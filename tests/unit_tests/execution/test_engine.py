@@ -2365,11 +2365,25 @@ class TestExecutionEngine:
         self.exec_engine.register_oms_type(strategy)
         return strategy
 
+    def _registered_hedging_strategy(self) -> Strategy:
+        config = StrategyConfig(oms_type="HEDGING")
+        strategy = Strategy(config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(strategy)
+        return strategy
+
     def _add_order_and_process_fill(
         self,
         order,
         account_id: AccountId,
         venue_order_id: str,
+        position_id: PositionId | None = None,
     ) -> None:
         self.cache.add_order(order, position_id=None)
         self.exec_engine.process(TestEventStubs.order_submitted(order, account_id=account_id))
@@ -2385,10 +2399,113 @@ class TestExecutionEngine:
                 order,
                 AUDUSD_SIM,
                 account_id=account_id,
+                position_id=position_id,
                 last_qty=order.quantity,
                 last_px=order.price,
             ),
         )
+
+    def _open_close_reopen_orders(self, strategy: Strategy) -> tuple[Order, Order, Order]:
+        open_order = strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            Price.from_str("1.00000"),
+        )
+        close_order = strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+            Price.from_str("1.10000"),
+        )
+        reopen_order = strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(50_000),
+            Price.from_str("1.20000"),
+        )
+        return open_order, close_order, reopen_order
+
+    def test_hedging_fill_reopening_closed_position_snapshots_predecessor(self) -> None:
+        # Arrange
+        self.exec_engine.start()
+
+        account_id = TestIdStubs.account_id()
+        strategy = self._registered_hedging_strategy()
+        venue_position_id = PositionId(f"{AUDUSD_SIM.id}-VENUE-1")
+        open_order, close_order, reopen_order = self._open_close_reopen_orders(strategy)
+
+        self._add_order_and_process_fill(
+            open_order,
+            account_id,
+            "V-HEDGE-001",
+            position_id=venue_position_id,
+        )
+        self._add_order_and_process_fill(
+            close_order,
+            account_id,
+            "V-HEDGE-002",
+            position_id=venue_position_id,
+        )
+        closed_position = self.cache.position(venue_position_id)
+        assert closed_position.is_closed
+
+        # Act
+        self._add_order_and_process_fill(
+            reopen_order,
+            account_id,
+            "V-HEDGE-003",
+            position_id=venue_position_id,
+        )
+
+        # Assert
+        position = self.cache.position(venue_position_id)
+        snapshots = self.cache.position_snapshots(venue_position_id)
+
+        assert position.opening_order_id == reopen_order.client_order_id
+        assert position.is_open
+        assert position.quantity == Quantity.from_int(50_000)
+        assert len(snapshots) == 1
+        assert snapshots[0].is_closed
+        assert snapshots[0].opening_order_id == open_order.client_order_id
+        assert snapshots[0].closing_order_id == close_order.client_order_id
+        assert snapshots[0].realized_pnl == closed_position.realized_pnl
+        assert snapshots[0].id != venue_position_id
+        assert snapshots[0].id.value.startswith(f"{venue_position_id.value}-")
+        assert self.cache.position_snapshot_ids(AUDUSD_SIM.id) == {venue_position_id}
+
+    def test_netting_fill_reopening_closed_position_snapshots_predecessor(self) -> None:
+        # Arrange
+        self.exec_engine.start()
+
+        account_id = TestIdStubs.account_id()
+        strategy = self._registered_netting_strategy()
+        netting_position_id = PositionId(f"{AUDUSD_SIM.id}-{strategy.id}")
+        open_order, close_order, reopen_order = self._open_close_reopen_orders(strategy)
+
+        self._add_order_and_process_fill(open_order, account_id, "V-NET-001")
+        self._add_order_and_process_fill(close_order, account_id, "V-NET-002")
+        closed_position = self.cache.position(netting_position_id)
+        assert closed_position.is_closed
+
+        # Act
+        self._add_order_and_process_fill(reopen_order, account_id, "V-NET-003")
+
+        # Assert
+        position = self.cache.position(netting_position_id)
+        snapshots = self.cache.position_snapshots(netting_position_id)
+
+        assert position.opening_order_id == reopen_order.client_order_id
+        assert position.is_open
+        assert position.quantity == Quantity.from_int(50_000)
+        assert len(snapshots) == 1
+        assert snapshots[0].is_closed
+        assert snapshots[0].opening_order_id == open_order.client_order_id
+        assert snapshots[0].closing_order_id == close_order.client_order_id
+        assert snapshots[0].realized_pnl == closed_position.realized_pnl
+        assert snapshots[0].id != netting_position_id
+        assert snapshots[0].id.value.startswith(f"{netting_position_id.value}-")
+        assert self.cache.position_snapshot_ids(AUDUSD_SIM.id) == {netting_position_id}
 
     def test_submit_order_denied_with_custom_position_id_under_netting(self) -> None:
         # Arrange

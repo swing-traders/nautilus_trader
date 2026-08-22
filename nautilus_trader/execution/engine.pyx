@@ -1768,20 +1768,14 @@ cdef class ExecutionEngine(Component):
         )
 
     cpdef void _reopen_position(self, Position position, OmsType oms_type):
-        if oms_type == OmsType.NETTING:
-            if position.is_open_c():
-                raise RuntimeError(
-                    f"Cannot reopen position {position.info()} (oms_type={oms_type_to_str(oms_type)}: "
-                    "reopening is only valid for closed positions in NETTING mode"
-                )
-
-            # Snapshot closed position if reopening (NETTING mode)
-            self._cache.snapshot_position(position)
-        else:  # HEDGING
-            self._log.warning(
-                f"Received fill for closed position {position.id} in HEDGING mode; "
-                "creating new position and ignoring previous state"
+        if oms_type == OmsType.NETTING and position.is_open_c():
+            raise RuntimeError(
+                f"Cannot reopen position {position.info()} (oms_type={oms_type_to_str(oms_type)}: "
+                "reopening is only valid for closed positions in NETTING mode"
             )
+
+        # Snapshot the closed position so the previous generation is retained
+        self._cache.snapshot_position(position)
 
     cpdef void _update_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type):
         try:
