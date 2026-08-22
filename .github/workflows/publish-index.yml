@@ -1,0 +1,58 @@
+# Publishes a PEP 503 simple index on GitHub Pages, regenerated from the repo's releases.
+# Wheels stay as release assets; the index links to them with #sha256= fragments taken
+# from each wheel's published .sha256 sibling, so pip verifies what it downloads.
+name: publish-index
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: [v1-patched]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-index:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Generate simple index from releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p site/simple/nautilus-trader
+          entries=""
+          while IFS=$'\t' read -r name url; do
+            case "$name" in
+              *.whl)
+                sha_url="${url}.sha256"
+                sha=$(curl -sfL "$sha_url" | awk '{print $1}') || sha=""
+                if [[ -n "$sha" ]]; then
+                  entries+="    <a href=\"${url}#sha256=${sha}\">${name}</a><br/>\n"
+                else
+                  entries+="    <a href=\"${url}\">${name}</a><br/>\n"
+                fi
+                ;;
+            esac
+          done < <(gh api "repos/${REPO}/releases" --paginate \
+                     -q '.[].assets[] | [.name, .browser_download_url] | @tsv')
+          printf '<!DOCTYPE html>\n<html><head><title>nautilus-trader</title></head><body>\n' > site/simple/nautilus-trader/index.html
+          printf "%b" "$entries" >> site/simple/nautilus-trader/index.html
+          printf '</body></html>\n' >> site/simple/nautilus-trader/index.html
+          printf '<!DOCTYPE html>\n<html><body><a href="nautilus-trader/">nautilus-trader</a></body></html>\n' > site/simple/index.html
+          printf '<!DOCTYPE html>\n<html><body><a href="simple/">simple index</a></body></html>\n' > site/index.html
+          cat site/simple/nautilus-trader/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4
