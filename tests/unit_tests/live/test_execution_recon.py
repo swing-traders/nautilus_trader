@@ -699,6 +699,24 @@ class TestLiveExecutionReconciliation:
         assert cached_fill_event.commission is not None
         assert cached_fill_event.liquidity_side == LiquiditySide.MAKER  # Original liquidity
 
+    @pytest.mark.asyncio
+    async def test_reconcile_state_when_timeout_elapses(self, monkeypatch):
+        # Arrange
+        async def hanging_mass_status(lookback_mins=None):
+            await asyncio.sleep(30.0)
+
+        monkeypatch.setattr(self.client, "generate_mass_status", hanging_mass_status)
+
+        # Act
+        result = await asyncio.wait_for(
+            self.exec_engine.reconcile_execution_state(timeout_secs=0.1),
+            timeout=5.0,
+        )
+
+        # Assert
+        assert not result
+        assert self.exec_engine._startup_reconciliation_event.is_set()
+
 
 class TestReconciliationEdgeCases:
     """

@@ -84,6 +84,9 @@ from nautilus_trader.portfolio.base import PortfolioFacade
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.risk.engine import RiskEngine
 from nautilus_trader.serialization.serializer import MsgSpecSerializer
+from nautilus_trader.system.error import EngineConnectionTimeout
+from nautilus_trader.system.error import ExecutionReconciliationFailed
+from nautilus_trader.system.error import PortfolioInitializationTimeout
 from nautilus_trader.trading.controller import Controller
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.trading.trader import Trader
@@ -1029,6 +1032,12 @@ class NautilusKernel:
         ------
         RuntimeError
             If no event loop has been assigned to the kernel.
+        EngineConnectionTimeout
+            If the engines do not connect and initialize within the timeout.
+        ExecutionReconciliationFailed
+            If execution state could not be reconciled.
+        PortfolioInitializationTimeout
+            If the portfolio does not initialize within the timeout.
 
         """
         if self.loop is None:
@@ -1044,11 +1053,14 @@ class NautilusKernel:
         self._connect_clients()
 
         if not await self._await_engines_connected():
-            return
+            raise EngineConnectionTimeout(
+                f"Timed out ({self._config.timeout_connection}s) waiting for engines "
+                f"to connect and initialize",
+            )
 
         if self.exec_engine.reconciliation:
             if not await self._await_execution_reconciliation():
-                return
+                raise ExecutionReconciliationFailed("Execution state could not be reconciled")
         else:
             self._log.warning("Reconciliation deactivated")
 
@@ -1056,7 +1068,10 @@ class NautilusKernel:
         self._initialize_portfolio()
 
         if not await self._await_portfolio_initialization():
-            return
+            raise PortfolioInitializationTimeout(
+                f"Timed out ({self._config.timeout_portfolio}s) waiting for portfolio "
+                f"to initialize",
+            )
 
         self._trader.start()
 

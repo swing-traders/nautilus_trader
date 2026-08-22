@@ -24,6 +24,7 @@ import pytest
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
+from nautilus_trader.system.error import ExecutionReconciliationFailed
 from nautilus_trader.test_kit.functions import eventually
 from nautilus_trader.trading.strategy import Strategy
 
@@ -59,6 +60,10 @@ class ExitingStopStrategy(Strategy):
 
     def on_stop(self) -> None:
         raise SystemExit
+
+
+async def _reconciliation_failed(timeout_secs: float = 10.0) -> bool:
+    return False
 
 
 def _node_config() -> TradingNodeConfig:
@@ -139,6 +144,48 @@ def test_run_reraises_system_exit_from_stop(event_loop):
     assert node.kernel.exec_engine.get_cmd_queue_task().done(), (
         "`run_async` did not unwind after the stop exited"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_async_raises_when_reconciliation_fails(monkeypatch):
+    # Arrange
+    loop = asyncio.get_running_loop()
+    node = TradingNode(config=_node_config(), loop=loop)
+    node.build()
+    monkeypatch.setattr(
+        node.kernel.exec_engine,
+        "reconcile_execution_state",
+        _reconciliation_failed,
+    )
+
+    run_task = asyncio.ensure_future(node.run_async())
+
+    # Act
+    await asyncio.wait({run_task}, timeout=5.0)
+
+    # Assert
+    assert run_task.done(), "`run_async` did not unwind when reconciliation failed"
+    assert not node.trader.is_running
+
+    with pytest.raises(ExecutionReconciliationFailed):
+        run_task.result()
+
+
+def test_run_raises_when_reconciliation_fails(event_loop, monkeypatch):
+    # Arrange
+    node = TradingNode(config=_node_config(), loop=event_loop)
+    node.build()
+    monkeypatch.setattr(
+        node.kernel.exec_engine,
+        "reconcile_execution_state",
+        _reconciliation_failed,
+    )
+
+    # Act, Assert
+    with pytest.raises(ExecutionReconciliationFailed):
+        node.run(raise_exception=True)
+
+    assert not node.trader.is_running
 
 
 @pytest.mark.asyncio

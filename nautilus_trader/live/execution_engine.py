@@ -1674,9 +1674,35 @@ class LiveExecutionEngine(ExecutionEngine):
         """
         Reconcile execution state as main entry point for startup reconciliation,
         coordinating reconciliation across all execution clients.
+
+        Parameters
+        ----------
+        timeout_secs : float, default 10.0
+            The timeout (seconds) for reconciliation to complete.
+
+        Returns
+        -------
+        bool
+            True if execution state reconciled within the timeout, else False.
+
+        Raises
+        ------
+        ValueError
+            If `timeout_secs` is not positive (> 0).
+
         """
         PyCondition.positive(timeout_secs, "timeout_secs")
 
+        try:
+            return await asyncio.wait_for(
+                self._reconcile_execution_state(),
+                timeout=timeout_secs,
+            )
+        except TimeoutError:
+            self._log.error(f"Timed out ({timeout_secs}s) reconciling execution state")
+            return False
+
+    async def _reconcile_execution_state(self) -> bool:
         try:
             for client_id in self._external_clients:
                 command = GenerateExecutionMassStatus(
