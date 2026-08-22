@@ -338,6 +338,12 @@ class TradingNode:
     async def run_async(self) -> None:
         """
         Start and run the trading node asynchronously.
+
+        Notes
+        -----
+        Any exception raised when starting the node, or by a stop which was scheduled on
+        the event loop, propagates to the caller rather than being discarded.
+
         """
         try:
             if not self._is_built:
@@ -378,6 +384,11 @@ class TradingNode:
         except asyncio.CancelledError:
             self.kernel.logger.debug("Engine queue tasks cancelled during shutdown")
 
+        stop_error = self.kernel.stop_error
+
+        if stop_error is not None:
+            raise stop_error
+
     def stop(self) -> None:
         """
         Stop the trading node gracefully.
@@ -386,10 +397,15 @@ class TradingNode:
 
         If save strategy is configured, then strategy states will be saved.
 
+        Notes
+        -----
+        When the event loop is running the stop runs as a task detached from the caller,
+        so any exception it raises is re-raised from `run_async` instead.
+
         """
         try:
             if self.kernel.loop.is_running():
-                self.kernel.loop.create_task(self.stop_async())
+                self.kernel.create_stop_task(self.stop_async)
             else:
                 self.kernel.loop.run_until_complete(self.stop_async())
         except RuntimeError as e:

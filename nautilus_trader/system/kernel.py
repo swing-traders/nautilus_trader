@@ -21,9 +21,11 @@ import socket
 import sys
 import time
 from collections.abc import Callable
+from collections.abc import Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import msgspec
 
@@ -547,6 +549,10 @@ class NautilusKernel:
         self._is_running = False
         self._is_stopping = False
 
+        # Stop handling
+        self._stop_error: BaseException | None = None
+        self._task_stop: asyncio.Task | None = None
+
         build_time_ns = time.time_ns() - ts_build
         build_time_ms = nanos_to_millis(build_time_ns) if build_time_ns > 0 else 0
         self._log.info(f"Initialized in {build_time_ms}ms")
@@ -575,9 +581,8 @@ class NautilusKernel:
         if self._loop is None:
             raise RuntimeError("No event loop available for the node")
 
-        self._loop.remove_signal_handler(signal.SIGTERM)
-        self._loop.add_signal_handler(signal.SIGINT, lambda: None)
-
+        # Signal handling remains armed while stopping, so a stop which is slow or
+        # which fails does not leave the process unable to receive further signals.
         if self._loop_sig_callback:
             self._loop_sig_callback(sig)
 
@@ -634,7 +639,7 @@ class NautilusKernel:
             self._log.debug("Set backtest FORCE_STOP")
 
         if self._loop:
-            self._loop.create_task(self.stop_async())
+            self.create_stop_task(self.stop_async)
         else:
             self.stop()
 
@@ -769,6 +774,22 @@ class NautilusKernel:
 
         """
         return self._ts_shutdown
+
+    @property
+    def stop_error(self) -> BaseException | None:
+        """
+        Return any exception raised by a scheduled stop for the kernel.
+
+        A stop scheduled on the event loop runs detached from whichever coroutine is
+        running the system, so any exception it raises is recorded here for the run
+        path to re-raise.
+
+        Returns
+        -------
+        BaseException or ``None``
+
+        """
+        return self._stop_error
 
     @property
     def load_state(self) -> bool:
@@ -1016,6 +1037,7 @@ class NautilusKernel:
         self._log.info("STARTING")
         self._ts_started = self._clock.timestamp_ns()
         self._is_running = True
+        self._stop_error = None
 
         self._register_executor()
         self._start_engines()
@@ -1104,6 +1126,71 @@ class NautilusKernel:
         self._is_running = False
         self._is_stopping = False
         self._ts_shutdown = self._clock.timestamp_ns()
+
+    def create_stop_task(self, stop: Callable[[], Coroutine[Any, Any, None]]) -> asyncio.Task:
+        """
+        Create a task on the event loop which stops the system with the given function.
+
+        If a stop is already pending then nothing further is scheduled and that pending
+        task is returned, so repeated stop requests do not run the sequence twice.
+
+        Any exception the stop raises is logged and recorded on `stop_error`, then the
+        engine message queue tasks are canceled so that whichever coroutine is running
+        the system unwinds and re-raises, rather than awaiting queues which will never
+        be stopped. A cancellation is handled the same way, as a stop which did not
+        complete leaves the queues running either way.
+
+        Parameters
+        ----------
+        stop : Callable[[], Coroutine]
+            The coroutine function to run for the stop.
+
+        Returns
+        -------
+        asyncio.Task
+
+        Raises
+        ------
+        RuntimeError
+            If no event loop has been assigned to the kernel.
+
+        """
+        if self._loop is None:
+            raise RuntimeError("no event loop has been assigned to the kernel")
+
+        if self._task_stop is not None and not self._task_stop.done():
+            self._log.debug("Stop already pending")
+            return self._task_stop
+
+        # The event loop only holds a weak reference to a task, so retaining it here also
+        # keeps a stop suspended on a future which nothing else holds from being garbage
+        # collected mid-flight.
+        self._task_stop = self._loop.create_task(self._run_stop(stop))
+        self._task_stop.add_done_callback(self._handle_stop_task_result)
+        return self._task_stop
+
+    async def _run_stop(self, stop: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        # `SystemExit` and `KeyboardInterrupt` tear the event loop down as they cross the
+        # task boundary, so every stop exception is recorded here rather than from the
+        # done callback, which would not run until a later iteration of the loop. The
+        # coroutine is created here rather than by the caller, so that a task canceled
+        # before its first step leaves no coroutine which was never awaited.
+        try:
+            await stop()
+        except BaseException as e:
+            self._record_stop_error(e)
+
+    def _handle_stop_task_result(self, task: asyncio.Task) -> None:
+        # Covers a stop task canceled before `_run_stop` took its first step
+        try:
+            task.result()
+        except BaseException as e:
+            self._record_stop_error(e)
+
+    def _record_stop_error(self, error: BaseException) -> None:
+        self._log.exception("Error on stop", error)
+        self._stop_error = error
+        self._cancel_queue_tasks()
 
     def dispose(self) -> None:
         """
@@ -1281,6 +1368,23 @@ class NautilusKernel:
 
         if self._emulator.is_running:
             self._emulator.stop()
+
+    def _cancel_queue_tasks(self) -> None:
+        queue_tasks = (
+            self._data_engine.get_cmd_queue_task(),
+            self._data_engine.get_req_queue_task(),
+            self._data_engine.get_res_queue_task(),
+            self._data_engine.get_data_queue_task(),
+            self._risk_engine.get_cmd_queue_task(),
+            self._risk_engine.get_evt_queue_task(),
+            self._exec_engine.get_cmd_queue_task(),
+            self._exec_engine.get_evt_queue_task(),
+        )
+
+        for task in queue_tasks:
+            if task is not None and not task.done():
+                self._log.info(f"Canceling task '{task.get_name()}' (id={id(task)})")
+                task.cancel()
 
     def _connect_clients(self) -> None:
         self._data_engine.connect()
