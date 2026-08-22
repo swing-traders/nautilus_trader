@@ -1,12 +1,13 @@
 # Publishes a PEP 503 simple index on GitHub Pages, regenerated from the repo's releases.
 # Wheels stay as release assets; the index links to them with #sha256= fragments taken
 # from each wheel's published .sha256 sibling, so pip verifies what it downloads.
+# Called from the release workflow only: the index derives from releases alone, and an
+# independent branch-push publish races the release's own deployment. Re-run the last
+# run to republish after infrastructure-only changes.
 name: publish-index
 
 on:
   workflow_call:
-  push:
-    branches: [v1-patched]
 
 permissions:
   contents: read
