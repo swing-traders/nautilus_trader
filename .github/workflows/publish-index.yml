@@ -4,8 +4,7 @@
 name: publish-index
 
 on:
-  release:
-    types: [published]
+  workflow_call:
   push:
     branches: [v1-patched]
 

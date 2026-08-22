@@ -63,3 +63,14 @@ jobs:
         with:
           files: dist/nautilus_trader-*
           fail_on_unmatched_files: true
+
+  # A release published with the default GITHUB_TOKEN does not fire other workflows'
+  # `release` triggers, so the index is published from here instead.
+  publish-index:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/publish-index.yml
