@@ -4890,6 +4890,211 @@ async def test_venue_reported_position_tolerance_does_not_consume_retries(
     assert (ethusdt.id, position.account_id) not in live_exec_engine._position_recon_retries
 
 
+# Tests for the _reconcile_position_report staleness guard
+
+_TS_POSITION_OPEN = 1_600_000_000_000_000_000
+_TS_POSITION_REDUCE = _TS_POSITION_OPEN + 60_000_000_000  # 60s after the open
+
+
+def _seed_reduced_long_position(cache, account_id, position_id, oms_type):
+    # Open LONG 1000, then reduce to LONG 500 with a fill 60s later, so the
+    # position's last applied fill sits at `_TS_POSITION_REDUCE`.
+    order_open = TestExecStubs.limit_order(
+        instrument=AUDUSD_SIM,
+        order_side=OrderSide.BUY,
+        client_order_id=ClientOrderId("O-STALE-OPEN"),
+    )
+    fill_open = TestEventStubs.order_filled(
+        order_open,
+        instrument=AUDUSD_SIM,
+        account_id=account_id,
+        trade_id=TradeId("T-STALE-OPEN"),
+        last_qty=Quantity.from_int(1000),
+        last_px=Price.from_str("1.00000"),
+        position_id=position_id,
+        ts_event=_TS_POSITION_OPEN,
+    )
+    position = Position(instrument=AUDUSD_SIM, fill=fill_open)
+    cache.add_position(position, oms_type)
+
+    order_reduce = TestExecStubs.limit_order(
+        instrument=AUDUSD_SIM,
+        order_side=OrderSide.SELL,
+        client_order_id=ClientOrderId("O-STALE-REDUCE"),
+    )
+    fill_reduce = TestEventStubs.order_filled(
+        order_reduce,
+        instrument=AUDUSD_SIM,
+        account_id=account_id,
+        trade_id=TradeId("T-STALE-REDUCE"),
+        last_qty=Quantity.from_int(500),
+        last_px=Price.from_str("1.00000"),
+        position_id=position_id,
+        ts_event=_TS_POSITION_REDUCE,
+    )
+    position.apply(fill_reduce)
+    cache.update_position(position)
+
+    return position
+
+
+def test_reconcile_position_report_discards_stale_hedge_report(
+    live_exec_engine,
+    exec_client,
+    cache,
+    account_id,
+):
+    # Arrange
+    live_exec_engine.register_client(exec_client)
+    cache.add_account(TestExecStubs.cash_account(account_id))
+
+    venue_position_id = PositionId("P-STALE-HEDGE")
+    position = _seed_reduced_long_position(
+        cache,
+        account_id,
+        venue_position_id,
+        OmsType.HEDGING,
+    )
+    assert position.ts_last == _TS_POSITION_REDUCE
+
+    # A venue snapshot captured before the reduce booked at the venue
+    stale_report = PositionStatusReport(
+        account_id=account_id,
+        instrument_id=AUDUSD_SIM.id,
+        venue_position_id=venue_position_id,
+        position_side=PositionSide.LONG,
+        quantity=Quantity.from_int(1000),
+        report_id=UUID4(),
+        ts_last=_TS_POSITION_OPEN,
+        ts_init=live_exec_engine._clock.timestamp_ns(),
+    )
+
+    # Act
+    result = live_exec_engine._reconcile_position_report(stale_report)
+
+    # Assert - the cache is provably newer, so the snapshot is discarded
+    assert result
+    assert cache.position(venue_position_id).signed_decimal_qty() == Decimal(500)
+    assert cache.orders(instrument_id=AUDUSD_SIM.id) == []
+
+
+def test_reconcile_position_report_discards_stale_netting_report(
+    live_exec_engine,
+    exec_client,
+    cache,
+    account_id,
+):
+    # Arrange
+    live_exec_engine.register_client(exec_client)
+    cache.add_account(TestExecStubs.cash_account(account_id))
+
+    position_id = PositionId("P-STALE-NET")
+    position = _seed_reduced_long_position(
+        cache,
+        account_id,
+        position_id,
+        OmsType.NETTING,
+    )
+    assert position.ts_last == _TS_POSITION_REDUCE
+
+    # No venue position ID routes the report through netting reconciliation
+    stale_report = PositionStatusReport(
+        account_id=account_id,
+        instrument_id=AUDUSD_SIM.id,
+        venue_position_id=None,
+        position_side=PositionSide.LONG,
+        quantity=Quantity.from_int(1000),
+        report_id=UUID4(),
+        ts_last=_TS_POSITION_OPEN,
+        ts_init=live_exec_engine._clock.timestamp_ns(),
+    )
+
+    # Act
+    result = live_exec_engine._reconcile_position_report(stale_report)
+
+    # Assert - no phantom second position is opened alongside the cached one
+    assert result
+    assert [p.id for p in cache.positions_open()] == [position_id]
+    assert position.signed_decimal_qty() == Decimal(500)
+    assert cache.orders(instrument_id=AUDUSD_SIM.id) == []
+
+
+def test_reconcile_position_report_reconciles_report_matching_last_fill(
+    live_exec_engine,
+    exec_client,
+    cache,
+    account_id,
+):
+    # Arrange
+    live_exec_engine.register_client(exec_client)
+    cache.add_account(TestExecStubs.cash_account(account_id))
+
+    venue_position_id = PositionId("P-EQUAL-HEDGE")
+    _seed_reduced_long_position(
+        cache,
+        account_id,
+        venue_position_id,
+        OmsType.HEDGING,
+    )
+
+    # Same timestamp as the last applied fill: not provably stale
+    report = PositionStatusReport(
+        account_id=account_id,
+        instrument_id=AUDUSD_SIM.id,
+        venue_position_id=venue_position_id,
+        position_side=PositionSide.LONG,
+        quantity=Quantity.from_int(1000),
+        report_id=UUID4(),
+        ts_last=_TS_POSITION_REDUCE,
+        ts_init=live_exec_engine._clock.timestamp_ns(),
+    )
+
+    # Act
+    result = live_exec_engine._reconcile_position_report(report)
+
+    # Assert - reconciliation proceeds unchanged
+    assert result
+    assert cache.position(venue_position_id).signed_decimal_qty() == Decimal(1000)
+
+
+def test_reconcile_position_report_reconciles_report_newer_than_last_fill(
+    live_exec_engine,
+    exec_client,
+    cache,
+    account_id,
+):
+    # Arrange
+    live_exec_engine.register_client(exec_client)
+    cache.add_account(TestExecStubs.cash_account(account_id))
+
+    venue_position_id = PositionId("P-NEWER-HEDGE")
+    _seed_reduced_long_position(
+        cache,
+        account_id,
+        venue_position_id,
+        OmsType.HEDGING,
+    )
+
+    # One nanosecond after the last applied fill
+    report = PositionStatusReport(
+        account_id=account_id,
+        instrument_id=AUDUSD_SIM.id,
+        venue_position_id=venue_position_id,
+        position_side=PositionSide.LONG,
+        quantity=Quantity.from_int(1000),
+        report_id=UUID4(),
+        ts_last=_TS_POSITION_REDUCE + 1,
+        ts_init=live_exec_engine._clock.timestamp_ns(),
+    )
+
+    # Act
+    result = live_exec_engine._reconcile_position_report(report)
+
+    # Assert - reconciliation proceeds unchanged
+    assert result
+    assert cache.position(venue_position_id).signed_decimal_qty() == Decimal(1000)
+
+
 # Tests for _process_venue_reported_positions
 
 

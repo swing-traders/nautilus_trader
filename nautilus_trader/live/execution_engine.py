@@ -2354,10 +2354,44 @@ class LiveExecutionEngine(ExecutionEngine):
             self._log_skipping_reconciliation_on_instrument_id(report)
             return True  # Filtered
 
+        if self._is_position_report_stale(report):
+            return True  # Snapshot is stale on the cache's timestamp axis
+
         if report.venue_position_id is not None:
             return self._reconcile_position_report_hedging(report)
         else:
             return self._reconcile_position_report_netting(report)
+
+    def _is_position_report_stale(self, report: PositionStatusReport) -> bool:
+        # A report timestamp earlier than the cached position's last applied event is
+        # stale on that timestamp axis, so the snapshot is discarded rather than
+        # reconciled against newer cached state.
+        ts_last_applied: int | None
+
+        if report.venue_position_id is not None:
+            position = self._cache.position(report.venue_position_id)
+            ts_last_applied = position.ts_last if position is not None else None
+        else:
+            positions_open = self._cache.positions_open(
+                venue=None,  # Faster query filtering
+                instrument_id=report.instrument_id,
+                account_id=report.account_id,
+            )
+            ts_last_applied = (
+                max(position.ts_last for position in positions_open) if positions_open else None
+            )
+
+        if ts_last_applied is None or report.ts_last >= ts_last_applied:
+            return False
+
+        self._log.info(
+            f"Discarding stale position status report for {report.instrument_id}: "
+            f"report timestamp={report.ts_last} predates "
+            f"cached position timestamp={ts_last_applied}",
+            LogColor.BLUE,
+        )
+
+        return True
 
     def _consider_for_reconciliation(self, instrument_id: InstrumentId) -> bool:
         if self.reconciliation_instrument_ids:
