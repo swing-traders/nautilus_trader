@@ -346,10 +346,16 @@ async def test_generate_order_status_reports_load_spreads_uses_generic_request(
 
 
 @pytest.mark.asyncio
-async def test_generate_order_status_reports_handles_failure(exec_client_builder, monkeypatch):
+async def test_generate_order_status_reports_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting no orders at the venue.
+    """
     # Arrange
     client, _, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_order_status_reports.side_effect = Exception("boom")
+    http_client.request_order_status_reports.side_effect = RuntimeError("boom")
 
     command = GenerateOrderStatusReports(
         instrument_id=InstrumentId(Symbol("BTC-USD"), OKX_VENUE),
@@ -360,11 +366,35 @@ async def test_generate_order_status_reports_handles_failure(exec_client_builder
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_order_status_reports(command)
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_reports(command)
 
-    # Assert
-    assert reports == []
+
+@pytest.mark.asyncio
+async def test_generate_fill_reports_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting no fills at the venue.
+    """
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_fill_reports.side_effect = RuntimeError("boom")
+
+    command = GenerateFillReports(
+        instrument_id=InstrumentId(Symbol("BTC-USD"), OKX_VENUE),
+        venue_order_id=None,
+        start=None,
+        end=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_fill_reports(command)
 
 
 @pytest.mark.asyncio
@@ -572,10 +602,19 @@ async def test_handle_fill_report_updates_venue_id_before_fill(exec_client_build
 
 
 @pytest.mark.asyncio
-async def test_generate_position_status_reports_handles_failure(exec_client_builder, monkeypatch):
-    # Arrange
-    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_position_status_reports.side_effect = Exception("boom")
+async def test_generate_position_status_reports_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting a flat account.
+    """
+    # Arrange - SWAP so the positions endpoint is actually queried
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    http_client.request_position_status_reports.side_effect = RuntimeError("boom")
 
     command = GeneratePositionStatusReports(
         instrument_id=None,
@@ -585,11 +624,11 @@ async def test_generate_position_status_reports_handles_failure(exec_client_buil
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_position_status_reports(command)
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_position_status_reports(command)
 
-    # Assert
-    assert reports == []
+    http_client.request_position_status_reports.assert_awaited_once()
 
 
 @pytest.mark.asyncio

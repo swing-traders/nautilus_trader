@@ -439,9 +439,11 @@ class BitmexExecutionClient(LiveExecutionClient):
             )
 
             return reports
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReports")
-            return []
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
     async def generate_order_status_report(
         self,
@@ -469,9 +471,11 @@ class BitmexExecutionClient(LiveExecutionClient):
             self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
 
             return reports
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "FillReports")
-            return []
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
     async def generate_position_status_reports(
         self,
@@ -492,9 +496,11 @@ class BitmexExecutionClient(LiveExecutionClient):
             )
 
             return reports
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "PositionStatusReports")
-            return []
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         order = command.order

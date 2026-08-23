@@ -423,11 +423,11 @@ async def test_spot_position_reports_handles_missing_currency(
 
 
 @pytest.mark.asyncio
-async def test_spot_position_reports_handles_exceptions(
+async def test_spot_position_reports_propagate_balance_query_failure(
     exec_client_with_spot_positions,
 ):
     """
-    Test error handling when balance query fails.
+    Test a failed balance query propagates rather than reporting a flat SPOT wallet.
     """
     # Arrange
     client, _, _, http_client, _ = exec_client_with_spot_positions
@@ -436,7 +436,7 @@ async def test_spot_position_reports_handles_exceptions(
     client._cache.add_instrument(instrument)
 
     # Mock get_balance to raise an exception
-    http_client.get_balance = AsyncMock(side_effect=Exception("API error"))
+    http_client.get_balance = AsyncMock(side_effect=RuntimeError("API error"))
 
     command = GeneratePositionStatusReports(
         instrument_id=instrument.id,
@@ -446,11 +446,9 @@ async def test_spot_position_reports_handles_exceptions(
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_position_status_reports(command)
-
-    # Assert - should return empty list and log exception
-    assert len(reports) == 0
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="API error"):
+        await client.generate_position_status_reports(command)
 
 
 @pytest.mark.asyncio

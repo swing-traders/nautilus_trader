@@ -13,6 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import asyncio
+import re
 from decimal import Decimal
 from unittest.mock import ANY
 from unittest.mock import AsyncMock
@@ -101,12 +103,14 @@ def exec_client_builder(
         # Return empty list to avoid PyO3 type conversion issues in tests
         mock_instrument_provider.instruments_pyo3.return_value = []
 
-        config = BybitExecClientConfig(
-            api_key="test_api_key",
-            api_secret="test_api_secret",
-            product_types=(nautilus_pyo3.BybitProductType.LINEAR,),
-            **(config_kwargs or {}),
-        )
+        config_values: dict = {
+            "api_key": "test_api_key",
+            "api_secret": "test_api_secret",
+            "product_types": (nautilus_pyo3.BybitProductType.LINEAR,),
+        }
+        config_values.update(config_kwargs or {})
+
+        config = BybitExecClientConfig(**config_values)
 
         client = BybitExecutionClient(
             loop=event_loop,
@@ -233,14 +237,9 @@ async def test_generate_order_status_reports_caches_local_venue_position_id(
     assert client._order_position_ids[order.client_order_id] == venue_position_id
 
 
-@pytest.mark.asyncio
-async def test_generate_order_status_reports_handles_failure(exec_client_builder, monkeypatch):
-    # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_order_status_reports.side_effect = Exception("boom")
-
-    command = GenerateOrderStatusReports(
-        instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
+def _order_status_reports_command() -> GenerateOrderStatusReports:
+    return GenerateOrderStatusReports(
+        instrument_id=None,
         start=None,
         end=None,
         open_only=False,
@@ -248,11 +247,138 @@ async def test_generate_order_status_reports_handles_failure(exec_client_builder
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_order_status_reports(command)
 
-    # Assert
-    assert reports == []
+def _fill_reports_command() -> GenerateFillReports:
+    return GenerateFillReports(
+        instrument_id=None,
+        venue_order_id=None,
+        start=None,
+        end=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+
+def _position_status_reports_command() -> GeneratePositionStatusReports:
+    return GeneratePositionStatusReports(
+        instrument_id=None,
+        start=None,
+        end=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_reports_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting no orders at the venue.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_order_status_reports.side_effect = RuntimeError("boom")
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_reports(_order_status_reports_command())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Request canceled",
+        "`symbol` must be initialized",
+        "unrecognized failure",
+    ],
+)
+async def test_generate_order_status_reports_propagates_value_error(
+    exec_client_builder,
+    monkeypatch,
+    message,
+):
+    """
+    Test every recognized `ValueError` shape propagates, including the shutdown and
+    uncached-symbol shapes which are only logged differently.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_order_status_reports.side_effect = ValueError(message)
+
+    # Act, Assert
+    with pytest.raises(ValueError, match=re.escape(message)):
+        await client.generate_order_status_reports(_order_status_reports_command())
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_reports_discards_partial_conversions(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a conversion failure discards the reports converted before it, since a partial
+    list is indistinguishable from the venue's full order state.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    converted = MagicMock()
+    converted.client_order_id = None  # External order short-circuit in cache helper
+    conversions: list[object] = []
+
+    def from_pyo3(obj):
+        conversions.append(obj)
+        if len(conversions) > 1:
+            raise ValueError("`symbol` must be initialized")
+        return converted
+
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.bybit.execution.OrderStatusReport.from_pyo3",
+        from_pyo3,
+    )
+    http_client.request_order_status_reports.return_value = [MagicMock(), MagicMock()]
+
+    # Act, Assert
+    with pytest.raises(ValueError, match="must be initialized"):
+        await client.generate_order_status_reports(_order_status_reports_command())
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_reports_discards_earlier_product_types(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failure on a later product type discards the reports already collected for
+    the earlier product types.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "product_types": (
+                nautilus_pyo3.BybitProductType.LINEAR,
+                nautilus_pyo3.BybitProductType.INVERSE,
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.bybit.execution.OrderStatusReport.from_pyo3",
+        lambda obj: MagicMock(client_order_id=None),
+    )
+    http_client.request_order_status_reports.side_effect = [
+        [MagicMock()],
+        RuntimeError("boom"),
+    ]
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_reports(_order_status_reports_command())
+
+    assert http_client.request_order_status_reports.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -315,24 +441,174 @@ async def test_generate_position_status_reports_converts_results(exec_client_bui
 
 
 @pytest.mark.asyncio
-async def test_generate_position_status_reports_handles_failure(exec_client_builder, monkeypatch):
+async def test_generate_position_status_reports_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting a flat account.
+    """
     # Arrange
     client, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_position_status_reports.side_effect = Exception("boom")
+    http_client.request_position_status_reports.side_effect = RuntimeError("boom")
 
-    command = GeneratePositionStatusReports(
-        instrument_id=None,
-        start=None,
-        end=None,
-        command_id=TestIdStubs.uuid(),
-        ts_init=0,
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_position_status_reports(_position_status_reports_command())
+
+
+@pytest.mark.asyncio
+async def test_generate_position_status_reports_discards_partial_conversions(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a conversion failure discards the reports converted before it, since a partial
+    list understates the venue's exposure.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    conversions: list[object] = []
+
+    def from_pyo3(obj):
+        conversions.append(obj)
+        if len(conversions) > 1:
+            raise ValueError("`symbol` must be initialized")
+        return MagicMock()
+
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.bybit.execution.PositionStatusReport.from_pyo3",
+        from_pyo3,
     )
+    http_client.request_position_status_reports.return_value = [MagicMock(), MagicMock()]
 
-    # Act
-    reports = await client.generate_position_status_reports(command)
+    # Act, Assert
+    with pytest.raises(ValueError, match="must be initialized"):
+        await client.generate_position_status_reports(_position_status_reports_command())
 
-    # Assert
-    assert reports == []
+
+@pytest.mark.asyncio
+async def test_generate_position_status_reports_discards_earlier_product_types(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failure on a later product type discards the positions already collected for
+    the earlier product types.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "product_types": (
+                nautilus_pyo3.BybitProductType.LINEAR,
+                nautilus_pyo3.BybitProductType.INVERSE,
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.bybit.execution.PositionStatusReport.from_pyo3",
+        lambda obj: MagicMock(),
+    )
+    http_client.request_position_status_reports.side_effect = [
+        [MagicMock()],
+        RuntimeError("boom"),
+    ]
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_position_status_reports(_position_status_reports_command())
+
+    assert http_client.request_position_status_reports.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_generate_fill_reports_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting no fills at the venue.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_fill_reports.side_effect = RuntimeError("boom")
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_fill_reports(_fill_reports_command())
+
+
+@pytest.mark.asyncio
+async def test_generate_fill_reports_discards_partial_conversions(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a conversion failure discards the fills converted before it, since a partial
+    list would hide fills the engine reconciles against.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    conversions: list[object] = []
+
+    def from_pyo3(obj):
+        conversions.append(obj)
+        if len(conversions) > 1:
+            raise ValueError("`symbol` must be initialized")
+        return MagicMock()
+
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.bybit.execution.FillReport.from_pyo3",
+        from_pyo3,
+    )
+    http_client.request_fill_reports.return_value = [MagicMock(), MagicMock()]
+
+    # Act, Assert
+    with pytest.raises(ValueError, match="must be initialized"):
+        await client.generate_fill_reports(_fill_reports_command())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("http_method", "generator", "command_factory"),
+    [
+        (
+            "request_order_status_reports",
+            "generate_order_status_reports",
+            _order_status_reports_command,
+        ),
+        (
+            "request_fill_reports",
+            "generate_fill_reports",
+            _fill_reports_command,
+        ),
+        (
+            "request_position_status_reports",
+            "generate_position_status_reports",
+            _position_status_reports_command,
+        ),
+    ],
+)
+async def test_report_generators_propagate_cancellation(
+    exec_client_builder,
+    monkeypatch,
+    http_method,
+    generator,
+    command_factory,
+):
+    """
+    Test cancellation is never swallowed by a report generator.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    getattr(http_client, http_method).side_effect = asyncio.CancelledError
+
+    # Act, Assert
+    with pytest.raises(asyncio.CancelledError):
+        await getattr(client, generator)(command_factory())
 
 
 # ============================================================================

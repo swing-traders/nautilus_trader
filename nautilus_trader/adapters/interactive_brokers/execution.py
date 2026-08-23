@@ -757,6 +757,9 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         except Exception as e:
             self._log.error(f"Failed to generate fill reports: {e}")
 
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
+
         return reports
 
     def _create_fill_report(

@@ -505,8 +505,11 @@ class OKXExecutionClient(LiveExecutionClient):
                 self._apply_client_order_alias(report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(
             len(reports),
@@ -759,8 +762,11 @@ class OKXExecutionClient(LiveExecutionClient):
                 if canonical_id is not None:
                     report.client_order_id = canonical_id
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "FillReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
 
@@ -829,6 +835,9 @@ class OKXExecutionClient(LiveExecutionClient):
                     reports.append(report)
         except Exception as e:
             self._log.exception("Failed to generate SPOT position report(s) from wallet", e)
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         for report in reports:
             self._log.debug(f"Generated SPOT position report from wallet: {report}")
@@ -983,8 +992,11 @@ class OKXExecutionClient(LiveExecutionClient):
                 report = PositionStatusReport.from_pyo3(pyo3_report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "PositionReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(
             len(reports),

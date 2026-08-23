@@ -13,6 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import asyncio
 from decimal import Decimal
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -276,17 +277,9 @@ async def test_generate_order_status_reports_converts_results(
     assert reports == [expected_report]
 
 
-@pytest.mark.asyncio
-async def test_generate_order_status_reports_handles_failure(
-    exec_client_builder,
-    monkeypatch,
-):
-    # Arrange
-    client, ws_client, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_order_status_reports.side_effect = Exception("boom")
-
-    command = GenerateOrderStatusReports(
-        instrument_id=InstrumentId(Symbol("BTC-USD-PERP"), HYPERLIQUID_VENUE),
+def _order_status_reports_command() -> GenerateOrderStatusReports:
+    return GenerateOrderStatusReports(
+        instrument_id=None,
         start=None,
         end=None,
         open_only=False,
@@ -294,11 +287,167 @@ async def test_generate_order_status_reports_handles_failure(
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_order_status_reports(command)
 
-    # Assert
-    assert reports == []
+def _fill_reports_command() -> GenerateFillReports:
+    return GenerateFillReports(
+        instrument_id=None,
+        venue_order_id=None,
+        start=None,
+        end=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+
+def _position_status_reports_command() -> GeneratePositionStatusReports:
+    return GeneratePositionStatusReports(
+        instrument_id=None,
+        start=None,
+        end=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("http_method", "generator", "command_factory"),
+    [
+        (
+            "request_order_status_reports",
+            "generate_order_status_reports",
+            _order_status_reports_command,
+        ),
+        (
+            "request_fill_reports",
+            "generate_fill_reports",
+            _fill_reports_command,
+        ),
+        (
+            "request_position_status_reports",
+            "generate_position_status_reports",
+            _position_status_reports_command,
+        ),
+    ],
+)
+async def test_report_generators_propagate_request_failure(
+    exec_client_builder,
+    monkeypatch,
+    http_method,
+    generator,
+    command_factory,
+):
+    """
+    Test a failed request propagates rather than reporting no activity at the venue.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    getattr(http_client, http_method).side_effect = RuntimeError("boom")
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await getattr(client, generator)(command_factory())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("http_method", "generator", "command_factory"),
+    [
+        (
+            "request_order_status_reports",
+            "generate_order_status_reports",
+            _order_status_reports_command,
+        ),
+        (
+            "request_fill_reports",
+            "generate_fill_reports",
+            _fill_reports_command,
+        ),
+        (
+            "request_position_status_reports",
+            "generate_position_status_reports",
+            _position_status_reports_command,
+        ),
+    ],
+)
+async def test_report_generators_propagate_cancellation(
+    exec_client_builder,
+    monkeypatch,
+    http_method,
+    generator,
+    command_factory,
+):
+    """
+    Test cancellation is never swallowed by a report generator.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    getattr(http_client, http_method).side_effect = asyncio.CancelledError
+
+    # Act, Assert
+    with pytest.raises(asyncio.CancelledError):
+        await getattr(client, generator)(command_factory())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("http_method", "generator", "report_cls", "command_factory"),
+    [
+        (
+            "request_order_status_reports",
+            "generate_order_status_reports",
+            "OrderStatusReport",
+            _order_status_reports_command,
+        ),
+        (
+            "request_fill_reports",
+            "generate_fill_reports",
+            "FillReport",
+            _fill_reports_command,
+        ),
+        (
+            "request_position_status_reports",
+            "generate_position_status_reports",
+            "PositionStatusReport",
+            _position_status_reports_command,
+        ),
+    ],
+)
+async def test_report_generators_discard_partial_conversions(
+    exec_client_builder,
+    monkeypatch,
+    http_method,
+    generator,
+    report_cls,
+    command_factory,
+):
+    """
+    Test a conversion failure discards the reports converted before it, since a partial
+    list is indistinguishable from the venue's full state.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    conversions: list[object] = []
+
+    def from_pyo3(obj):
+        conversions.append(obj)
+        if len(conversions) > 1:
+            raise ValueError("cannot convert report")
+        converted = MagicMock()
+        converted.client_order_id = ClientOrderId("O-123")
+        converted.venue_order_id = None
+        return converted
+
+    monkeypatch.setattr(
+        f"nautilus_trader.adapters.hyperliquid.execution.{report_cls}.from_pyo3",
+        from_pyo3,
+    )
+    getattr(http_client, http_method).return_value = [MagicMock(), MagicMock()]
+
+    # Act, Assert
+    with pytest.raises(ValueError, match="cannot convert report"):
+        await getattr(client, generator)(command_factory())
 
 
 @pytest.mark.asyncio
@@ -455,28 +604,6 @@ async def test_generate_fill_reports_converts_results(exec_client_builder, monke
 
 
 @pytest.mark.asyncio
-async def test_generate_fill_reports_handles_failure(exec_client_builder, monkeypatch):
-    # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_fill_reports.side_effect = Exception("boom")
-
-    command = GenerateFillReports(
-        instrument_id=InstrumentId(Symbol("BTC-USD-PERP"), HYPERLIQUID_VENUE),
-        venue_order_id=None,
-        start=None,
-        end=None,
-        command_id=TestIdStubs.uuid(),
-        ts_init=0,
-    )
-
-    # Act
-    reports = await client.generate_fill_reports(command)
-
-    # Assert
-    assert reports == []
-
-
-@pytest.mark.asyncio
 async def test_generate_position_status_reports_converts_results(
     exec_client_builder,
     monkeypatch,
@@ -506,30 +633,6 @@ async def test_generate_position_status_reports_converts_results(
     # Assert
     http_client.request_position_status_reports.assert_awaited_once()
     assert reports == [expected_report]
-
-
-@pytest.mark.asyncio
-async def test_generate_position_status_reports_handles_failure(
-    exec_client_builder,
-    monkeypatch,
-):
-    # Arrange
-    client, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_position_status_reports.side_effect = Exception("boom")
-
-    command = GeneratePositionStatusReports(
-        instrument_id=None,
-        start=None,
-        end=None,
-        command_id=TestIdStubs.uuid(),
-        ts_init=0,
-    )
-
-    # Act
-    reports = await client.generate_position_status_reports(command)
-
-    # Assert
-    assert reports == []
 
 
 @pytest.mark.asyncio

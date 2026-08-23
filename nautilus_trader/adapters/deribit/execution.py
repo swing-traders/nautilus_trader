@@ -227,8 +227,11 @@ class DeribitExecutionClient(LiveExecutionClient):
                 report = OrderStatusReport.from_pyo3(pyo3_report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(
             len(reports),
@@ -266,8 +269,11 @@ class DeribitExecutionClient(LiveExecutionClient):
                 report = FillReport.from_pyo3(pyo3_report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "FillReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
 
@@ -295,8 +301,11 @@ class DeribitExecutionClient(LiveExecutionClient):
                 report = PositionStatusReport.from_pyo3(pyo3_report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "PositionStatusReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(
             len(reports),

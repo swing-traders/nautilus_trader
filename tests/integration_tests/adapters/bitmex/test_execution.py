@@ -701,11 +701,16 @@ async def test_generate_order_status_reports_converts_results(
 
 
 @pytest.mark.asyncio
-async def test_generate_order_status_reports_handles_failure(exec_client, instrument):
+async def test_generate_order_status_reports_propagates_request_failure(
+    exec_client,
+    instrument,
+):
+    """
+    Test a failed request propagates rather than reporting no orders at the venue.
+    """
     # Arrange
-    exec_client._mock_http_client.request_order_status_reports.side_effect = Exception("boom")
+    exec_client._mock_http_client.request_order_status_reports.side_effect = RuntimeError("boom")
 
-    reports = None
     try:
         command = GenerateOrderStatusReports(
             instrument_id=instrument.id,
@@ -716,13 +721,36 @@ async def test_generate_order_status_reports_handles_failure(exec_client, instru
             ts_init=0,
         )
 
-        # Act
-        reports = await exec_client.generate_order_status_reports(command)
+        # Act, Assert
+        with pytest.raises(RuntimeError, match="boom"):
+            await exec_client.generate_order_status_reports(command)
     finally:
         exec_client._mock_http_client.request_order_status_reports.side_effect = None
 
-    # Assert
-    assert reports == []
+
+@pytest.mark.asyncio
+async def test_generate_fill_reports_propagates_request_failure(exec_client, instrument):
+    """
+    Test a failed request propagates rather than reporting no fills at the venue.
+    """
+    # Arrange
+    exec_client._mock_http_client.request_fill_reports.side_effect = RuntimeError("boom")
+
+    try:
+        command = GenerateFillReports(
+            instrument_id=instrument.id,
+            venue_order_id=None,
+            start=None,
+            end=None,
+            command_id=TestIdStubs.uuid(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(RuntimeError, match="boom"):
+            await exec_client.generate_fill_reports(command)
+    finally:
+        exec_client._mock_http_client.request_fill_reports.side_effect = None
 
 
 @pytest.mark.asyncio
@@ -793,11 +821,13 @@ async def test_generate_position_status_reports_converts_results(
 
 
 @pytest.mark.asyncio
-async def test_generate_position_status_reports_handles_failure(exec_client):
+async def test_generate_position_status_reports_propagates_request_failure(exec_client):
+    """
+    Test a failed request propagates rather than reporting a flat account.
+    """
     # Arrange
-    exec_client._mock_http_client.request_position_status_reports.side_effect = Exception("boom")
+    exec_client._mock_http_client.request_position_status_reports.side_effect = RuntimeError("boom")
 
-    reports = None
     try:
         command = GeneratePositionStatusReports(
             instrument_id=None,
@@ -807,13 +837,11 @@ async def test_generate_position_status_reports_handles_failure(exec_client):
             ts_init=0,
         )
 
-        # Act
-        reports = await exec_client.generate_position_status_reports(command)
+        # Act, Assert
+        with pytest.raises(RuntimeError, match="boom"):
+            await exec_client.generate_position_status_reports(command)
     finally:
         exec_client._mock_http_client.request_position_status_reports.side_effect = None
-
-    # Assert
-    assert reports == []
 
 
 @pytest.mark.asyncio

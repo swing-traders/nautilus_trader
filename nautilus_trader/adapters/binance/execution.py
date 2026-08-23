@@ -572,7 +572,9 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
                     binance_orders.extend(response)
         except BinanceError as e:
             self._log.exception(f"Cannot generate OrderStatusReport: {e.message}", e)
-            return []
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         start_ms = secs_to_millis(command.start.timestamp()) if command.start is not None else None
         end_ms = secs_to_millis(command.end.timestamp()) if command.end is not None else None
@@ -644,7 +646,9 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
                 binance_trades.extend(response)
         except BinanceError as e:
             self._log.exception(f"Cannot generate FillReport: {e.message}", e)
-            return []
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         # Parse all Binance trades
         reports: list[FillReport] = []
@@ -696,7 +700,9 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
                 reports = await self._get_binance_position_status_reports()
         except BinanceError as e:
             self._log.exception(f"Cannot generate PositionStatusReport: {e.message}", e)
-            return []
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(
             len(reports),

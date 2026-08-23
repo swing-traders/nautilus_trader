@@ -4798,6 +4798,65 @@ async def test_check_positions_consistency_processes_only_discrepant_account(
 
 
 @pytest.mark.asyncio
+async def test_check_positions_consistency_skips_venue_whose_position_query_raises(
+    live_exec_engine,
+    exec_client,
+    cache,
+):
+    """
+    Test a raising position status generator marks the venue failed, so the cached open
+    position is never reconciled flat.
+    """
+    # Arrange
+    live_exec_engine.register_client(exec_client)
+    live_exec_engine.generate_missing_orders = True
+
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM, order_side=OrderSide.BUY)
+    fill = TestEventStubs.order_filled(
+        order,
+        instrument=AUDUSD_SIM,
+        last_qty=Quantity.from_int(1000),
+        last_px=Price.from_str("1.00000"),
+        position_id=PositionId("P-QUERY-RAISES"),
+    )
+    position = Position(instrument=AUDUSD_SIM, fill=fill)
+    cache.add_position(position, OmsType.NETTING)
+
+    position_queries = []
+
+    async def raise_error(command):
+        position_queries.append(command)
+        raise RuntimeError("API error")
+
+    exec_client.generate_position_status_reports = raise_error
+
+    fill_queries = []
+
+    async def counting_query(instrument_id, clients):
+        fill_queries.append(instrument_id)
+        return [], False
+
+    live_exec_engine._query_and_find_missing_fills = counting_query
+
+    reconcile_calls = []
+
+    def spy_reconcile(report):
+        reconcile_calls.append(report)
+        return True
+
+    live_exec_engine._reconcile_position_report = spy_reconcile
+
+    # Act
+    await live_exec_engine._check_positions_consistency()
+
+    # Assert
+    assert len(position_queries) == 1  # The venue was queried and the query failed
+    assert fill_queries == []
+    assert reconcile_calls == []
+    assert position.is_open
+
+
+@pytest.mark.asyncio
 async def test_venue_reported_position_retries_stop_after_max(
     live_exec_engine,
     exec_client,

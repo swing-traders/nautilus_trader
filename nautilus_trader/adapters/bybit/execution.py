@@ -453,8 +453,12 @@ class BybitExecutionClient(LiveExecutionClient):
                 )
             else:
                 self._log.exception("Failed to generate OrderStatusReports", e)
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
         except Exception as e:
             self._log.exception("Failed to generate OrderStatusReports", e)
+            raise
 
         self._log_report_receipt(
             len(reports),
@@ -587,8 +591,11 @@ class BybitExecutionClient(LiveExecutionClient):
                 report = FillReport.from_pyo3(pyo3_report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "FillReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
 
@@ -633,8 +640,11 @@ class BybitExecutionClient(LiveExecutionClient):
                 report = PositionStatusReport.from_pyo3(pyo3_report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "PositionStatusReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(
             len(reports),

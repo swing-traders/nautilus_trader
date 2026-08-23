@@ -441,10 +441,16 @@ async def test_generate_order_status_reports_passes_open_client_ids_for_cid_reso
 
 
 @pytest.mark.asyncio
-async def test_generate_order_status_reports_handles_failure(exec_client_builder, monkeypatch):
+async def test_generate_order_status_reports_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting no orders at the venue.
+    """
     # Arrange
     client, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_order_status_reports.side_effect = Exception("boom")
+    http_client.request_order_status_reports.side_effect = RuntimeError("boom")
 
     command = GenerateOrderStatusReports(
         instrument_id=InstrumentId(Symbol("GBPUSD-PERP"), AX_VENUE),
@@ -455,11 +461,60 @@ async def test_generate_order_status_reports_handles_failure(exec_client_builder
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_order_status_reports(command)
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_reports(command)
 
-    # Assert
-    assert reports == []
+
+@pytest.mark.asyncio
+async def test_generate_fill_reports_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting no fills at the venue.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_fill_reports.side_effect = RuntimeError("boom")
+
+    command = GenerateFillReports(
+        instrument_id=None,
+        venue_order_id=None,
+        start=None,
+        end=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_fill_reports(command)
+
+
+@pytest.mark.asyncio
+async def test_generate_position_status_reports_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting a flat account.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_position_reports.side_effect = RuntimeError("boom")
+
+    command = GeneratePositionStatusReports(
+        instrument_id=None,
+        start=None,
+        end=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_position_status_reports(command)
 
 
 def test_handle_order_status_report_accepts_submitted_order_once(

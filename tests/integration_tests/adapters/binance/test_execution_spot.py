@@ -36,7 +36,10 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.execution.engine import ExecutionEngine
 from nautilus_trader.execution.messages import CancelAllOrders
+from nautilus_trader.execution.messages import GenerateFillReports
 from nautilus_trader.execution.messages import GenerateOrderStatusReport
+from nautilus_trader.execution.messages import GenerateOrderStatusReports
+from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
@@ -145,6 +148,239 @@ class TestBinanceSpotExecutionClient:
         )
 
         return
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_reports_propagates_request_failure(self, mocker):
+        """
+        Test a failed request propagates rather than reporting no orders at the venue.
+        """
+        # Arrange
+        mocker.patch.object(
+            self.exec_client,
+            "_build_active_symbols",
+            side_effect=BinanceError(429, {"code": -1003, "msg": "Too many requests"}, {}),
+        )
+        command = GenerateOrderStatusReports(
+            instrument_id=None,
+            start=None,
+            end=None,
+            open_only=False,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(BinanceError):
+            await self.exec_client.generate_order_status_reports(command)
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_reports_discards_earlier_symbols(self, mocker):
+        """
+        Test a failure on a later symbol discards the orders already collected for the
+        earlier symbols.
+        """
+        # Arrange
+        mocker.patch.object(
+            self.exec_client,
+            "_build_active_symbols",
+            return_value=({"ETHUSDT", "BTCUSDT"}, []),
+        )
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_all_orders",
+            side_effect=[[], BinanceError(500, {"code": -1001, "msg": "Internal error"}, {})],
+        )
+        command = GenerateOrderStatusReports(
+            instrument_id=None,
+            start=None,
+            end=None,
+            open_only=False,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(BinanceError):
+            await self.exec_client.generate_order_status_reports(command)
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_reports_discards_partial_parses(self, mocker):
+        """
+        Test a parse failure discards the orders parsed before it, since a partial list
+        would understate the venue's open orders.
+        """
+        # Arrange
+        parsed: list[object] = []
+
+        def parse_to_order_status_report(**kwargs):
+            parsed.append(kwargs)
+            if len(parsed) > 1:
+                raise ValueError("cannot parse order")
+            return mocker.MagicMock()
+
+        orders = []
+        for _ in range(2):
+            order = mocker.MagicMock()
+            order.time = 0
+            order.origQty = "1"
+            order.symbol = "ETHUSDT"
+            order.parse_to_order_status_report = parse_to_order_status_report
+            orders.append(order)
+
+        mocker.patch.object(
+            self.exec_client,
+            "_build_active_symbols",
+            return_value=({"ETHUSDT"}, []),
+        )
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_all_orders",
+            return_value=orders,
+        )
+        mocker.patch.object(
+            self.exec_client,
+            "_get_cached_instrument_id",
+            return_value=ETHUSDT_BINANCE.id,
+        )
+        command = GenerateOrderStatusReports(
+            instrument_id=None,
+            start=None,
+            end=None,
+            open_only=False,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(ValueError, match="cannot parse order"):
+            await self.exec_client.generate_order_status_reports(command)
+
+    @pytest.mark.asyncio
+    async def test_generate_fill_reports_propagates_request_failure(self, mocker):
+        """
+        Test a failed request propagates rather than reporting no fills at the venue.
+        """
+        # Arrange
+        mocker.patch.object(self.exec_client, "_get_cache_active_symbols", return_value={"ETHUSDT"})
+        mocker.patch.object(
+            self.exec_client,
+            "_get_binance_active_position_symbols",
+            return_value=set(),
+        )
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_user_trades",
+            side_effect=BinanceError(429, {"code": -1003, "msg": "Too many requests"}, {}),
+        )
+        command = GenerateFillReports(
+            instrument_id=None,
+            venue_order_id=None,
+            start=None,
+            end=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(BinanceError):
+            await self.exec_client.generate_fill_reports(command)
+
+    @pytest.mark.asyncio
+    async def test_generate_fill_reports_discards_earlier_symbols(self, mocker):
+        """
+        Test a failure on a later symbol discards the trades already collected for the
+        earlier symbols.
+        """
+        # Arrange
+        mocker.patch.object(
+            self.exec_client,
+            "_get_cache_active_symbols",
+            return_value={"ETHUSDT", "BTCUSDT"},
+        )
+        mocker.patch.object(
+            self.exec_client,
+            "_get_binance_active_position_symbols",
+            return_value=set(),
+        )
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_user_trades",
+            side_effect=[[], BinanceError(500, {"code": -1001, "msg": "Internal error"}, {})],
+        )
+        command = GenerateFillReports(
+            instrument_id=None,
+            venue_order_id=None,
+            start=None,
+            end=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(BinanceError):
+            await self.exec_client.generate_fill_reports(command)
+
+    @pytest.mark.asyncio
+    async def test_generate_position_status_reports_propagates_request_failure(self, mocker):
+        """
+        Test a failed request propagates rather than reporting a flat account.
+        """
+        # Arrange
+        mocker.patch.object(
+            self.exec_client,
+            "_get_binance_position_status_reports",
+            side_effect=BinanceError(429, {"code": -1003, "msg": "Too many requests"}, {}),
+        )
+        command = GeneratePositionStatusReports(
+            instrument_id=None,
+            start=None,
+            end=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(BinanceError):
+            await self.exec_client.generate_position_status_reports(command)
+
+    @pytest.mark.asyncio
+    async def test_report_generators_propagate_cancellation(self, mocker):
+        """
+        Test cancellation is never swallowed by a report generator.
+        """
+        # Arrange
+        mocker.patch.object(
+            self.exec_client,
+            "_build_active_symbols",
+            side_effect=asyncio.CancelledError,
+        )
+        mocker.patch.object(
+            self.exec_client,
+            "_get_binance_position_status_reports",
+            side_effect=asyncio.CancelledError,
+        )
+        order_command = GenerateOrderStatusReports(
+            instrument_id=None,
+            start=None,
+            end=None,
+            open_only=False,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+        position_command = GeneratePositionStatusReports(
+            instrument_id=None,
+            start=None,
+            end=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(asyncio.CancelledError):
+            await self.exec_client.generate_order_status_reports(order_command)
+
+        with pytest.raises(asyncio.CancelledError):
+            await self.exec_client.generate_position_status_reports(position_command)
 
     @pytest.mark.asyncio
     async def test_submit_unsupported_order_logs_error(self, mocker):

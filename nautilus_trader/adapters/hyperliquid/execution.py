@@ -408,9 +408,11 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 "Generated",
             )
             return reports
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReports")
-            return []
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
     async def generate_fill_reports(
         self,
@@ -436,9 +438,11 @@ class HyperliquidExecutionClient(LiveExecutionClient):
 
             self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO, "Generated")
             return reports
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "FillReports")
-            return []
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
     async def generate_position_status_reports(
         self,
@@ -459,9 +463,11 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             )
 
             return reports
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "PositionStatusReports")
-            return []
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
     async def _request_and_process_fills_for_order(
         self,

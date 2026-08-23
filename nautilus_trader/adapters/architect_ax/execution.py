@@ -336,8 +336,11 @@ class AxExecutionClient(LiveExecutionClient):
                     report.client_order_id = cached_client_order_id
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(
             len(reports),
@@ -363,8 +366,11 @@ class AxExecutionClient(LiveExecutionClient):
                 report = FillReport.from_pyo3(pyo3_report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "FillReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
 
@@ -390,8 +396,11 @@ class AxExecutionClient(LiveExecutionClient):
                     LogColor.MAGENTA,
                 )
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "PositionStatusReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(
             len(reports),

@@ -1243,14 +1243,17 @@ async def test_generate_order_status_reports_converts_results_spot(
 
 
 @pytest.mark.asyncio
-async def test_generate_order_status_reports_handles_failure_spot(
+async def test_generate_order_status_reports_propagates_request_failure_spot(
     exec_client_builder_spot,
     monkeypatch,
     instrument,
 ):
+    """
+    Test a failed request propagates rather than reporting no orders at the venue.
+    """
     # Arrange
     client, _, http_client, _ = exec_client_builder_spot(monkeypatch)
-    http_client.request_order_status_reports.side_effect = Exception("boom")
+    http_client.request_order_status_reports.side_effect = RuntimeError("boom")
 
     command = GenerateOrderStatusReports(
         instrument_id=instrument.id,
@@ -1261,11 +1264,9 @@ async def test_generate_order_status_reports_handles_failure_spot(
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_order_status_reports(command)
-
-    # Assert
-    assert reports == []
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_reports(command)
 
 
 @pytest.mark.asyncio
@@ -1303,14 +1304,17 @@ async def test_generate_fill_reports_converts_results_spot(
 
 
 @pytest.mark.asyncio
-async def test_generate_fill_reports_handles_failure_spot(
+async def test_generate_fill_reports_propagates_request_failure_spot(
     exec_client_builder_spot,
     monkeypatch,
     instrument,
 ):
+    """
+    Test a failed request propagates rather than reporting no fills at the venue.
+    """
     # Arrange
     client, _, http_client, _ = exec_client_builder_spot(monkeypatch)
-    http_client.request_fill_reports.side_effect = Exception("boom")
+    http_client.request_fill_reports.side_effect = RuntimeError("boom")
 
     command = GenerateFillReports(
         instrument_id=instrument.id,
@@ -1321,11 +1325,9 @@ async def test_generate_fill_reports_handles_failure_spot(
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_fill_reports(command)
-
-    # Assert
-    assert reports == []
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_fill_reports(command)
 
 
 @pytest.mark.asyncio
@@ -1361,13 +1363,16 @@ async def test_generate_position_status_reports_converts_results_spot(
 
 
 @pytest.mark.asyncio
-async def test_generate_position_status_reports_handles_failure_spot(
+async def test_generate_position_status_reports_propagates_request_failure_spot(
     exec_client_builder_spot,
     monkeypatch,
 ):
+    """
+    Test a failed request propagates rather than reporting a flat account.
+    """
     # Arrange
     client, _, http_client, _ = exec_client_builder_spot(monkeypatch)
-    http_client.request_position_status_reports.side_effect = Exception("boom")
+    http_client.request_position_status_reports.side_effect = RuntimeError("boom")
 
     command = GeneratePositionStatusReports(
         instrument_id=None,
@@ -1377,11 +1382,50 @@ async def test_generate_position_status_reports_handles_failure_spot(
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_position_status_reports(command)
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_position_status_reports(command)
 
-    # Assert
-    assert reports == []
+
+@pytest.mark.asyncio
+async def test_generate_position_status_reports_discards_spot_when_futures_fails(
+    exec_client_builder_dual,
+    monkeypatch,
+):
+    """
+    Test a futures query failure discards the SPOT positions already collected, since
+    each product leg has its own error handling and a partial list understates exposure.
+    """
+    # Arrange
+    (
+        client,
+        _,
+        _,
+        http_client_spot,
+        http_client_futures,
+        _,
+    ) = exec_client_builder_dual(monkeypatch)
+
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.kraken.execution.PositionStatusReport.from_pyo3",
+        lambda obj: MagicMock(),
+    )
+    http_client_spot.request_position_status_reports.return_value = [MagicMock()]
+    http_client_futures.request_position_status_reports.side_effect = RuntimeError("boom")
+
+    command = GeneratePositionStatusReports(
+        instrument_id=None,
+        start=None,
+        end=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_position_status_reports(command)
+
+    http_client_spot.request_position_status_reports.assert_awaited_once()
 
 
 @pytest.mark.asyncio

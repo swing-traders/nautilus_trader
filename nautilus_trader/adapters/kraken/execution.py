@@ -442,8 +442,11 @@ class KrakenExecutionClient(LiveExecutionClient):
                     self._log.debug(f"Received {report}", LogColor.MAGENTA)
                     reports.append(report)
 
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         self._log_report_receipt(
             len(reports),
@@ -604,8 +607,11 @@ class KrakenExecutionClient(LiveExecutionClient):
                     self._log.debug(f"Received {report}", LogColor.MAGENTA)
                     reports.append(report)
 
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "FillReports")
+
+            # Propagate: an empty or partial result would be indistinguishable from success
+            raise
 
         if command.venue_order_id is not None:
             reports = [
@@ -830,8 +836,11 @@ class KrakenExecutionClient(LiveExecutionClient):
                     and not command.instrument_id
                 ):
                     reports.extend(self._synthesize_flat_spot_margin_reports(reports))
-            except (asyncio.CancelledError, Exception) as e:
+            except Exception as e:
                 self._log_report_error(e, "PositionStatusReports (spot)")
+
+                # Propagate: an empty or partial result would be indistinguishable from success
+                raise
 
         if self._http_client_futures is not None and target_product_type != KrakenProductType.SPOT:
             try:
@@ -844,8 +853,11 @@ class KrakenExecutionClient(LiveExecutionClient):
                     report = PositionStatusReport.from_pyo3(pyo3_report)
                     self._log.debug(f"Received {report}", LogColor.MAGENTA)
                     reports.append(report)
-            except (asyncio.CancelledError, Exception) as e:
+            except Exception as e:
                 self._log_report_error(e, "PositionStatusReports (futures)")
+
+                # Propagate: an empty or partial result would be indistinguishable from success
+                raise
 
         self._log_report_receipt(
             len(reports),
