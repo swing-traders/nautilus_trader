@@ -536,13 +536,15 @@ class BybitExecutionClient(LiveExecutionClient):
                     f"Failed to generate OrderStatusReport for {command.client_order_id!r}",
                     e,
                 )
-            return None
+
+            # Propagate: a `None` result would be indistinguishable from order not found
+            raise
         except Exception as e:
             self._log.exception(
                 f"Failed to generate OrderStatusReport for {command.client_order_id!r}",
                 e,
             )
-            return None
+            raise
 
     async def generate_fill_reports(
         self,

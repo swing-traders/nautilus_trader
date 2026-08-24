@@ -397,7 +397,11 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             ):
                 del self._generate_order_status_retries[command.client_order_id]
 
-            return None
+            # Raise: the venue was never asked, so the order status remains unknown
+            raise RuntimeError(
+                f"Reached maximum retries {self._max_retries}/{self._max_retries} for generating "
+                f"OrderStatusReport for {command.client_order_id!r}, {command.venue_order_id!r}",
+            )
 
         self._log.info(
             f"Generating OrderStatusReport for "
@@ -442,18 +446,14 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             # Check for None before dictionary operations
             if not command.client_order_id:
                 self._log.warning("Cannot retry without a client order ID")
-                return None
+                raise
 
             self._generate_order_status_retries[command.client_order_id] = retries
 
             order: Order | None = self._cache.order(command.client_order_id)
             if order is None:
                 self._log.warning("Order not found in cache")
-                return None
-            elif order.is_closed:
-                return None  # Nothing else to do
-
-            if retries >= self._max_retries:
+            elif not order.is_closed and retries >= self._max_retries:
                 if command.client_order_id in self._generate_order_status_retries:
                     del self._generate_order_status_retries[command.client_order_id]
 
@@ -469,15 +469,23 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
                     ts_event=self._clock.timestamp_ns(),
                     due_post_only=due_post_only,
                 )
-            return None  # Error now handled
 
-        if not binance_order or (binance_order.origQty and Decimal(binance_order.origQty) == 0):
-            # Cannot proceed to generating report
-            self._log.error(
+            # Propagate: a `None` result would be indistinguishable from order not found
+            raise
+
+        if not binance_order:
+            self._log.warning(
                 f"Cannot generate `OrderStatusReport` for {command.client_order_id=!r}, {command.venue_order_id=!r}: "
                 "order not found",
             )
             return None
+
+        if binance_order.origQty and Decimal(binance_order.origQty) == 0:
+            # Raise: the venue returned this order, so `None` would be a false not-found
+            raise ValueError(
+                f"Cannot generate `OrderStatusReport` for {command.client_order_id=!r}, "
+                f"{command.venue_order_id=!r}: order quantity was zero",
+            )
 
         report: OrderStatusReport = binance_order.parse_to_order_status_report(
             account_id=self.account_id,

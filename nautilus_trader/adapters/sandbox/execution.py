@@ -172,7 +172,10 @@ class SandboxExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
-        return None
+        # Raise: the simulated exchange is never asked, so `None` would be a false not-found
+        raise NotImplementedError(
+            "method `generate_order_status_report` is not implemented for the sandbox",
+        )
 
     async def generate_order_status_reports(
         self,

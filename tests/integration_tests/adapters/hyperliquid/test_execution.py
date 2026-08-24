@@ -524,7 +524,7 @@ async def test_generate_order_status_report_returns_none_when_helper_returns_non
 
 
 @pytest.mark.asyncio
-async def test_generate_order_status_report_requires_identifier(
+async def test_generate_order_status_report_raises_without_identifier(
     exec_client_builder,
     monkeypatch,
 ):
@@ -539,22 +539,24 @@ async def test_generate_order_status_report_requires_identifier(
         ts_init=0,
     )
 
-    # Act
-    report = await client.generate_order_status_report(command)
+    # Act, Assert
+    with pytest.raises(ValueError, match="without venue_order_id or client_order_id"):
+        await client.generate_order_status_report(command)
 
-    # Assert
     http_client.request_order_status_report.assert_not_awaited()
-    assert report is None
 
 
 @pytest.mark.asyncio
-async def test_generate_order_status_report_handles_failure(
+async def test_generate_order_status_report_propagates_request_failure(
     exec_client_builder,
     monkeypatch,
 ):
+    """
+    Test a failed request propagates rather than reporting the order not found.
+    """
     # Arrange
     client, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_order_status_report.side_effect = Exception("boom")
+    http_client.request_order_status_report.side_effect = RuntimeError("boom")
 
     command = GenerateOrderStatusReport(
         instrument_id=InstrumentId(Symbol("BTC-USD-PERP"), HYPERLIQUID_VENUE),
@@ -564,11 +566,34 @@ async def test_generate_order_status_report_handles_failure(
         ts_init=0,
     )
 
-    # Act
-    report = await client.generate_order_status_report(command)
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_report(command)
 
-    # Assert
-    assert report is None
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_propagates_cancellation(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test cancellation is never swallowed by the order status report request.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_order_status_report.side_effect = asyncio.CancelledError
+
+    command = GenerateOrderStatusReport(
+        instrument_id=InstrumentId(Symbol("BTC-USD-PERP"), HYPERLIQUID_VENUE),
+        client_order_id=ClientOrderId("O-10"),
+        venue_order_id=VenueOrderId("1000"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(asyncio.CancelledError):
+        await client.generate_order_status_report(command)
 
 
 @pytest.mark.asyncio
@@ -3021,7 +3046,7 @@ async def test_cancel_replace_promotes_on_first_fill_then_processes_subsequent(
 
 
 @pytest.mark.asyncio
-async def test_generate_order_status_report_suppresses_inflight_modify_old_leg_cancel(
+async def test_generate_order_status_report_withholds_inflight_modify_old_leg_cancel(
     exec_client_builder,
     monkeypatch,
     instrument,
@@ -3032,9 +3057,9 @@ async def test_generate_order_status_report_suppresses_inflight_modify_old_leg_c
 
     During an in-flight cancel-replace the venue reports the old leg as CANCELED. A
     query reconciliation that applied it would close the order while the replacement is
-    still live, stranding the eventual replacement fill. The adapter suppresses the old-
-    leg CANCELED while the modify is tracked (returns no report) so the engine defers
-    and the in-flight order stays alive.
+    still live, stranding the eventual replacement fill. The adapter withholds the old-
+    leg CANCELED while the modify is tracked, raising so the engine cannot conclude and
+    the order stays alive.
 
     """
     # Arrange
@@ -3077,11 +3102,82 @@ async def test_generate_order_status_report_suppresses_inflight_modify_old_leg_c
     )
 
     try:
-        # Act
-        report = await client.generate_order_status_report(command)
+        # Act, Assert
+        with pytest.raises(RuntimeError, match="Cannot conclude"):
+            await client.generate_order_status_report(command)
+    finally:
+        await client._disconnect()
 
-        # Assert
-        assert report is None
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_withholds_old_leg_cancel_after_partial_fill(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    """
+    A partial fill on the old leg leaves the order PARTIALLY_FILLED (not in-flight)
+    while the modify is still tracked, so the withheld old-leg CANCELED must raise
+    rather than let the engine resolve the order as not found at the venue.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-CR-SUP-003"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.00020"),
+        price=Price.from_str("56730.0"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    cache.add_order(order, None)
+
+    old_voi = VenueOrderId("900")
+    cache.add_venue_order_id(order.client_order_id, old_voi)
+    order.apply(TestEventStubs.order_submitted(order))
+    order.apply(TestEventStubs.order_accepted(order, venue_order_id=old_voi))
+    order.apply(TestEventStubs.order_pending_update(order))
+    order.apply(
+        TestEventStubs.order_filled(
+            order,
+            instrument=instrument,
+            venue_order_id=old_voi,
+            last_qty=Quantity.from_str("0.00010"),
+        ),
+    )
+    cache.update_order(order)
+    assert not order.is_inflight
+
+    client._pending_modify_keys[order.client_order_id.value] = old_voi.value
+
+    http_client.request_order_status_report.return_value = _build_status_report_pyo3(
+        client,
+        instrument,
+        order.client_order_id,
+        old_voi.value,
+        nautilus_pyo3.OrderStatus.CANCELED,
+        price="56730.0",
+        quantity="0.00020",
+    )
+
+    command = GenerateOrderStatusReport(
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=old_voi,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    try:
+        # Act, Assert
+        with pytest.raises(RuntimeError, match="Cannot conclude"):
+            await client.generate_order_status_report(command)
     finally:
         await client._disconnect()
 

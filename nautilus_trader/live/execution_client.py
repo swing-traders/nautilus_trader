@@ -347,7 +347,10 @@ class LiveExecutionClient(ExecutionClient):
         """
         Generate an `OrderStatusReport` for the given order identifier parameter(s).
 
-        If the order is not found, or an error occurs, then logs and returns ``None``.
+        Returns ``None`` only when the venue answered and does not know the order, as
+        the engine resolves a cached order from that answer. Any failure to obtain an
+        answer must propagate, since a laundered ``None`` would be indistinguishable
+        from the order being absent at the venue.
 
         Parameters
         ----------
@@ -362,6 +365,8 @@ class LiveExecutionClient(ExecutionClient):
         ------
         ValueError
             If both the `client_order_id` and `venue_order_id` are ``None``.
+        Exception
+            If the request fails, or the venue answer cannot be interpreted.
 
         """
         raise NotImplementedError(
@@ -523,7 +528,12 @@ class LiveExecutionClient(ExecutionClient):
             command_id=UUID4(),
             ts_init=self._clock.timestamp_ns(),
         )
-        report: OrderStatusReport | None = await self.generate_order_status_report(command)
+        try:
+            report: OrderStatusReport | None = await self.generate_order_status_report(command)
+        except Exception as e:
+            # Cannot conclude anything about the order, the caller will query again
+            self._log.warning(f"Cannot synchronize order status: query failed, {e}")
+            return
 
         if report is None:
             self._log.warning("Did not receive `OrderStatusReport` from request")

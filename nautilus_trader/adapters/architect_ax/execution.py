@@ -279,10 +279,10 @@ class AxExecutionClient(LiveExecutionClient):
 
         instrument_id = command.instrument_id or (order.instrument_id if order else None)
         if instrument_id is None:
-            self._log.error(
+            # Raise: the venue was never asked, so `None` would be a false not-found
+            raise ValueError(
                 "Cannot generate OrderStatusReport: no instrument_id on command or cached order",
             )
-            return None
 
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(instrument_id.value)
         pyo3_client_order_id = (
@@ -307,10 +307,11 @@ class AxExecutionClient(LiveExecutionClient):
                 pyo3_venue_order_id,
             )
             return OrderStatusReport.from_pyo3(pyo3_report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReport")
 
-        return None
+            # Propagate: a `None` result would be indistinguishable from order not found
+            raise
 
     async def generate_order_status_reports(
         self,

@@ -21,6 +21,7 @@ import pytest
 from nautilus_trader.backtest.engine import SimulatedExchange
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.model.data import InstrumentClose
 from nautilus_trader.model.data import InstrumentStatus
 from nautilus_trader.model.data import QuoteTick
@@ -100,6 +101,26 @@ async def test_generate_mass_status_has_account_id(exec_client):
     assert mass_status.account_id is not None
     assert mass_status.account_id.value == "SANDBOX-001"
     mass_status.to_pyo3()  # Would raise AttributeError if account_id was None
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_raises_not_implemented(exec_client, instrument):
+    """
+    Test the unimplemented single-order query raises rather than reporting not found.
+    """
+    # Arrange
+    exec_client.connect()
+    command = GenerateOrderStatusReport(
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-1"),
+        venue_order_id=VenueOrderId("V-1"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(NotImplementedError):
+        await exec_client.generate_order_status_report(command)
 
 
 @pytest.mark.asyncio

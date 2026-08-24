@@ -1230,6 +1230,141 @@ class TestPolymarketExecutionClient:
         }
 
     @pytest.mark.asyncio
+    async def test_generate_order_status_report_propagates_request_failure(self):
+        """
+        A failed request must propagate rather than recovering a terminal status from
+        trades, since the venue never answered whether it knows the order.
+        """
+        from nautilus_trader.execution.messages import GenerateOrderStatusReport
+
+        venue_order_id_str = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ac"
+        client_order_id, venue_order_id = self._setup_test_order_with_venue_id(
+            venue_order_id_str,
+            use_ws_instrument=True,
+            price=Price.from_str("0.500"),
+        )
+        order = self.cache.order(client_order_id)
+
+        self.http_client.get_order = MagicMock(
+            side_effect=PolyApiException(error_msg="server error"),
+        )
+        self.http_client.get_trades = MagicMock(return_value=[])
+
+        command = GenerateOrderStatusReport(
+            instrument_id=order.instrument_id,
+            client_order_id=client_order_id,
+            venue_order_id=venue_order_id,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to generate OrderStatusReport"):
+            await self.exec_client.generate_order_status_report(command)
+
+        self.http_client.get_trades.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_report_propagates_trade_lookup_failure(self):
+        """
+        A failed trade lookup must propagate rather than recovering the order as
+        CANCELED, since no venue evidence about its fills was obtained.
+        """
+        from nautilus_trader.execution.messages import GenerateOrderStatusReport
+
+        venue_order_id_str = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ad"
+        client_order_id, venue_order_id = self._setup_test_order_with_venue_id(
+            venue_order_id_str,
+            use_ws_instrument=True,
+            price=Price.from_str("0.500"),
+        )
+        order = self.cache.order(client_order_id)
+
+        self.http_client.get_order = MagicMock(return_value=None)
+        self.http_client.get_trades = MagicMock(
+            side_effect=PolyApiException(error_msg="server error"),
+        )
+
+        command = GenerateOrderStatusReport(
+            instrument_id=order.instrument_id,
+            client_order_id=client_order_id,
+            venue_order_id=venue_order_id,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to generate FillReports"):
+            await self.exec_client.generate_order_status_report(command)
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_reports_propagates_request_failure(self):
+        """
+        A failed open-orders request must propagate rather than reporting no orders at
+        the venue.
+        """
+        from nautilus_trader.execution.messages import GenerateOrderStatusReports
+
+        self.http_client.get_open_orders = MagicMock(
+            side_effect=PolyApiException(error_msg="server error"),
+        )
+
+        command = GenerateOrderStatusReports(
+            instrument_id=None,
+            start=None,
+            end=None,
+            open_only=True,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to generate OrderStatusReports"):
+            await self.exec_client.generate_order_status_reports(command)
+
+    @pytest.mark.asyncio
+    async def test_generate_fill_reports_propagates_request_failure(self):
+        """
+        A failed trades request must propagate rather than reporting no fills at the
+        venue.
+        """
+        self.http_client.get_trades = MagicMock(
+            side_effect=PolyApiException(error_msg="server error"),
+        )
+
+        command = GenerateFillReports(
+            instrument_id=None,
+            venue_order_id=None,
+            start=None,
+            end=None,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to generate FillReports"):
+            await self.exec_client.generate_fill_reports(command)
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_report_raises_without_venue_order_id(self):
+        """
+        Without a venue order ID the venue cannot be asked, so raise rather than
+        reporting the order not found.
+        """
+        from nautilus_trader.execution.messages import GenerateOrderStatusReport
+
+        instrument_id = get_polymarket_instrument_id(
+            "0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917",
+            "21742633143463906290569050155826241533067272736897614950488156847949938836455",
+        )
+        command = GenerateOrderStatusReport(
+            instrument_id=instrument_id,
+            client_order_id=ClientOrderId("O-UNKNOWN"),
+            venue_order_id=None,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        with pytest.raises(ValueError, match="without the venue order ID"):
+            await self.exec_client.generate_order_status_report(command)
+
+    @pytest.mark.asyncio
     async def test_generate_order_status_report_recovers_filled_with_dust_snap(self):
         """
         CLOB cent-tick truncation: trade size lands within `DUST_SNAP_THRESHOLD` below

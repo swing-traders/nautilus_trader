@@ -320,6 +320,11 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
         if report is not None:
             return report
 
+        if self._binance_account_type != BinanceAccountType.USDT_FUTURES:
+            # The algo endpoints exist only on USD-margined futures, so the not-found
+            # answer already established for the regular order stands.
+            return None
+
         client_order_id = command.client_order_id.value if command.client_order_id else None
         venue_order_id = int(command.venue_order_id.value) if command.venue_order_id else None
 
@@ -332,8 +337,10 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
                 client_algo_id=client_order_id,
             )
         except BinanceError as e:
-            self._log.debug(f"Algo order query also failed: {e.message}")
-            return None
+            self._log.error(f"Algo order query also failed: {e.message}")
+
+            # Propagate: a `None` result would be indistinguishable from order not found
+            raise
 
         if algo_order is None:
             return None
@@ -347,8 +354,10 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
                 ts_init=self._clock.timestamp_ns(),
             )
         except ValueError as e:
-            self._log.warning(f"Cannot parse algo order: {e}")
-            return None
+            self._log.exception("Cannot parse algo order", e)
+
+            # Propagate: the venue knows this order, so `None` would be a false not-found
+            raise
 
         self._log.debug(f"Received algo {report}")
         return report

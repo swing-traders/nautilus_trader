@@ -406,6 +406,12 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 params=params,
             )
 
+            if not retry_manager.result:
+                # Propagate: an empty result would be indistinguishable from success
+                raise RuntimeError(
+                    f"Failed to generate OrderStatusReports: {retry_manager.message}",
+                ) from retry_manager.last_exception
+
             if response:
                 # Uncomment for development
                 # self._log.info(f"Processing {len(response)} orders", LogColor.MAGENTA)
@@ -569,10 +575,10 @@ class PolymarketExecutionClient(LiveExecutionClient):
         if venue_order_id is None:
             venue_order_id = self._cache.venue_order_id(command.client_order_id)
             if venue_order_id is None:
-                self._log.error(
+                # Raise: the venue was never asked, so the order status remains unknown
+                raise ValueError(
                     "Cannot generate an order status report for Polymarket without the venue order ID",
                 )
-                return None  # Failed
 
         self._log.info(
             f"Generating OrderStatusReport for "
@@ -590,6 +596,14 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 order_id=venue_order_id.value,
             )
 
+            if not retry_manager.result:
+                # Propagate: recovering from trades here would resolve the order from a
+                # failed request rather than a venue answer.
+                raise RuntimeError(
+                    f"Failed to generate OrderStatusReport for {venue_order_id!r}: "
+                    f"{retry_manager.message}",
+                ) from retry_manager.last_exception
+
             if not response:
                 return await self._recover_terminal_status_from_trades(
                     command=command,
@@ -605,11 +619,11 @@ class PolymarketExecutionClient(LiveExecutionClient):
             )
             instrument = self._cache.instrument(instrument_id)
             if instrument is None:
-                self._log.warning(
+                # Raise: the venue knows this order, so `None` would be a false not-found
+                raise ValueError(
                     f"Cannot handle order report: instrument {instrument_id} not found "
                     f"(market={polymarket_order.market}, asset_id={polymarket_order.asset_id})",
                 )
-                return None
 
             return polymarket_order.parse_to_order_status_report(
                 account_id=self.account_id,
@@ -775,6 +789,12 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 self._http_client.get_trades,
                 params=params,
             )
+
+            if not retry_manager.result:
+                # Propagate: an empty result would be indistinguishable from success
+                raise RuntimeError(
+                    f"Failed to generate FillReports: {retry_manager.message}",
+                ) from retry_manager.last_exception
 
             if response:
                 # Uncomment for development

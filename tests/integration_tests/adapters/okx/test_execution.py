@@ -13,6 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -28,6 +29,7 @@ from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateFillReports
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
@@ -369,6 +371,140 @@ async def test_generate_order_status_reports_propagates_request_failure(
     # Act, Assert
     with pytest.raises(RuntimeError, match="boom"):
         await client.generate_order_status_reports(command)
+
+
+def _stub_unmatched_order_status_report(monkeypatch, http_client) -> None:
+    # The venue answers with an order which is not the one requested, so the algo
+    # fallback is reached.
+    report = MagicMock(
+        client_order_id=ClientOrderId("O-OTHER"),
+        venue_order_id=VenueOrderId("V-OTHER"),
+        linked_order_ids=None,
+    )
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.okx.execution.OrderStatusReport.from_pyo3",
+        lambda obj: report,
+    )
+    http_client.request_order_status_reports = AsyncMock(return_value=[MagicMock()])
+
+
+def _order_status_report_command() -> GenerateOrderStatusReport:
+    return GenerateOrderStatusReport(
+        instrument_id=InstrumentId(Symbol("BTC-USD"), OKX_VENUE),
+        client_order_id=ClientOrderId("O-1"),
+        venue_order_id=VenueOrderId("V-1"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than falling back to the algo lookup.
+    """
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_order_status_reports.side_effect = RuntimeError("boom")
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_report(_order_status_report_command())
+
+    http_client.request_algo_order_status_report.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_propagates_cancellation(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test cancellation is never swallowed by the order status report request.
+    """
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_order_status_reports.side_effect = asyncio.CancelledError
+
+    # Act, Assert
+    with pytest.raises(asyncio.CancelledError):
+        await client.generate_order_status_report(_order_status_report_command())
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_propagates_algo_fallback_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed algo fallback request propagates rather than reporting not found.
+    """
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
+    _stub_unmatched_order_status_report(monkeypatch, http_client)
+    http_client.request_algo_order_status_report.side_effect = RuntimeError("boom")
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_report(_order_status_report_command())
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_tries_algo_fallback_on_empty_regular_list(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test an empty regular-order response still reaches the algo fallback.
+    """
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_order_status_reports = AsyncMock(return_value=[])
+
+    expected_report = MagicMock(
+        client_order_id=ClientOrderId("O-1"),
+        venue_order_id=VenueOrderId("V-1"),
+        linked_order_ids=None,
+    )
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.okx.execution.OrderStatusReport.from_pyo3",
+        lambda obj: expected_report,
+    )
+    pyo3_algo_report = MagicMock()
+    pyo3_algo_report.quantity = "1"
+    http_client.request_algo_order_status_report = AsyncMock(return_value=pyo3_algo_report)
+
+    # Act
+    report = await client.generate_order_status_report(_order_status_report_command())
+
+    # Assert
+    http_client.request_algo_order_status_report.assert_awaited()
+    assert report is expected_report
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_returns_none_when_algo_not_found(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a venue 404 on the algo fallback is reported as ``None``.
+    """
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
+    _stub_unmatched_order_status_report(monkeypatch, http_client)
+    http_client.request_algo_order_status_report = AsyncMock(
+        side_effect=ValueError("404 Not Found"),
+    )
+
+    # Act
+    report = await client.generate_order_status_report(_order_status_report_command())
+
+    # Assert
+    assert report is None
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ import math
 import os
 from asyncio import Queue
 from collections import Counter
+from collections import deque
 from collections.abc import Iterable
 from decimal import Decimal
 from typing import Any
@@ -150,6 +151,7 @@ class LiveExecutionEngine(ExecutionEngine):
         # Reconciliation
         self._recon_check_retries: Counter[ClientOrderId] = Counter()
         self._ts_last_query: dict[ClientOrderId, int] = {}
+        self._missing_order_query_queue: deque[ClientOrderId] = deque()
         self._order_local_activity_ns: dict[ClientOrderId, int] = {}
         self._position_local_activity_ns: dict[InstrumentAccountKey, int] = {}
         self._position_recon_retries: Counter[InstrumentAccountKey] = Counter()
@@ -1312,26 +1314,23 @@ class LiveExecutionEngine(ExecutionEngine):
                 self._log.debug("No execution clients to check orders consistency, early return")
                 return
 
-            all_order_reports, venue_reported_ids = await self._query_order_status_reports()
+            (
+                all_order_reports,
+                venue_reported_ids,
+                failed_clients,
+            ) = await self._query_order_status_reports()
 
             self._reconcile_order_reports(all_order_reports, open_order_ids)
 
-            if self.open_check_open_only:
-                missing_orders = all_order_ids - venue_reported_ids
-                if missing_orders:
-                    self._log.debug(
-                        f"{len(missing_orders)} cached open order(s) not in venue's current response - "
-                        f"likely recently filled/canceled (venue may include recent closed orders with open query):",
-                    )
+            await self._handle_missing_orders_at_venue(
+                all_order_ids,
+                venue_reported_ids,
+                failed_clients,
+            )
 
-                    for order_id in missing_orders:
-                        self._log.debug(f"- {order_id}")
-
-                return  # Can't reliably resolve missing orders in open_only mode
-
-            await self._handle_missing_orders_at_venue(all_order_ids, venue_reported_ids)
-
-            self._validate_open_orders_consistency()
+            if not self.open_check_open_only:
+                # Cache-wide fill audit is not run for open-only responses
+                self._validate_open_orders_consistency()
         except Exception as e:
             self._log.exception("Error in check_order_consistency", e)
 
@@ -1348,17 +1347,45 @@ class LiveExecutionEngine(ExecutionEngine):
         self,
         open_order_ids: set[ClientOrderId],
         venue_reported_ids: set[ClientOrderId],
+        failed_order_report_clients: set[ClientId] | None = None,
     ) -> None:
         missing_at_venue: set[ClientOrderId] = open_order_ids - venue_reported_ids
         ts_now = self._clock.timestamp_ns()
 
+        # A FIFO queue rotates the per-cycle cap: an attempted order is removed before
+        # its query and re-appended at the tail while it stays open, so neither a
+        # persistently failing order nor a conclusively open one can starve the rest
+        self._missing_order_query_queue = deque(
+            cid for cid in self._missing_order_query_queue if cid in missing_at_venue
+        )
+        queued_order_ids = set(self._missing_order_query_queue)
+        self._missing_order_query_queue.extend(
+            sorted(missing_at_venue - queued_order_ids, key=lambda cid: cid.value)
+        )
+        query_order: list[ClientOrderId] = list(self._missing_order_query_queue)
+
         targeted_queries_count = 0
         logged_limit_warning = False
 
-        for client_order_id in missing_at_venue:
+        for client_order_id in query_order:
             order = self._cache.order(client_order_id)
             if order is None:
                 self._log.error(f"{client_order_id!r} missing at venue and not found in cache")
+                continue
+
+            if self._client_for_order(order) is None:
+                self._log.debug(
+                    f"Skipping missing-order reconciliation for {client_order_id!r} - "
+                    f"no registered execution client queries this order",
+                )
+                continue
+
+            if self._did_order_status_query_fail(order, failed_order_report_clients):
+                self._log.warning(
+                    f"Skipping missing-order reconciliation for {client_order_id!r}: "
+                    f"failed to query order status from its execution client",
+                    LogColor.YELLOW,
+                )
                 continue
 
             # Check if order is too recent to reconcile (avoid race conditions)
@@ -1408,8 +1435,17 @@ class LiveExecutionEngine(ExecutionEngine):
                     LogColor.YELLOW,
                 )
                 self._clear_recon_tracking(client_order_id, drop_last_query=False)
-                await self._resolve_order_not_found_at_venue(order)
+                conclusive = await self._resolve_order_not_found_at_venue(order)
                 targeted_queries_count += 1
+
+                if not conclusive:
+                    # Hold at the threshold so the next cycle queries again, rather than
+                    # spending another `open_check_missing_retries` cycles on an order
+                    # the venue has already been absent for.
+                    self._recon_check_retries[client_order_id] = retries
+
+                if order.is_open:
+                    self._missing_order_query_queue.append(client_order_id)
 
                 # Add delay between single-order queries (skip after final query)
                 if (
@@ -1423,52 +1459,101 @@ class LiveExecutionEngine(ExecutionEngine):
                     f"Order {client_order_id!r} not found at venue, retry {retries + 1}/{self.open_check_missing_retries}",
                 )
 
-    async def _resolve_order_not_found_at_venue(self, order: Order) -> None:
+    def _client_for_order(self, order: Order) -> ExecutionClient | None:
+        # Resolve the execution client which received the given order, mirroring the
+        # routing priority of `_find_client_for_command`: explicit client ID, account ID
+        # issuer, instrument venue, then the default client. An external client is never
+        # queried by this engine, so such an order has no resolvable owner and must not
+        # be attributed to another client.
+        client_id = self._cache.client_id(order.client_order_id)
+
+        if client_id is not None:
+            client = self._clients.get(client_id)
+
+            if client is not None:
+                return client
+
+            if client_id in self._external_clients:
+                return None
+
+        if order.account_id is not None:
+            issuer = order.account_id.get_issuer()
+
+            client = self._clients.get(ClientId(issuer))
+            if client is not None:
+                return client
+
+            client = self._routing_map.get(Venue(issuer))
+            if client is not None:
+                return client
+
+        return self._routing_map.get(order.instrument_id.venue, self._default_client)
+
+    def _did_order_status_query_fail(
+        self,
+        order: Order,
+        failed_order_report_clients: set[ClientId] | None,
+    ) -> bool:
+        if not failed_order_report_clients:
+            return False
+
+        client = self._client_for_order(order)
+
+        return client is not None and client.id in failed_order_report_clients
+
+    async def _resolve_order_not_found_at_venue(self, order: Order) -> bool:
+        # Returns whether the venue answered for this order, so the caller can hold the
+        # order at its retry threshold when nothing could be concluded.
         ts_now = self._clock.timestamp_ns()
 
         self._log.debug(
-            f"Performing single-order query for {order.client_order_id!r} before marking as REJECTED",
+            f"Performing single-order query for {order.client_order_id!r} before resolving",
             LogColor.BLUE,
         )
 
-        client_id = self._cache.client_id(order.client_order_id)
-        if client_id is None:
+        client = self._client_for_order(order)
+        if client is None:
             self._log.warning(
-                f"No client_id found for {order.client_order_id!r}, skipping targeted query",
+                f"No execution client for {order.client_order_id!r}, "
+                f"cannot resolve order missing at venue",
             )
-            # Skip targeted query but proceed with resolution
-        else:
-            client = self._clients.get(client_id)
+            return False  # Cannot conclude, the order keeps its cached state
 
-            try:
-                query_ts = self._clock.timestamp_ns()
-                command = GenerateOrderStatusReport(
-                    instrument_id=order.instrument_id,
-                    client_order_id=order.client_order_id,
-                    venue_order_id=order.venue_order_id,
-                    command_id=UUID4(),
-                    ts_init=query_ts,
-                )
+        try:
+            query_ts = self._clock.timestamp_ns()
+            command = GenerateOrderStatusReport(
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=order.venue_order_id,
+                command_id=UUID4(),
+                ts_init=query_ts,
+            )
 
-                self._ts_last_query[order.client_order_id] = query_ts
-                report = await client.generate_order_status_report(command)
-                if report is not None:
-                    self._log.info(
-                        f"Found {order.client_order_id!r} via targeted query: {report.order_status}",
-                        LogColor.BLUE,
-                    )
-                    self._reconcile_order_report(report, trades=[])
-                    return  # Order found and reconciled, no need to mark as rejected
-            except Exception as e:
-                self._log.warning(f"Error during targeted query for {order.client_order_id!r}: {e}")
+            self._ts_last_query[order.client_order_id] = query_ts
+            report = await client.generate_order_status_report(command)
+        except Exception as e:
+            self._log.warning(
+                f"Targeted query for {order.client_order_id!r} failed ({e}), "
+                f"cannot resolve order missing at venue",
+            )
+            return False  # Cannot conclude, the order keeps its cached state
 
+        if report is not None:
+            self._log.info(
+                f"Found {order.client_order_id!r} via targeted query: {report.order_status}",
+                LogColor.BLUE,
+            )
+            self._reconcile_order_report(report, trades=[])
+            return True  # The venue's individual answer is the authority
+
+        # The venue answered and does not know the order: resolve from cached state
         if not order.is_open:
             self._log.debug(
                 f"Skipping reconciliation for {order.client_order_id!r} - already {order.status_string()}",
             )
             self._clear_recon_tracking(order.client_order_id)
             self._order_local_activity_ns.pop(order.client_order_id, None)
-            return
+            return True
 
         if order.status == OrderStatus.ACCEPTED:
             self._log.warning(
@@ -1483,7 +1568,7 @@ class LiveExecutionEngine(ExecutionEngine):
             self._handle_event_with_tracking(rejected)
             self._clear_recon_tracking(order.client_order_id)
             self._order_local_activity_ns.pop(order.client_order_id, None)
-            return
+            return True
 
         if order.status == OrderStatus.PARTIALLY_FILLED:
             self._log.warning(
@@ -1498,7 +1583,7 @@ class LiveExecutionEngine(ExecutionEngine):
             self._handle_event_with_tracking(canceled)
             self._clear_recon_tracking(order.client_order_id)
             self._order_local_activity_ns.pop(order.client_order_id, None)
-            return
+            return True
 
         if order.status == OrderStatus.SUBMITTED:
             self._log.warning(
@@ -1513,7 +1598,7 @@ class LiveExecutionEngine(ExecutionEngine):
             self._handle_event_with_tracking(rejected)
             self._clear_recon_tracking(order.client_order_id)
             self._order_local_activity_ns.pop(order.client_order_id, None)
-            return
+            return True
 
         if order.is_inflight:
             self._log.debug(
@@ -1521,7 +1606,7 @@ class LiveExecutionEngine(ExecutionEngine):
             )
             self._clear_recon_tracking(order.client_order_id, drop_last_query=False)
             self._ts_last_query[order.client_order_id] = ts_now
-            return
+            return True
 
         if order.is_closed:
             if order.status == OrderStatus.FILLED:
@@ -1535,7 +1620,7 @@ class LiveExecutionEngine(ExecutionEngine):
                 )
             self._clear_recon_tracking(order.client_order_id)
             self._order_local_activity_ns.pop(order.client_order_id, None)
-            return
+            return True
 
         self._log.warning(
             f"Unexpected order status {order.status_string()} "
@@ -1544,14 +1629,16 @@ class LiveExecutionEngine(ExecutionEngine):
         self._clear_recon_tracking(order.client_order_id)
         self._order_local_activity_ns.pop(order.client_order_id, None)
 
+        return True
+
     async def _query_order_status_reports(
         self,
-    ) -> tuple[list[OrderStatusReport], set[ClientOrderId]]:
+    ) -> tuple[list[OrderStatusReport], set[ClientOrderId], set[ClientId]]:
         order_status_start = self._clock.utc_now() - pd.Timedelta(
             minutes=self.open_check_lookback_mins,
         )
 
-        clients = self._clients.values()
+        clients = list(self._clients.values())
 
         tasks = [
             c.generate_order_status_reports(
@@ -1570,24 +1657,33 @@ class LiveExecutionEngine(ExecutionEngine):
 
         order_reports_all = await asyncio.gather(*tasks, return_exceptions=True)
         all_order_reports: list[OrderStatusReport] = []
+        failed_clients: set[ClientId] = set()
 
-        for reports_or_exception in order_reports_all:
+        for client, reports_or_exception in zip(clients, order_reports_all, strict=True):
             if isinstance(reports_or_exception, BaseException):
+                failed_clients.add(client.id)
                 self._log.error(
-                    f"Failed to generate order status reports: {reports_or_exception}",
+                    f"Failed to generate order status reports for client {client.id}: "
+                    f"{reports_or_exception}",
                 )
                 continue
 
             reports = cast(list[OrderStatusReport], reports_or_exception)
             all_order_reports.extend(reports)
 
-        venue_reported_ids: set[ClientOrderId] = {
-            report.client_order_id
-            for report in all_order_reports
-            if report.client_order_id is not None
-        }
+        venue_reported_ids: set[ClientOrderId] = set()
 
-        return all_order_reports, venue_reported_ids
+        for report in all_order_reports:
+            client_order_id = report.client_order_id
+
+            if client_order_id is None and report.venue_order_id is not None:
+                # A venue-only report still identifies a cached order, which is not absent
+                client_order_id = self._cache.client_order_id(report.venue_order_id)
+
+            if client_order_id is not None:
+                venue_reported_ids.add(client_order_id)
+
+        return all_order_reports, venue_reported_ids, failed_clients
 
     def _reconcile_order_reports(
         self,
@@ -3774,6 +3870,9 @@ class LiveExecutionEngine(ExecutionEngine):
         drop_last_query: bool = True,
     ) -> None:
         self._recon_check_retries.pop(client_order_id, None)
+
+        if client_order_id in self._missing_order_query_queue:
+            self._missing_order_query_queue.remove(client_order_id)
 
         if drop_last_query:
             self._ts_last_query.pop(client_order_id, None)

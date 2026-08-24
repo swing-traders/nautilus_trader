@@ -2472,6 +2472,118 @@ class TestBinanceFuturesExecutionClient:
         assert report is mock_report
 
     @pytest.mark.asyncio
+    async def test_generate_order_status_report_propagates_regular_query_failure(
+        self,
+        mocker,
+    ):
+        """
+        Test a failed regular order query propagates rather than falling back to algo.
+        """
+        # Arrange
+        mocker.patch.object(
+            self.exec_client.__class__.__bases__[0],
+            "generate_order_status_report",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        )
+        mock_query_algo = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_algo_order",
+        )
+
+        command = GenerateOrderStatusReport(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            client_order_id=ClientOrderId("O-20251224-071254-eK0z-000-1"),
+            venue_order_id=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(RuntimeError, match="boom"):
+            await self.exec_client.generate_order_status_report(command)
+
+        mock_query_algo.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_report_propagates_algo_query_failure(
+        self,
+        mocker,
+    ):
+        """
+        Test a failed algo query propagates rather than reporting the order not found.
+        """
+        # Arrange
+        from nautilus_trader.adapters.binance.http.error import BinanceError
+
+        mocker.patch.object(
+            self.exec_client.__class__.__bases__[0],
+            "generate_order_status_report",
+            new=AsyncMock(return_value=None),
+        )
+
+        error = BinanceError(
+            status=500,
+            message={"code": -1001, "msg": "Internal error."},
+            headers={},
+        )
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_algo_order",
+            new_callable=AsyncMock,
+            side_effect=error,
+        )
+
+        command = GenerateOrderStatusReport(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            client_order_id=ClientOrderId("O-20251224-071254-eK0z-000-1"),
+            venue_order_id=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(BinanceError):
+            await self.exec_client.generate_order_status_report(command)
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_report_propagates_algo_parse_failure(
+        self,
+        mocker,
+    ):
+        """
+        Test an unparseable algo order propagates rather than reporting not found.
+        """
+        # Arrange
+        mocker.patch.object(
+            self.exec_client.__class__.__bases__[0],
+            "generate_order_status_report",
+            new=AsyncMock(return_value=None),
+        )
+
+        algo_order_response = mocker.Mock()
+        algo_order_response.symbol = "ETHUSDT"
+        algo_order_response.parse_to_order_status_report = mocker.Mock(
+            side_effect=ValueError("bad enum"),
+        )
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_algo_order",
+            return_value=algo_order_response,
+        )
+
+        command = GenerateOrderStatusReport(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            client_order_id=ClientOrderId("O-20251224-071254-eK0z-000-1"),
+            venue_order_id=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(ValueError, match="bad enum"):
+            await self.exec_client.generate_order_status_report(command)
+
+    @pytest.mark.asyncio
     async def test_cancel_all_orders_with_open_orders_uses_batch_cancel(self, mocker):
         """
         Test that _cancel_all_orders uses batch cancel when strategy owns all orders.

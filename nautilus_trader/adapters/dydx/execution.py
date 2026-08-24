@@ -820,8 +820,9 @@ class DydxExecutionClient(LiveExecutionClient):
         Generate order status reports for the configured subaccount.
         """
         if not self._wallet_address:
-            self._log.warning("Cannot generate order reports: wallet not initialized")
-            return []
+            # Raise: the venue was never asked, so an empty result would be
+            # indistinguishable from the venue reporting no orders.
+            raise RuntimeError("Cannot generate order reports: wallet not initialized")
 
         self._log.debug(
             f"Requesting OrderStatusReports"

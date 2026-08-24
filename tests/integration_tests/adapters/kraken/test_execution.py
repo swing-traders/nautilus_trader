@@ -13,6 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import asyncio
 from decimal import Decimal
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -2489,6 +2490,85 @@ async def test_batch_cancel_orders_warns_when_venue_order_id_not_found(
 # ============================================================================
 # ORDER STATUS REPORT TESTS (instrument_id=None)
 # ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_propagates_request_failure(
+    exec_client_builder_spot,
+    monkeypatch,
+    instrument,
+):
+    """
+    Test a failed request propagates rather than reporting the order not found.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder_spot(monkeypatch)
+    http_client.request_order_status_reports.side_effect = RuntimeError("boom")
+
+    command = GenerateOrderStatusReport(
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-123456"),
+        venue_order_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_report(command)
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_raises_without_transport_for_product(
+    exec_client_builder_spot,
+    monkeypatch,
+    futures_instrument,
+):
+    """
+    Test an unconfigured product transport raises rather than reporting not found.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder_spot(monkeypatch)
+
+    command = GenerateOrderStatusReport(
+        instrument_id=futures_instrument.id,
+        client_order_id=ClientOrderId("O-123456"),
+        venue_order_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="No configured Kraken HTTP client"):
+        await client.generate_order_status_report(command)
+
+    http_client.request_order_status_reports.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_propagates_cancellation(
+    exec_client_builder_spot,
+    monkeypatch,
+    instrument,
+):
+    """
+    Test cancellation is never swallowed by the order status report request.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder_spot(monkeypatch)
+    http_client.request_order_status_reports.side_effect = asyncio.CancelledError
+
+    command = GenerateOrderStatusReport(
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-123456"),
+        venue_order_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(asyncio.CancelledError):
+        await client.generate_order_status_report(command)
 
 
 @pytest.mark.asyncio

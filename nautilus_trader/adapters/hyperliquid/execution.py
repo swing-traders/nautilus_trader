@@ -323,16 +323,16 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
+        venue_order_id = command.venue_order_id.value if command.venue_order_id else None
+        client_order_id = command.client_order_id.value if command.client_order_id else None
+
+        if venue_order_id is None and client_order_id is None:
+            # Raise: the venue was never asked, so `None` would be a false not-found
+            raise ValueError(
+                "Cannot generate order status report without venue_order_id or client_order_id",
+            )
+
         try:
-            venue_order_id = command.venue_order_id.value if command.venue_order_id else None
-            client_order_id = command.client_order_id.value if command.client_order_id else None
-
-            if venue_order_id is None and client_order_id is None:
-                self._log.warning(
-                    "Cannot generate order status report without venue_order_id or client_order_id",
-                )
-                return None
-
             pyo3_report = await self._client.request_order_status_report(
                 venue_order_id=venue_order_id,
                 client_order_id=client_order_id,
@@ -354,19 +354,24 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                     report.client_order_id = resolved_id
 
             self._promote_replacement_if_inflight_modify(report)
-
-            if self._is_inflight_modify_old_leg_cancel(report):
-                self._log.debug(
-                    f"Suppressing in-flight modify old-leg CANCELED for "
-                    f"{report.client_order_id!r}, venue_order_id={report.venue_order_id!r}",
-                )
-                return None
-
-            self._log.debug(f"Found order status report: {report}")
-            return report
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReport")
-            return None
+
+            # Propagate: a `None` result would be indistinguishable from order not found
+            raise
+
+        if self._is_inflight_modify_old_leg_cancel(report):
+            # Raise: the old leg's CANCELED is withheld so the replacement can rebind,
+            # which is a cannot-conclude rather than the venue not knowing the order.
+            raise RuntimeError(
+                f"Cannot conclude status for {report.client_order_id!r}: withholding "
+                f"in-flight modify old-leg CANCELED, "
+                f"venue_order_id={report.venue_order_id!r}",
+            )
+
+        self._log.debug(f"Found order status report: {report}")
+
+        return report
 
     async def generate_order_status_reports(
         self,

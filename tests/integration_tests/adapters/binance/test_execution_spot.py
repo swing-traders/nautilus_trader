@@ -759,6 +759,167 @@ class TestBinanceSpotExecutionClient:
         mock_generate_rejected.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_generate_order_status_report_propagates_request_failure(self, mocker):
+        """
+        Test a failed request propagates rather than reporting the order not found.
+        """
+        # Arrange
+        order = self.strategy.order_factory.limit(
+            instrument_id=ETHUSDT_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(10),
+            price=Price.from_str("10050.80"),
+        )
+        venue_order_id = VenueOrderId("12345")
+        self.cache.add_order(order, None)
+
+        order.apply(TestEventStubs.order_submitted(order, account_id=self.account_id))
+        order.apply(
+            TestEventStubs.order_accepted(
+                order,
+                account_id=self.account_id,
+                venue_order_id=venue_order_id,
+            ),
+        )
+        self.cache.update_order(order)
+
+        error = BinanceError(
+            status=500,
+            message={"code": -1001, "msg": "Internal error."},
+            headers={},
+        )
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new_callable=AsyncMock,
+            side_effect=error,
+        )
+
+        command = GenerateOrderStatusReport(
+            instrument_id=ETHUSDT_BINANCE.id,
+            client_order_id=order.client_order_id,
+            venue_order_id=venue_order_id,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(BinanceError):
+            await self.exec_client.generate_order_status_report(command)
+
+        assert order.status == OrderStatus.ACCEPTED
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_report_raises_on_zero_quantity_order(self, mocker):
+        """
+        Test a venue-returned zero-quantity order raises rather than reporting not
+        found.
+        """
+        # Arrange
+        order = self.strategy.order_factory.limit(
+            instrument_id=ETHUSDT_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(10),
+            price=Price.from_str("10050.80"),
+        )
+        venue_order_id = VenueOrderId("12345")
+        self.cache.add_order(order, None)
+
+        binance_order = mocker.Mock()
+        binance_order.origQty = "0"
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new_callable=AsyncMock,
+            return_value=binance_order,
+        )
+
+        command = GenerateOrderStatusReport(
+            instrument_id=ETHUSDT_BINANCE.id,
+            client_order_id=order.client_order_id,
+            venue_order_id=venue_order_id,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(ValueError, match="quantity was zero"):
+            await self.exec_client.generate_order_status_report(command)
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_report_returns_none_when_venue_has_no_order(self, mocker):
+        """
+        Test a venue answer of no such order is reported as ``None``.
+        """
+        # Arrange
+        order = self.strategy.order_factory.limit(
+            instrument_id=ETHUSDT_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(10),
+            price=Price.from_str("10050.80"),
+        )
+        self.cache.add_order(order, None)
+
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        command = GenerateOrderStatusReport(
+            instrument_id=ETHUSDT_BINANCE.id,
+            client_order_id=order.client_order_id,
+            venue_order_id=VenueOrderId("12345"),
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act
+        report = await self.exec_client.generate_order_status_report(command)
+
+        # Assert
+        assert report is None
+
+    @pytest.mark.asyncio
+    async def test_generate_order_status_report_propagates_after_max_retries(self, mocker):
+        """
+        Test the retry circuit breaker raises rather than reporting the order not found.
+        """
+        # Arrange
+        order = self.strategy.order_factory.limit(
+            instrument_id=ETHUSDT_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(10),
+            price=Price.from_str("10050.80"),
+        )
+        venue_order_id = VenueOrderId("12345")
+        self.cache.add_order(order, None)
+        self.exec_client._generate_order_status_retries[order.client_order_id] = (
+            self.exec_client._max_retries + 1
+        )
+
+        mock_query_order = mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new_callable=AsyncMock,
+        )
+
+        command = GenerateOrderStatusReport(
+            instrument_id=ETHUSDT_BINANCE.id,
+            client_order_id=order.client_order_id,
+            venue_order_id=venue_order_id,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act, Assert
+        with pytest.raises(RuntimeError, match="Reached maximum retries"):
+            await self.exec_client.generate_order_status_report(command)
+
+        mock_query_order.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_cancel_all_orders_with_open_orders_uses_batch_cancel(self, mocker):
         """
         Test that _cancel_all_orders uses batch cancel when strategy owns all orders.

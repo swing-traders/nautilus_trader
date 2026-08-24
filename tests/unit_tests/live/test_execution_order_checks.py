@@ -40,6 +40,7 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import TimeInForce
+from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import Venue
@@ -2014,7 +2015,7 @@ async def test_order_found_at_venue_clears_retry_counter(
 
 
 @pytest.mark.asyncio
-async def test_open_check_open_only_mode_does_not_reject_missing_orders(
+async def test_open_check_open_only_mode_defers_rejection_until_venue_answers(
     exec_engine,
     exec_client,
     cache,
@@ -2022,8 +2023,9 @@ async def test_open_check_open_only_mode_does_not_reject_missing_orders(
     clock,
 ):
     """
-    Test that orders not in venue's open orders response are NOT marked as rejected when
-    using open_check_open_only=True mode (they might be filled/canceled).
+    Test that orders not in venue's open orders response are NOT marked as rejected on
+    absence alone in open_check_open_only=True mode (they might be filled/canceled), and
+    are resolved once the targeted query answers.
     """
     # Arrange
     exec_engine.open_check_open_only = True
@@ -2058,13 +2060,27 @@ async def test_open_check_open_only_mode_does_not_reject_missing_orders(
     # Configure venue to return empty list (simulating order was filled/canceled)
     exec_client._order_status_reports.clear()
 
-    # Act
-    for _ in range(3):
+    queries = []
+    original_query = exec_client.generate_order_status_report
+
+    async def counting_query(command):
+        queries.append(command.client_order_id)
+        return await original_query(command)
+
+    exec_client.generate_order_status_report = counting_query
+
+    # Act, Assert
+    for _ in range(exec_engine.open_check_missing_retries):
         await exec_engine._check_orders_consistency()
 
-    # Assert
+    assert queries == []
     assert order.status == OrderStatus.ACCEPTED
     assert not order.is_closed
+
+    await exec_engine._check_orders_consistency()
+
+    assert queries == [order.client_order_id]
+    assert order.status == OrderStatus.REJECTED
 
 
 @pytest.mark.asyncio
@@ -2485,12 +2501,17 @@ async def test_query_order_status_reports_success(exec_engine_open_check, exec_c
     exec_client.add_order_status_report(report)
 
     # Act
-    all_reports, venue_reported_ids = await exec_engine_open_check._query_order_status_reports()
+    (
+        all_reports,
+        venue_reported_ids,
+        failed_clients,
+    ) = await exec_engine_open_check._query_order_status_reports()
 
     # Assert
     assert len(all_reports) == 1
     assert all_reports[0].client_order_id == ClientOrderId("O-123")
     assert ClientOrderId("O-123") in venue_reported_ids
+    assert failed_clients == set()
 
 
 @pytest.mark.asyncio
@@ -2506,11 +2527,16 @@ async def test_query_order_status_reports_handles_exceptions(exec_engine_open_ch
     exec_client.generate_order_status_reports = raise_error
 
     # Act
-    all_reports, venue_reported_ids = await exec_engine_open_check._query_order_status_reports()
+    (
+        all_reports,
+        venue_reported_ids,
+        failed_clients,
+    ) = await exec_engine_open_check._query_order_status_reports()
 
     # Assert
     assert len(all_reports) == 0
     assert len(venue_reported_ids) == 0
+    assert failed_clients == {exec_client.id}
 
 
 @pytest.mark.asyncio
@@ -2576,13 +2602,18 @@ async def test_query_order_status_reports_multiple_clients(
     client2.add_order_status_report(report2)
 
     # Act
-    all_reports, venue_reported_ids = await exec_engine_open_check._query_order_status_reports()
+    (
+        all_reports,
+        venue_reported_ids,
+        failed_clients,
+    ) = await exec_engine_open_check._query_order_status_reports()
 
     # Assert
     assert len(all_reports) == 2
     assert len(venue_reported_ids) == 2
     assert ClientOrderId("O-1") in venue_reported_ids
     assert ClientOrderId("O-2") in venue_reported_ids
+    assert failed_clients == set()
 
 
 @pytest.mark.asyncio
@@ -2604,11 +2635,12 @@ async def test_query_order_status_reports_no_clients(exec_engine_open_check, tra
     )
 
     # Act
-    all_reports, venue_reported_ids = await engine._query_order_status_reports()
+    all_reports, venue_reported_ids, failed_clients = await engine._query_order_status_reports()
 
     # Assert
     assert len(all_reports) == 0
     assert len(venue_reported_ids) == 0
+    assert failed_clients == set()
 
 
 # =============================================================================
@@ -3232,3 +3264,698 @@ async def test_reconcile_order_reports_proceeds_after_threshold_exceeded(
 
     # Assert - reconciliation should proceed since activity is past threshold
     assert reconciled_count == 1, "Reconciliation should proceed when threshold exceeded"
+
+
+# =============================================================================
+# Tests for missing-order resolution evidence
+# =============================================================================
+
+
+@pytest.fixture(name="exec_engine_open_only")
+def fixture_exec_engine_open_only(event_loop, msgbus, cache, clock, exec_client):
+    """
+    Create an execution engine checking open orders with an open-only venue query.
+    """
+    exec_engine = LiveExecutionEngine(
+        loop=event_loop,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        config=LiveExecEngineConfig(
+            open_check_interval_secs=0.1,
+            open_check_open_only=True,
+            open_check_threshold_ms=0,
+            open_check_missing_retries=2,
+            reconciliation_startup_delay_secs=0.0,
+        ),
+    )
+    exec_engine.register_client(exec_client)
+
+    yield exec_engine
+
+    exec_engine.stop()
+    ensure_all_tasks_completed()
+
+
+def _accepted_order(cache, account_id, clock, client_order_id=None):
+    order = TestExecStubs.limit_order(
+        instrument=AUDUSD_SIM,
+        client_order_id=client_order_id,
+    )
+    cache.add_order(order)
+
+    old_ts = clock.timestamp_ns() - 10_000_000_000
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=old_ts))
+    order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=old_ts))
+    cache.update_order(order)
+
+    return order
+
+
+def _status_report(order, account_id, order_status, ts_ns):
+    return OrderStatusReport(
+        account_id=account_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=order.venue_order_id or VenueOrderId("V-1"),
+        order_side=order.side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=order_status,
+        price=order.price,
+        quantity=order.quantity,
+        filled_qty=Quantity.from_int(0),
+        report_id=UUID4(),
+        ts_accepted=ts_ns,
+        ts_last=ts_ns,
+        ts_init=ts_ns,
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_only_missing_order_resolved_by_targeted_query(
+    exec_engine_open_only,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test an order absent from open-only responses resolves from the targeted query.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_only
+    order = _accepted_order(cache, account_id, clock)
+    exec_client._order_status_reports.clear()
+
+    canceled_report = _status_report(
+        order,
+        account_id,
+        OrderStatus.CANCELED,
+        clock.timestamp_ns(),
+    )
+
+    async def targeted_query(command):
+        return canceled_report
+
+    exec_client.generate_order_status_report = targeted_query
+    exec_engine._recon_check_retries[order.client_order_id] = exec_engine.open_check_missing_retries
+
+    # Act
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert order.status == OrderStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_open_only_missing_order_advances_retries_before_resolving(
+    exec_engine_open_only,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test the missing-retries contract is honored before a targeted query is made.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_only
+    order = _accepted_order(cache, account_id, clock)
+    exec_client._order_status_reports.clear()
+
+    queries = []
+
+    async def targeted_query(command):
+        queries.append(command.client_order_id)
+        return _status_report(order, account_id, OrderStatus.CANCELED, clock.timestamp_ns())
+
+    exec_client.generate_order_status_report = targeted_query
+
+    # Act, Assert
+    await exec_engine._check_orders_consistency()
+    assert exec_engine._recon_check_retries[order.client_order_id] == 1
+    assert queries == []
+
+    await exec_engine._check_orders_consistency()
+    assert exec_engine._recon_check_retries[order.client_order_id] == 2
+    assert queries == []
+
+    await exec_engine._check_orders_consistency()
+    assert queries == [order.client_order_id]
+    assert order.status == OrderStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_query_does_not_advance_missing_retries(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test a failed batch query never counts a cached order as missing at the venue.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_check
+    order = _accepted_order(cache, account_id, clock)
+
+    async def raise_error(command):
+        raise RuntimeError("API error")
+
+    exec_client.generate_order_status_reports = raise_error
+
+    # Act
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert exec_engine._recon_check_retries.get(order.client_order_id, 0) == 0
+    assert order.status == OrderStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_query_does_not_resolve_order_at_threshold(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test a failed batch query never resolves a cached order which is at the threshold.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_check
+    order = _accepted_order(cache, account_id, clock)
+
+    async def raise_error(command):
+        raise RuntimeError("API error")
+
+    exec_client.generate_order_status_reports = raise_error
+
+    queries = []
+
+    async def targeted_query(command):
+        queries.append(command.client_order_id)
+        return None
+
+    exec_client.generate_order_status_report = targeted_query
+    exec_engine._recon_check_retries[order.client_order_id] = exec_engine.open_check_missing_retries
+
+    # Act
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert queries == []
+    assert order.status == OrderStatus.ACCEPTED
+    assert (
+        exec_engine._recon_check_retries[order.client_order_id]
+        == exec_engine.open_check_missing_retries
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_query_isolates_other_clients(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test one client's failure does not exclude another client's cached orders.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_check
+    venue2 = Venue("SIM2")
+    client2 = MockLiveExecutionClient(
+        loop=exec_engine._loop,
+        client_id=ClientId("SIM2"),
+        venue=venue2,
+        account_type=AccountType.CASH,
+        base_currency=USD,
+        instrument_provider=InstrumentProvider(),
+        msgbus=exec_engine._msgbus,
+        cache=cache,
+        clock=clock,
+    )
+    exec_engine.register_client(client2)
+
+    order = _accepted_order(cache, account_id, clock)
+
+    async def raise_error(command):
+        raise RuntimeError("API error")
+
+    client2.generate_order_status_reports = raise_error
+    exec_client._order_status_reports.clear()
+
+    # Act
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert exec_engine._recon_check_retries[order.client_order_id] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_targeted_query_does_not_reject_order(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test a failed targeted query never resolves an order as not found at the venue.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_check
+    order = _accepted_order(cache, account_id, clock)
+    exec_client._order_status_reports.clear()
+
+    async def raise_error(command):
+        raise RuntimeError("API error")
+
+    exec_client.generate_order_status_report = raise_error
+    exec_engine._recon_check_retries[order.client_order_id] = exec_engine.open_check_missing_retries
+
+    # Act
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert order.status == OrderStatus.ACCEPTED
+    assert order.is_open
+
+
+@pytest.mark.asyncio
+async def test_venue_confirmed_not_found_after_cancel_resolves_canceled(
+    exec_engine_continuous,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test absence at the venue after our own cancel resolves the order as CANCELED.
+    """
+    # Arrange
+    exec_engine = exec_engine_continuous
+    order = _accepted_order(cache, account_id, clock)
+
+    old_ts = clock.timestamp_ns() - 10_000_000_000
+    order.apply(TestEventStubs.order_pending_cancel(order, ts_event=old_ts))
+    cache.update_order(order)
+    assert order.status == OrderStatus.PENDING_CANCEL
+
+    exec_client._order_status_reports.clear()
+
+    async def targeted_query(command):
+        return None  # Venue answered: order not found
+
+    exec_client.generate_order_status_report = targeted_query
+    exec_engine._recon_check_retries[order.client_order_id] = exec_engine.open_check_missing_retries
+
+    # Act
+    await exec_engine._check_orders_consistency()
+    assert order.status == OrderStatus.PENDING_CANCEL
+
+    for _ in range(exec_engine.inflight_check_max_retries + 1):
+        await asyncio.sleep(0.05)
+        await exec_engine._check_inflight_orders()
+
+    # Assert
+    assert order.status == OrderStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_order_reported_open_is_never_queried_individually(
+    exec_engine_open_only,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test an order present in the venue response never reaches the resolution path.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_only
+    order = _accepted_order(cache, account_id, clock)
+    exec_client._order_status_reports.clear()
+    exec_client.add_order_status_report(
+        _status_report(order, account_id, OrderStatus.ACCEPTED, clock.timestamp_ns()),
+    )
+
+    queries = []
+
+    async def targeted_query(command):
+        queries.append(command.client_order_id)
+        return None
+
+    exec_client.generate_order_status_report = targeted_query
+    exec_engine._recon_check_retries[order.client_order_id] = exec_engine.open_check_missing_retries
+
+    # Act
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert queries == []
+    assert order.status == OrderStatus.ACCEPTED
+    assert order.client_order_id not in exec_engine._recon_check_retries
+
+
+@pytest.mark.asyncio
+async def test_order_owned_by_external_client_is_never_resolved(
+    exec_engine_external_client,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test an order owned by an external client the engine never queries is not resolved.
+    """
+    # Arrange
+    exec_engine = exec_engine_external_client
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, None, ClientId("EXTERNAL"))
+
+    old_ts = clock.timestamp_ns() - 10_000_000_000
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=old_ts))
+    order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=old_ts))
+    cache.update_order(order)
+
+    exec_client._order_status_reports.clear()
+
+    queries = []
+
+    async def targeted_query(command):
+        queries.append(command.client_order_id)
+        return None
+
+    exec_client.generate_order_status_report = targeted_query
+    exec_engine._recon_check_retries[order.client_order_id] = exec_engine.open_check_missing_retries
+
+    # Act
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert queries == []
+    assert order.status == OrderStatus.ACCEPTED
+    assert (
+        exec_engine._recon_check_retries[order.client_order_id]
+        == exec_engine.open_check_missing_retries
+    )
+
+
+@pytest.mark.asyncio
+async def test_order_reported_by_venue_order_id_only_is_not_counted_missing(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test a report identifying a cached order only by venue order ID counts as present.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_check
+    venue_order_id = VenueOrderId("V-VENUE-ONLY")
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order)
+
+    old_ts = clock.timestamp_ns() - 10_000_000_000
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=old_ts))
+    order.apply(
+        TestEventStubs.order_accepted(
+            order,
+            account_id=account_id,
+            venue_order_id=venue_order_id,
+            ts_event=old_ts,
+        ),
+    )
+    cache.update_order(order)
+
+    current_ns = clock.timestamp_ns()
+    exec_client._order_status_reports.clear()
+    exec_client.add_order_status_report(
+        OrderStatusReport(
+            account_id=account_id,
+            instrument_id=order.instrument_id,
+            client_order_id=None,
+            venue_order_id=venue_order_id,
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            order_status=OrderStatus.ACCEPTED,
+            price=order.price,
+            quantity=order.quantity,
+            filled_qty=Quantity.from_int(0),
+            report_id=UUID4(),
+            ts_accepted=current_ns,
+            ts_last=current_ns,
+            ts_init=current_ns,
+        ),
+    )
+
+    # Act
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert exec_engine._recon_check_retries.get(order.client_order_id, 0) == 0
+    assert order.status == OrderStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_failed_targeted_query_retries_on_the_next_cycle(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test a failed targeted query is retried on the next cycle, not after N more.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_check
+    order = _accepted_order(cache, account_id, clock)
+    exec_client._order_status_reports.clear()
+
+    queries = []
+
+    async def raise_error(command):
+        queries.append(command.client_order_id)
+        raise RuntimeError("API error")
+
+    exec_client.generate_order_status_report = raise_error
+    exec_engine._recon_check_retries[order.client_order_id] = exec_engine.open_check_missing_retries
+
+    # Act
+    await exec_engine._check_orders_consistency()
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert queries == [order.client_order_id, order.client_order_id]
+    assert order.status == OrderStatus.ACCEPTED
+
+
+@pytest.fixture(name="exec_engine_external_client")
+def fixture_exec_engine_external_client(event_loop, msgbus, cache, clock, exec_client):
+    """
+    Create an execution engine which routes one client ID to an external process.
+    """
+    exec_engine = LiveExecutionEngine(
+        loop=event_loop,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        config=LiveExecEngineConfig(
+            external_clients=[ClientId("EXTERNAL")],
+            open_check_interval_secs=0.1,
+            open_check_open_only=False,
+            open_check_threshold_ms=0,
+            reconciliation_startup_delay_secs=0.0,
+        ),
+    )
+    exec_engine.register_client(exec_client)
+
+    yield exec_engine
+
+    exec_engine.stop()
+    ensure_all_tasks_completed()
+
+
+@pytest.mark.asyncio
+async def test_order_with_unknown_explicit_client_id_still_resolves(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    clock,
+):
+    """
+    Test an order dispatched by venue routing resolves despite an unknown client ID.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, None, ClientId("STALE-ID"))
+
+    old_ts = clock.timestamp_ns() - 10_000_000_000
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=old_ts))
+    order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=old_ts))
+    cache.update_order(order)
+
+    exec_client._order_status_reports.clear()
+
+    queries = []
+
+    async def targeted_query(command):
+        queries.append(command.client_order_id)
+        return None  # Venue answered: order not found
+
+    exec_client.generate_order_status_report = targeted_query
+    exec_engine._recon_check_retries[order.client_order_id] = exec_engine.open_check_missing_retries
+
+    # Act
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert queries == [order.client_order_id]
+    assert order.status == OrderStatus.REJECTED
+
+
+@pytest.mark.asyncio
+async def test_order_routed_by_account_issuer_uses_that_client(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    clock,
+):
+    """
+    Test an order routed by its account issuer is not attributed to the venue client.
+    """
+    # Arrange
+    exec_engine = exec_engine_open_check
+    account_client = MockLiveExecutionClient(
+        loop=exec_engine._loop,
+        client_id=ClientId("ACCOUNT"),
+        venue=Venue("ACCOUNT"),
+        account_type=AccountType.CASH,
+        base_currency=USD,
+        instrument_provider=InstrumentProvider(),
+        msgbus=exec_engine._msgbus,
+        cache=cache,
+        clock=clock,
+    )
+    exec_engine.register_client(account_client)
+
+    account_id = AccountId("ACCOUNT-1")
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, None, ClientId("STALE-ID"))
+
+    old_ts = clock.timestamp_ns() - 10_000_000_000
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=old_ts))
+    order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=old_ts))
+    cache.update_order(order)
+
+    async def raise_error(command):
+        raise RuntimeError("API error")
+
+    account_client.generate_order_status_reports = raise_error
+    exec_client._order_status_reports.clear()
+
+    queries = []
+
+    async def targeted_query(command):
+        queries.append(command.client_order_id)
+        return None
+
+    exec_client.generate_order_status_report = targeted_query
+    exec_engine._recon_check_retries[order.client_order_id] = exec_engine.open_check_missing_retries
+
+    # Act
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert queries == []
+    assert order.status == OrderStatus.ACCEPTED
+
+
+@pytest.fixture(name="exec_engine_single_query_cap")
+def fixture_exec_engine_single_query_cap(event_loop, msgbus, cache, clock, exec_client):
+    """
+    Create an execution engine capped at one single-order query per cycle.
+    """
+    exec_engine = LiveExecutionEngine(
+        loop=event_loop,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        config=LiveExecEngineConfig(
+            open_check_interval_secs=0.1,
+            open_check_open_only=False,
+            open_check_threshold_ms=0,
+            open_check_missing_retries=0,
+            max_single_order_queries_per_cycle=1,
+            single_order_query_delay_ms=0,
+            reconciliation_startup_delay_secs=0.0,
+        ),
+    )
+    exec_engine.register_client(exec_client)
+
+    yield exec_engine
+
+    exec_engine.stop()
+    ensure_all_tasks_completed()
+
+
+@pytest.mark.asyncio
+async def test_targeted_queries_rotate_after_failed_and_open_reports_when_capped(
+    exec_engine_single_query_cap,
+    exec_client,
+    cache,
+    clock,
+    account_id,
+):
+    """
+    Test failed and still-open targeted queries rotate when capped at one per cycle.
+    """
+    # Arrange
+    exec_engine = exec_engine_single_query_cap
+    first = _accepted_order(cache, account_id, clock, ClientOrderId("O-CAP-1"))
+    second = _accepted_order(cache, account_id, clock, ClientOrderId("O-CAP-2"))
+    exec_client._order_status_reports.clear()
+
+    queries = []
+
+    async def targeted_query(command):
+        queries.append(command.client_order_id)
+
+        if command.client_order_id == first.client_order_id:
+            raise RuntimeError("API error")
+
+        return _status_report(
+            second,
+            account_id,
+            OrderStatus.ACCEPTED,
+            clock.timestamp_ns(),
+        )
+
+    exec_client.generate_order_status_report = targeted_query
+
+    # Act
+    await exec_engine._check_orders_consistency()
+    await exec_engine._check_orders_consistency()
+    await exec_engine._check_orders_consistency()
+
+    # Assert
+    assert queries == [
+        first.client_order_id,
+        second.client_order_id,
+        first.client_order_id,
+    ]
+    assert first.status == OrderStatus.ACCEPTED
+    assert second.status == OrderStatus.ACCEPTED

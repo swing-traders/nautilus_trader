@@ -193,10 +193,11 @@ class DeribitExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
-        self._log.warning(
-            f"generate_order_status_report not yet implemented (instrument_id={command.instrument_id})",
+        # Raise: the venue was never asked, so `None` would be a false not-found
+        raise NotImplementedError(
+            f"method `generate_order_status_report` is not yet implemented for Deribit "
+            f"(instrument_id={command.instrument_id})",
         )
-        return None
 
     async def generate_order_status_reports(
         self,

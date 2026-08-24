@@ -483,7 +483,12 @@ class KrakenExecutionClient(LiveExecutionClient):
                 end=None,
                 open_only=False,
             )
-        return []
+
+        # Raise: no configured transport asked the venue, so an empty result would be
+        # indistinguishable from the venue reporting no orders.
+        raise RuntimeError(
+            f"No configured Kraken HTTP client for {instrument_id} ({product_type})",
+        )
 
     async def _fetch_all_order_status_reports(self) -> list[nautilus_pyo3.OrderStatusReport]:
         """
@@ -552,9 +557,11 @@ class KrakenExecutionClient(LiveExecutionClient):
 
             return await self._generate_futures_filled_status_report(command)
 
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReport")
-            return None
+
+            # Propagate: a `None` result would be indistinguishable from order not found
+            raise
 
     async def generate_fill_reports(
         self,

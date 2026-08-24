@@ -33,6 +33,7 @@ from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateFillReports
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
@@ -235,6 +236,16 @@ async def test_generate_order_status_reports_caches_local_venue_position_id(
     # Assert
     assert reports == [expected_report]
     assert client._order_position_ids[order.client_order_id] == venue_position_id
+
+
+def _order_status_report_command() -> GenerateOrderStatusReport:
+    return GenerateOrderStatusReport(
+        instrument_id=InstrumentId(Symbol("BTCUSDT-LINEAR"), BYBIT_VENUE),
+        client_order_id=ClientOrderId("O-1"),
+        venue_order_id=VenueOrderId("V-1"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
 
 
 def _order_status_reports_command() -> GenerateOrderStatusReports:
@@ -609,6 +620,87 @@ async def test_report_generators_propagate_cancellation(
     # Act, Assert
     with pytest.raises(asyncio.CancelledError):
         await getattr(client, generator)(command_factory())
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting the order not found.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.query_order.side_effect = RuntimeError("boom")
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_report(_order_status_report_command())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "request canceled",
+        "instrument not found in cache",
+        "`symbol` must be initialized",
+        "unexpected wire format",
+    ],
+)
+async def test_generate_order_status_report_propagates_value_errors(
+    exec_client_builder,
+    monkeypatch,
+    message,
+):
+    """
+    Test every handled `ValueError` propagates rather than reporting the order not
+    found.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.query_order.side_effect = ValueError(message)
+
+    # Act, Assert
+    with pytest.raises(ValueError, match=re.escape(message)):
+        await client.generate_order_status_report(_order_status_report_command())
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_propagates_cancellation(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test cancellation is never swallowed by the order status report request.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.query_order.side_effect = asyncio.CancelledError
+
+    # Act, Assert
+    with pytest.raises(asyncio.CancelledError):
+        await client.generate_order_status_report(_order_status_report_command())
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_returns_none_when_venue_has_no_order(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a venue answer of no such order is reported as ``None``.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.query_order = AsyncMock(return_value=None)
+
+    # Act
+    report = await client.generate_order_status_report(_order_status_report_command())
+
+    # Assert
+    assert report is None
 
 
 # ============================================================================

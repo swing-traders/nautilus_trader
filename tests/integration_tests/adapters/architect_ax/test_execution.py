@@ -26,6 +26,7 @@ from nautilus_trader.adapters.architect_ax.factories import AxLiveExecClientFact
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateFillReports
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
@@ -313,6 +314,76 @@ async def test_account_id_set_on_initialization(exec_client_builder, monkeypatch
 
     # Assert
     assert client.account_id.value == "AX-001"
+
+
+def _order_status_report_command() -> GenerateOrderStatusReport:
+    return GenerateOrderStatusReport(
+        instrument_id=InstrumentId(Symbol("GBPUSD-PERP"), AX_VENUE),
+        client_order_id=ClientOrderId("O-1"),
+        venue_order_id=VenueOrderId("V-1"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_propagates_request_failure(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test a failed request propagates rather than reporting the order not found.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_order_status.side_effect = RuntimeError("boom")
+
+    # Act, Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_order_status_report(_order_status_report_command())
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_raises_without_instrument_id(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test an unresolvable instrument raises rather than reporting the order not found.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    command = GenerateOrderStatusReport(
+        instrument_id=None,
+        client_order_id=ClientOrderId("O-UNKNOWN"),
+        venue_order_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(ValueError, match="no instrument_id"):
+        await client.generate_order_status_report(command)
+
+    http_client.request_order_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_propagates_cancellation(
+    exec_client_builder,
+    monkeypatch,
+):
+    """
+    Test cancellation is never swallowed by the order status report request.
+    """
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_order_status.side_effect = asyncio.CancelledError
+
+    # Act, Assert
+    with pytest.raises(asyncio.CancelledError):
+        await client.generate_order_status_report(_order_status_report_command())
 
 
 @pytest.mark.asyncio

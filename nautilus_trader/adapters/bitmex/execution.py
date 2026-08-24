@@ -450,8 +450,10 @@ class BitmexExecutionClient(LiveExecutionClient):
         command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
         # TODO: Implement fetching specific order from BitMEX
-        self._log.warning("Order status report generation not yet implemented")
-        return None
+        # Raise: the venue was never asked, so `None` would be a false not-found
+        raise NotImplementedError(
+            "method `generate_order_status_report` is not yet implemented for BitMEX",
+        )
 
     async def generate_fill_reports(
         self,

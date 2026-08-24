@@ -552,28 +552,33 @@ class OKXExecutionClient(LiveExecutionClient):
                 instrument_id=pyo3_instrument_id,
             )
 
-            if not pyo3_reports:
-                return None
+            # An empty regular-order response still leaves the algo fallback to try
+            if pyo3_reports:
+                # Filter for the specific order we're looking for
+                self._log.warning(
+                    f"Resolving order status lookup for requested {command.client_order_id!r} -> canonical {canonical_requested_id!r}",
+                )
 
-            # Filter for the specific order we're looking for
-            self._log.warning(
-                f"Resolving order status lookup for requested {command.client_order_id!r} -> canonical {canonical_requested_id!r}",
-            )
+                for pyo3_report in pyo3_reports:
+                    report = OrderStatusReport.from_pyo3(pyo3_report)
+                    self._apply_client_order_alias(report)
+                    canonical_report_id = self._canonical_client_order_id(report.client_order_id)
 
-            for pyo3_report in pyo3_reports:
-                report = OrderStatusReport.from_pyo3(pyo3_report)
-                self._apply_client_order_alias(report)
-                canonical_report_id = self._canonical_client_order_id(report.client_order_id)
-
-                if (
-                    canonical_requested_id
-                    and canonical_report_id is not None
-                    and canonical_report_id == canonical_requested_id
-                ) or (command.venue_order_id and report.venue_order_id == command.venue_order_id):
-                    self._log.debug(f"Received {report}", LogColor.MAGENTA)
-                    return report
-        except (asyncio.CancelledError, Exception) as e:
+                    if (
+                        canonical_requested_id
+                        and canonical_report_id is not None
+                        and canonical_report_id == canonical_requested_id
+                    ) or (
+                        command.venue_order_id and report.venue_order_id == command.venue_order_id
+                    ):
+                        self._log.debug(f"Received {report}", LogColor.MAGENTA)
+                        return report
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReport")
+
+            # Propagate: an algo fallback or `None` result would be indistinguishable
+            # from order not found.
+            raise
 
         if canonical_requested_id is not None:
             return await self._resolve_algo_fallback(
@@ -663,12 +668,15 @@ class OKXExecutionClient(LiveExecutionClient):
                 self._log.debug(
                     f"OKX algo order status not found for {query_client_order_id!r} (404)",
                 )
-            else:
-                self._log.exception("Failed to generate OKX algo OrderStatusReport", e)
-        except Exception as e:
+                return None
+
             self._log.exception("Failed to generate OKX algo OrderStatusReport", e)
 
-        return None
+            # Propagate: a `None` result would be indistinguishable from order not found
+            raise
+        except Exception as e:
+            self._log.exception("Failed to generate OKX algo OrderStatusReport", e)
+            raise
 
     async def _fetch_algo_order_status_report_by_algo_id(
         self,
@@ -695,10 +703,15 @@ class OKXExecutionClient(LiveExecutionClient):
                 self._log.debug(
                     f"OKX algo order status not found for algo_id={algo_id} (404)",
                 )
-            else:
-                self._log.exception("Failed to query OKX algo order by algo_id", e)
+                return None
+
+            self._log.exception("Failed to query OKX algo order by algo_id", e)
+
+            # Propagate: a `None` result would be indistinguishable from order not found
+            raise
         except Exception as e:
             self._log.exception("Failed to query OKX algo order by algo_id", e)
+            raise
 
         return None
 

@@ -21,6 +21,7 @@ from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateFillReports
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
@@ -726,6 +727,25 @@ async def test_generate_order_status_reports_propagates_request_failure(
             await exec_client.generate_order_status_reports(command)
     finally:
         exec_client._mock_http_client.request_order_status_reports.side_effect = None
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_report_raises_not_implemented(exec_client, instrument):
+    """
+    Test the unimplemented single-order query raises rather than reporting not found.
+    """
+    # Arrange
+    command = GenerateOrderStatusReport(
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-1"),
+        venue_order_id=VenueOrderId("V-1"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act, Assert
+    with pytest.raises(NotImplementedError):
+        await exec_client.generate_order_status_report(command)
 
 
 @pytest.mark.asyncio
