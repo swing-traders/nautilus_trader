@@ -46,6 +46,7 @@ from nautilus_trader.config import ImportableActorConfig
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.correctness import PyCondition
+from nautilus_trader.core.data import Data
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.datetime import max_date
 from nautilus_trader.core.datetime import min_date
@@ -56,6 +57,8 @@ from nautilus_trader.live.factories import LiveDataClientFactory
 from nautilus_trader.model import BOOK_DATA_TYPES
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
+from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.data import capsule_to_list
 from nautilus_trader.model.data import pyo3_list_to_data_list
 from nautilus_trader.model.enums import AccountType
@@ -543,6 +546,10 @@ class BacktestNode:
         # Cache file lists per catalog and data type to avoid repeated filesystem operations
         cached_file_lists: dict[tuple[str, str | None, type], list[str]] = {}
 
+        # Names of the data series this stream supplies, so that subscribing to one of
+        # them is not also served from a catalog before the chunk carrying it arrives.
+        subscription_names: list[str] = []
+
         # Add query for all data configs
         for config in data_configs:
             catalog = self.load_catalog(config)
@@ -587,6 +594,26 @@ class BacktestNode:
                 end=used_end,
             )
 
+            # An inverted window selects no rows however many files it reaches, since a
+            # config narrowed by `end_time` can close before the run itself opens.
+            window_selects_rows = (
+                used_start is None
+                or used_end is None
+                or dt_to_unix_nanos(used_start) <= dt_to_unix_nanos(used_end)
+            )
+
+            # Only a config which reaches a file and can select rows supplies this
+            # stream, while any other config is left to the catalog request path, as a
+            # one-shot run does for a config returning no data.
+            if filter_files and window_selects_rows:
+                if config.data_type == Bar:
+                    subscription_names.extend(str(bar_type) for bar_type in used_bar_types)
+                elif config.data_type in (QuoteTick, TradeTick):
+                    subscription_names.extend(
+                        f"{config.data_type.__name__}.{instrument_id}"
+                        for instrument_id in used_instrument_ids
+                    )
+
             session = catalog.backend_session(
                 data_cls=config.data_type,
                 identifiers=(used_bar_types or used_instrument_ids),
@@ -597,6 +624,12 @@ class BacktestNode:
                 optimize_file_loading=config.optimize_file_loading,
             )
 
+        engine.add_subscription_names(subscription_names)
+
+        # Files can reach the run window while holding no rows inside it, so track each
+        # seeded series until it delivers and report those which never do.
+        undelivered_names: set[str] = set(subscription_names)
+
         for chunk in session.to_query_result():
             # The Rust backend returns a PyCapsule for built-in-only chunks
             # and a Python list when any custom data is present in the chunk.
@@ -606,6 +639,16 @@ class BacktestNode:
                 data = capsule_to_list(chunk)
                 # Reclaim the leaked Vec<DataFFI>; capsule has a no-op destructor
                 drop_cvec_pycapsule(chunk)
+
+            if undelivered_names:
+                for data_point in data:
+                    subscription_name = get_subscription_name(data_point)
+
+                    if subscription_name is not None:
+                        undelivered_names.discard(subscription_name)
+
+                        if not undelivered_names:
+                            break
 
             engine.add_data(
                 data=data,
@@ -624,6 +667,12 @@ class BacktestNode:
                 # Shutdown requested during the chunk; skip remaining chunks.
                 # engine.run() already finalized via end() on the force-stop path
                 return
+
+        for subscription_name in sorted(undelivered_names):
+            engine.logger.warning(
+                f"No data delivered for configured series {subscription_name}, "
+                "its subscription was not served from a data catalog",
+            )
 
         engine.end()
 
@@ -783,6 +832,24 @@ def get_instrument_ids(config: BacktestDataConfig) -> list[InstrumentId]:
         instrument_ids = [bar_type.instrument_id for bar_type in bar_types]
 
     return instrument_ids
+
+
+def get_subscription_name(data: Data) -> str | None:
+    """
+    Return the subscription name for the given data, or ``None`` when it has none.
+
+    Mirrors the names `BacktestEngine.add_data` registers, so that data arriving in
+    batches can be matched against the series names seeded ahead of it.
+
+    """
+    data_type = type(data)
+
+    if data_type is Bar:
+        return f"{data.bar_type}"
+    elif data_type in (QuoteTick, TradeTick):
+        return f"{data_type.__name__}.{data.instrument_id}"
+
+    return None
 
 
 def get_oms_type(config: BacktestVenueConfig) -> OmsType:

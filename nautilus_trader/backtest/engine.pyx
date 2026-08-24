@@ -951,6 +951,26 @@ cdef class BacktestEngine:
 
         self._log.info(f"Added {data_name} stream generator")
 
+    def add_subscription_names(self, names: list[str]) -> None:
+        """
+        Add the names of data series which the engines own data stream will supply.
+
+        Parameters
+        ----------
+        names : list[str]
+            The subscription names to add.
+
+        Notes
+        -----
+        A subscription matching one of these names is served by the data added through
+        `add_data()`, rather than by a request to a registered data catalog. `add_data()`
+        already registers the names of the data it receives, so this is only required
+        when data arrives in batches after subscriptions have been made, where an early
+        batch may not yet contain every series.
+
+        """
+        self._backtest_subscription_names.update(names)
+
     cpdef void _handle_data_command(self, DataCommand command):
         if not(command.data_type.type in [Bar, QuoteTick, TradeTick, OrderBookDelta, OrderBookDeltas, OrderBookDepth10]
                or isinstance(command, (SubscribeData, UnsubscribeData, SubscribeInstruments, UnsubscribeInstruments))):

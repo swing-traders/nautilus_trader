@@ -24,15 +24,21 @@ import nautilus_trader.backtest.node as node
 from nautilus_trader.adapters.tardis.loaders import TardisCSVDataLoader
 from nautilus_trader.backtest.engine import BacktestEngineConfig
 from nautilus_trader.backtest.node import BacktestNode
+from nautilus_trader.backtest.results import BacktestResult
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.config import InvalidConfiguration
 from nautilus_trader.config import BacktestDataConfig
 from nautilus_trader.config import BacktestRunConfig
 from nautilus_trader.config import BacktestVenueConfig
+from nautilus_trader.config import DataCatalogConfig
 from nautilus_trader.config import ImportableStrategyConfig
 from nautilus_trader.config import LoggingConfig
+from nautilus_trader.model.data import Bar
+from nautilus_trader.model.data import BarType
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.objects import Price
+from nautilus_trader.model.objects import Quantity
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.persistence.wranglers import QuoteTickDataWrangler
 from nautilus_trader.test_kit.mocks.data import load_catalog_with_stub_quote_ticks_audusd
@@ -84,9 +90,27 @@ class DummyStreamingCatalog:
         return session
 
 
+class DummyStreamingLogger:
+    def __init__(self):
+        self.warnings: list[str] = []
+
+    def info(self, message, color=None):
+        return None
+
+    def warning(self, message, color=None):
+        self.warnings.append(message)
+
+
 class DummyStreamingEngine:
+    def __init__(self):
+        self.logger = DummyStreamingLogger()
+        self.subscription_names: list[str] = []
+
     def add_data(self, data, validate=True, sort=True):
         return None
+
+    def add_subscription_names(self, names):
+        self.subscription_names.extend(names)
 
     def run(self, start=None, end=None, run_config_id=None, streaming=None):
         return None
@@ -100,6 +124,204 @@ class DummyStreamingEngine:
 
 _AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
 _BTCUSDT_HUOBI = TestInstrumentProvider.btcusdt_future_binance()  # Use as stand-in for Huobi
+
+_STREAMING_BAR_TYPE = BarType.from_str("AUD/USD.SIM-1-MINUTE-BID-EXTERNAL")
+_STREAMING_START_NS = 1_704_067_200_000_000_000  # 2024-01-01T00:00:00Z
+_ONE_MINUTE_NS = 60_000_000_000
+
+
+class StreamingRecorderActor(Actor):
+    """
+    Records the quotes and bars delivered to a subscriber, in delivery order.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.received: list[tuple[str, int]] = []
+
+    def on_start(self) -> None:
+        self.subscribe_bars(_STREAMING_BAR_TYPE)
+        self.subscribe_quote_ticks(_AUDUSD_SIM.id)
+
+    def on_bar(self, bar: Bar) -> None:
+        self.received.append(("bar", bar.ts_init))
+
+    def on_quote_tick(self, tick: QuoteTick) -> None:
+        self.received.append(("quote", tick.ts_init))
+
+
+def load_catalog_with_quotes_and_bars(
+    catalog: ParquetDataCatalog,
+    bar_offset_ns: int,
+) -> list[tuple[str, int]]:
+    """
+    Load six one-minute quotes and six bars for AUD/USD.SIM to the catalog.
+
+    `bar_offset_ns` shifts every bar off its minute, so bar and quote timestamps either
+    tie (0) or stay distinct (1).
+
+    Returns every written record as a (kind, ts_init) pair in timestamp order, so a test
+    can assert delivery against the data it wrote rather than against another run.
+
+    """
+    quotes = []
+    bars = []
+
+    for i in range(6):
+        ts_event = _STREAMING_START_NS + i * _ONE_MINUTE_NS
+        quotes.append(
+            QuoteTick(
+                instrument_id=_AUDUSD_SIM.id,
+                bid_price=Price.from_str(f"0.{67000 + i}"),
+                ask_price=Price.from_str(f"0.{67010 + i}"),
+                bid_size=Quantity.from_int(1_000_000),
+                ask_size=Quantity.from_int(1_000_000),
+                ts_event=ts_event,
+                ts_init=ts_event,
+            ),
+        )
+        bars.append(
+            Bar(
+                bar_type=_STREAMING_BAR_TYPE,
+                open=Price.from_str(f"0.{67000 + i}"),
+                high=Price.from_str(f"0.{67020 + i}"),
+                low=Price.from_str(f"0.{66990 + i}"),
+                close=Price.from_str(f"0.{67005 + i}"),
+                volume=Quantity.from_int(1_000_000),
+                ts_event=ts_event + bar_offset_ns,
+                ts_init=ts_event + bar_offset_ns,
+            ),
+        )
+
+    catalog.write_data([_AUDUSD_SIM])
+    catalog.write_data(quotes)
+    catalog.write_data(bars)
+
+    written = [("quote", quote.ts_init) for quote in quotes]
+    written += [("bar", bar.ts_init) for bar in bars]
+    written.sort(key=lambda record: record[1])
+
+    return written
+
+
+def run_quotes_and_bars_backtest(
+    catalog: ParquetDataCatalog,
+    venue_config: BacktestVenueConfig,
+    chunk_size: int | None,
+    start: str | None = None,
+    end: str | None = None,
+    quote_time_window: tuple[int | None, int | None] | None = None,
+) -> tuple[list[tuple[str, int]], BacktestResult]:
+    """
+    Run the quotes and bars catalog through a node, returning what was delivered.
+
+    The engine is given the catalog so that a subscription which the engines own data
+    does not cover is served from it. `quote_time_window` narrows the quote config to a
+    (start, end) range, which a test can place away from the written quotes.
+
+    """
+    quote_start, quote_end = quote_time_window or (None, None)
+    config = BacktestRunConfig(
+        engine=BacktestEngineConfig(
+            logging=LoggingConfig(bypass_logging=True),
+            catalogs=[DataCatalogConfig(path=catalog.path, fs_protocol=catalog.fs_protocol)],
+        ),
+        venues=[venue_config],
+        data=[
+            BacktestDataConfig(
+                catalog_path=catalog.path,
+                catalog_fs_protocol=catalog.fs_protocol,
+                data_cls=QuoteTick,
+                instrument_id=_AUDUSD_SIM.id,
+                start_time=quote_start,
+                end_time=quote_end,
+            ),
+            BacktestDataConfig(
+                catalog_path=catalog.path,
+                catalog_fs_protocol=catalog.fs_protocol,
+                data_cls=Bar,
+                bar_types=[str(_STREAMING_BAR_TYPE)],
+            ),
+        ],
+        chunk_size=chunk_size,
+        start=start,
+        end=end,
+        raise_exception=True,
+    )
+
+    node_instance = BacktestNode(configs=[config])
+    node_instance.build()
+
+    actor = StreamingRecorderActor()
+    node_instance.get_engine(config.id).add_actor(actor)
+    results = node_instance.run()
+
+    return actor.received, results[0]
+
+
+def run_streaming_with_stubs(
+    monkeypatch,
+    tmp_path,
+    chunks: list[list[object]],
+) -> DummyStreamingEngine:
+    """
+    Drive `_run_streaming` over the given chunks with a stubbed catalog, session,
+    engine.
+
+    The stub catalog reports one file for the data class, so the quote config counts as
+    supplied by the stream. Returns the stub engine, whose logger recorded any warnings.
+
+    """
+
+    class StubStreamingSession:
+        def __init__(self, chunk_size=None):
+            self.chunk_size = chunk_size
+
+        def to_query_result(self):
+            return list(chunks)
+
+    monkeypatch.setattr(node, "DataBackendSession", StubStreamingSession)
+    monkeypatch.setattr(node, "pyo3_list_to_data_list", lambda chunk: chunk)
+    monkeypatch.setattr(
+        BacktestNode,
+        "load_catalog",
+        lambda _self, config: DummyStreamingCatalog(
+            config.catalog_path,
+            config.catalog_fs_protocol,
+        ),
+    )
+
+    run_config = BacktestRunConfig(
+        engine=BacktestEngineConfig(logging=LoggingConfig(bypass_logging=True)),
+        venues=[
+            BacktestVenueConfig(
+                name="SIM",
+                oms_type="HEDGING",
+                account_type="MARGIN",
+                base_currency="USD",
+                starting_balances=["1000000 USD"],
+            ),
+        ],
+        data=[
+            BacktestDataConfig(
+                catalog_path=(tmp_path / "stub_catalog").as_posix(),
+                catalog_fs_protocol="file",
+                data_cls=QuoteTick,
+                instrument_id=_AUDUSD_SIM.id,
+            ),
+        ],
+        chunk_size=1_000,
+    )
+
+    engine = DummyStreamingEngine()
+    BacktestNode(configs=[run_config])._run_streaming(
+        run_config_id=run_config.id,
+        engine=engine,
+        data_configs=run_config.data,
+        chunk_size=run_config.chunk_size,
+    )
+
+    return engine
 
 
 def load_catalog_with_quote_ticks(
@@ -670,6 +892,219 @@ class TestBacktestNodeStreaming:
             f"Position count mismatch: streaming={streaming_result.total_positions}, "
             f"oneshot={oneshot_result.total_positions}"
         )
+
+    def test_streaming_delivers_each_record_once_when_series_absent_from_first_chunk(self):
+        """
+        Verify a chunked run delivers every record exactly once when a subscribed series
+        is absent from the first chunk.
+
+        With `chunk_size=1` the first chunk holds a single quote, so the engine has not
+        yet seen the bar series when the subscription is made. It must not open a
+        catalog-backed stream for a series which the data configs for this run already
+        supply, which would deliver those records a second time.
+
+        Delivery order is not compared here, since the streaming backend orders records
+        which share a `ts_init` differently to the one-shot path.
+
+        """
+        # Arrange - each bar ties with a quote, so the first chunk boundary shares a timestamp
+        written = load_catalog_with_quotes_and_bars(self.catalog, bar_offset_ns=0)
+
+        # Act
+        streamed, streamed_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=1,
+        )
+        oneshot, oneshot_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=None,
+        )
+
+        # Assert
+        assert len(streamed) == len(set(streamed)), f"Records delivered more than once: {streamed}"
+        assert sorted(streamed) == sorted(written)
+        assert sorted(streamed) == sorted(oneshot)
+        assert streamed_result.iterations == oneshot_result.iterations
+
+    def test_streaming_with_bound_end_matches_oneshot(self):
+        """
+        Verify a chunked run bound by `BacktestRunConfig.end` matches the one-shot run.
+
+        The bound `end` becomes the engines end timestamp for every chunk, so a
+        catalog-backed stream opened for a configured series spans the whole run rather
+        than a single chunk, delivering every record of that series a second time.
+
+        """
+        # Arrange - bars sit one nanosecond off the quotes, so no timestamps are shared
+        # and delivery order is directly comparable.
+        written = load_catalog_with_quotes_and_bars(self.catalog, bar_offset_ns=1)
+        end = "2024-01-01T00:05:00"
+        end_ns = _STREAMING_START_NS + 5 * _ONE_MINUTE_NS
+
+        # The run ends on the first record past `end`, so every earlier record is due
+        expected = [record for record in written if record[1] <= end_ns]
+
+        # Act
+        streamed, streamed_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=1,
+            end=end,
+        )
+        oneshot, oneshot_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=None,
+            end=end,
+        )
+
+        # Assert
+        assert len(streamed) == len(set(streamed)), f"Records delivered more than once: {streamed}"
+        assert streamed == expected
+        assert streamed == oneshot
+        assert streamed_result.iterations == oneshot_result.iterations
+
+    def test_streaming_empty_window_config_is_still_served_from_catalog(self):
+        """
+        Verify a config whose window holds no catalog files keeps its catalog stream.
+
+        A one-shot run skips a data config which returns no rows, so that series is
+        never registered and its subscription is served by a data catalog request
+        instead. A chunked run must do the same, rather than treat the empty config as
+        covering the series and drop it from the run.
+
+        Delivery order is not compared here. A catalog-backed stream opened during a
+        chunked run is drained while the first chunk runs, since `clear_data()` replaces
+        the data iterator between chunks, which is a separate concern.
+
+        """
+        # Arrange - bars sit one nanosecond ahead of the quotes so the first chunk holds a
+        # bar, and the quote config's window closes before the first quote was recorded.
+        written = load_catalog_with_quotes_and_bars(self.catalog, bar_offset_ns=-1)
+        quote_time_window = (
+            _STREAMING_START_NS - 10 * _ONE_MINUTE_NS,
+            _STREAMING_START_NS - 5 * _ONE_MINUTE_NS,
+        )
+        end = "2024-01-01T00:05:00"
+        end_ns = _STREAMING_START_NS + 5 * _ONE_MINUTE_NS
+
+        # The run ends on the first record past `end`, so every earlier record is due
+        expected = [record for record in written if record[1] <= end_ns]
+
+        # Act
+        streamed, streamed_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=1,
+            end=end,
+            quote_time_window=quote_time_window,
+        )
+        oneshot, oneshot_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=None,
+            end=end,
+            quote_time_window=quote_time_window,
+        )
+
+        # Assert
+        assert [record for record in expected if record[0] == "quote"], "Test data proves nothing"
+        assert len(streamed) == len(set(streamed)), f"Records delivered more than once: {streamed}"
+        assert sorted(streamed) == sorted(expected)
+        assert sorted(oneshot) == sorted(expected)
+        assert streamed_result.iterations == oneshot_result.iterations
+
+    def test_streaming_inverted_window_config_is_still_served_from_catalog(self):
+        """
+        Verify a config whose effective window is inverted keeps its catalog stream.
+
+        Narrowing a config with `end_time` while the run itself starts later leaves an
+        inverted window which can select no rows at all. The file holding those rows may
+        still span both bounds, so a config has to be judged on its window and not on
+        the files alone, or the series is dropped from a chunked run.
+
+        """
+        # Arrange - the quote config closes at 00:02 while the run opens at 00:04
+        written = load_catalog_with_quotes_and_bars(self.catalog, bar_offset_ns=1)
+        start = "2024-01-01T00:04:00"
+        end = "2024-01-01T00:05:00"
+        start_ns = _STREAMING_START_NS + 4 * _ONE_MINUTE_NS
+        end_ns = _STREAMING_START_NS + 5 * _ONE_MINUTE_NS
+        quote_time_window = (None, _STREAMING_START_NS + 2 * _ONE_MINUTE_NS)
+
+        # The run covers the records between `start` and `end` inclusive
+        expected = [record for record in written if start_ns <= record[1] <= end_ns]
+
+        # Act
+        streamed, streamed_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=1,
+            start=start,
+            end=end,
+            quote_time_window=quote_time_window,
+        )
+        oneshot, oneshot_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=None,
+            start=start,
+            end=end,
+            quote_time_window=quote_time_window,
+        )
+
+        # Assert
+        assert [record for record in expected if record[0] == "quote"], "Test data proves nothing"
+        assert len(streamed) == len(set(streamed)), f"Records delivered more than once: {streamed}"
+        assert sorted(streamed) == sorted(expected)
+        assert sorted(oneshot) == sorted(expected)
+        assert streamed_result.iterations == oneshot_result.iterations
+
+    def test_streaming_warns_for_seeded_series_which_delivers_no_data(self, monkeypatch, tmp_path):
+        """
+        Verify one end-of-run warning names a configured series which delivered nothing.
+
+        A config whose files intersect the run window is treated as supplied by the
+        stream, so its subscription is not served from a data catalog. When those files
+        hold no rows inside the window nothing arrives, and the run must say so rather
+        than leave the series silently missing.
+
+        """
+        # Arrange - the session yields no chunks, so no configured series delivers data
+        engine = run_streaming_with_stubs(monkeypatch, tmp_path, chunks=[])
+
+        # Assert
+        assert engine.subscription_names == [f"QuoteTick.{_AUDUSD_SIM.id}"]
+        assert len(engine.logger.warnings) == 1, engine.logger.warnings
+        assert f"QuoteTick.{_AUDUSD_SIM.id}" in engine.logger.warnings[0]
+
+    def test_streaming_does_not_warn_when_every_seeded_series_delivers(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """
+        Verify a run whose configured series all deliver data produces no such warning.
+        """
+        # Arrange - the single chunk carries the configured quote series
+        quote = QuoteTick(
+            instrument_id=_AUDUSD_SIM.id,
+            bid_price=Price.from_str("0.67000"),
+            ask_price=Price.from_str("0.67010"),
+            bid_size=Quantity.from_int(1_000_000),
+            ask_size=Quantity.from_int(1_000_000),
+            ts_event=_STREAMING_START_NS,
+            ts_init=_STREAMING_START_NS,
+        )
+
+        # Act
+        engine = run_streaming_with_stubs(monkeypatch, tmp_path, chunks=[[quote]])
+
+        # Assert
+        assert engine.subscription_names == [f"QuoteTick.{_AUDUSD_SIM.id}"]
+        assert engine.logger.warnings == []
 
     def test_run_streaming_caches_per_catalog(self, monkeypatch, tmp_path):
         monkeypatch.setattr(node, "DataBackendSession", DummyStreamingSession)
