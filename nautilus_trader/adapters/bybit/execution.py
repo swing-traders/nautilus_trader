@@ -2048,8 +2048,29 @@ _BYBIT_BBO_ORDER_TYPES: frozenset[OrderType] = frozenset(
 )
 
 
+# Bybit V5 retCodes documented at https://bybit-exchange.github.io/docs/v5/error as
+# deterministic order-parameter verdicts, where the order as submitted can never be accepted,
+# so the HTTP reply itself confirms the venue rejection: 110017 truncates the order quantity
+# to zero, while 110092 and 110093 place the trigger price on the wrong side of the current
+# price, and transport, rate limit, permission and server conditions are excluded because
+# those leave the order outcome unknown and must resolve through reconciliation.
+_BYBIT_CONFIRMED_REJECTION_CODES: frozenset[int] = frozenset({110017, 110092, 110093})
+
+# Anchored to the `BybitHttpError::BybitError` display shape "Bybit error {code}: {message}",
+# so a code only counts when the reply itself carries it, since a reason which merely embeds
+# the shape, such as "Order lookup failed after submission: Bybit error ...", leaves the
+# order possibly live at the venue and must not be read as a rejection.
+_BYBIT_CONFIRMED_REJECTION_PREFIXES: tuple[str, ...] = tuple(
+    f"Bybit error {code}: " for code in sorted(_BYBIT_CONFIRMED_REJECTION_CODES)
+)
+
+
 def _is_confirmed_submit_rejection_error(exc: BaseException) -> bool:
-    return str(exc).startswith("Order rejected: ")
+    reason = str(exc)
+
+    return reason.startswith("Order rejected: ") or reason.startswith(
+        _BYBIT_CONFIRMED_REJECTION_PREFIXES,
+    )
 
 
 def _validate_price_string(key: str, val: str) -> str:

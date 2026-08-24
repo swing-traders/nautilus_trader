@@ -2415,10 +2415,283 @@ async def test_submit_order_list_live_ws_failure_waits_for_reconciliation(
         ),
         (ValueError("Bybit error 10000: Server Timeout"), False),
         (ValueError("Bybit error 10001: Request parameter error"), False),
+        # Deterministic order-parameter verdicts confirmed by the HTTP reply itself
+        (
+            ValueError(
+                "Bybit error 110017: current position is zero, cannot fix reduce-only order qty",
+            ),
+            True,
+        ),
+        (
+            ValueError("Bybit error 110092: expect Rising, but trigger_price[1] <= current[2]"),
+            True,
+        ),
+        (
+            ValueError("Bybit error 110093: expect Falling, but trigger_price[3] >= current[2]"),
+            True,
+        ),
+        # A wrapped post-submit lookup failure leaves the order possibly live at the venue,
+        # so the code must only be read from the start of the reason.
+        (
+            ValueError(
+                "Order lookup failed after submission: "
+                "Bybit error 110092: expect Rising, but trigger_price[1] <= current[2]",
+            ),
+            False,
+        ),
+        # A longer code sharing an adopted code's leading digits is a different code
+        (ValueError("Bybit error 1100921: some other condition"), False),
+        # Documented, but never measured on the submit path, so it stays on the reconciliation
+        # path under the exclusion rule for codes whose full set of conditions is unknown.
+        (ValueError("Bybit error 110094: Order notional value below the lower limit"), False),
     ],
 )
 def test_is_confirmed_submit_rejection_error(exc, expected):
     assert _is_confirmed_submit_rejection_error(exc) is expected
+
+
+# Reasons carrying a Bybit V5 retCode documented at
+# https://bybit-exchange.github.io/docs/v5/error as a deterministic order-parameter verdict,
+# where the order as submitted can never be accepted.
+_DETERMINISTIC_REJECTION_REASONS = [
+    pytest.param(
+        "Bybit error 110017: current position is zero, cannot fix reduce-only order qty",
+        id="110017",
+    ),
+    pytest.param(
+        "Bybit error 110092: expect Rising, but trigger_price[50000.00] <= current[51000.00]",
+        id="110092",
+    ),
+    pytest.param(
+        "Bybit error 110093: expect Falling, but trigger_price[52000.00] >= current[51000.00]",
+        id="110093",
+    ),
+]
+
+# Reasons whose outcome at the venue is not confirmed by the reply, so the order must be left
+# SUBMITTED for reconciliation rather than rejected.
+_UNCONFIRMED_SUBMIT_FAILURE_REASONS = [
+    pytest.param("Network error: Timed out after 60000ms", id="timeout"),
+    pytest.param("Unexpected HTTP status code 502: Bad Gateway", id="http-502"),
+    pytest.param("Bybit error 10000: Server Timeout", id="retcode-10000"),
+]
+
+
+def _stop_market_order(instrument, client_order_id: str) -> StopMarketOrder:
+    return StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId(client_order_id),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100"),
+        trigger_price=Price.from_str("51000.00"),
+        trigger_type=TriggerType.LAST_PRICE,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", _DETERMINISTIC_REJECTION_REASONS)
+async def test_submit_order_demo_deterministic_retcode_emits_order_rejected(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    reason,
+):
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
+    )
+
+    http_client.submit_order = AsyncMock(side_effect=ValueError(reason))
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    order = _stop_market_order(instrument, "O-DETERMINISTIC-REJECT")
+    command = SubmitOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order=order,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    await client._submit_order(command)
+
+    client.generate_order_submitted.assert_called_once()
+    http_client.submit_order.assert_awaited_once()
+    client.generate_order_rejected.assert_called_once_with(
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        reason=reason,
+        ts_event=ANY,
+        due_post_only=False,
+    )
+    assert order.client_order_id not in client._order_position_ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", _DETERMINISTIC_REJECTION_REASONS)
+async def test_submit_order_list_demo_deterministic_retcode_emits_order_rejected(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    reason,
+):
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
+    )
+
+    http_client.submit_order = AsyncMock(side_effect=ValueError(reason))
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    order = _stop_market_order(instrument, "O-LIST-DETERMINISTIC-REJECT")
+    command = SubmitOrderList(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order_list=OrderList(TestIdStubs.order_list_id(), [order]),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    await client._submit_order_list(command)
+
+    client.generate_order_submitted.assert_called_once()
+    http_client.submit_order.assert_awaited_once()
+    client.generate_order_rejected.assert_called_once_with(
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        reason=reason,
+        ts_event=ANY,
+        due_post_only=False,
+    )
+    assert order.client_order_id not in client._order_position_ids
+
+
+@pytest.mark.asyncio
+async def test_submit_order_deterministic_retcode_rejects_order_pending_cancel(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
+    )
+
+    reason = "Bybit error 110092: expect Rising, but trigger_price[50000.00] <= current[51000.00]"
+    http_client.submit_order = AsyncMock(side_effect=ValueError(reason))
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    order = _stop_market_order(instrument, "O-RACING-CANCEL-REJECT")
+    order.apply(TestEventStubs.order_submitted(order=order))
+    order.apply(TestEventStubs.order_pending_cancel(order=order))
+    assert order.status == OrderStatus.PENDING_CANCEL
+
+    command = SubmitOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order=order,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    await client._submit_order(command)
+
+    http_client.submit_order.assert_awaited_once()
+    client.generate_order_rejected.assert_called_once_with(
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        reason=reason,
+        ts_event=ANY,
+        due_post_only=False,
+    )
+
+    # The rejection applies even though a cancel request is already in flight
+    order.apply(TestEventStubs.order_rejected(order=order))
+    assert order.status == OrderStatus.REJECTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", _UNCONFIRMED_SUBMIT_FAILURE_REASONS)
+async def test_submit_order_demo_unconfirmed_failure_waits_for_reconciliation(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    reason,
+):
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
+    )
+
+    http_client.submit_order = AsyncMock(side_effect=RuntimeError(reason))
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    order = _stop_market_order(instrument, "O-UNCONFIRMED-FAILURE")
+    command = SubmitOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order=order,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    await client._submit_order(command)
+
+    client.generate_order_submitted.assert_called_once()
+    http_client.submit_order.assert_awaited_once()
+    client.generate_order_rejected.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_order_demo_accepted_submit_emits_no_rejection(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
+    )
+
+    http_client.submit_order = AsyncMock(return_value=MagicMock())
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+
+    order = _stop_market_order(instrument, "O-ACCEPTED-SUBMIT")
+    command = SubmitOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order=order,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+    await client._submit_order(command)
+
+    client.generate_order_submitted.assert_called_once()
+    http_client.submit_order.assert_awaited_once()
+    client.generate_order_rejected.assert_not_called()
 
 
 @pytest.mark.asyncio
