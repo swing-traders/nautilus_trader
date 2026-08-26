@@ -33,6 +33,7 @@ from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.inspect import is_nautilus_class
 from nautilus_trader.core.rust.model import OtoTriggerMode
 from nautilus_trader.data.engine import TimeRangeGenerator
+from nautilus_trader.data.engine import default_time_range_generator
 from nautilus_trader.data.engine import get_time_range_generator
 from nautilus_trader.model import BOOK_DATA_TYPES
 from nautilus_trader.model import NAUTILUS_PYO3_DATA_TYPES
@@ -271,6 +272,7 @@ cdef class BacktestEngine:
 
         # Set up data iterator
         self._data_requests: dict[str, RequestData] = {}
+        self._subscription_resume_ns: dict[str, uint64_t] = {}
         self._last_subscription_ts: dict[str, uint64_t] = {}
         self._backtest_subscription_names = set()
         self._response_data = []
@@ -989,13 +991,25 @@ cdef class BacktestEngine:
 
         self._log.debug(f"Subscribing to {subscription_name}, {command.params.get('durations_seconds')=}")
 
-        time_range_generator = get_time_range_generator(
-            request.params.get("time_range_generator", "")
-        )(request)
+        cdef str range_generator_name = request.params.get("time_range_generator", "")
+        time_range_generator = get_time_range_generator(range_generator_name)(request)
         cdef bint append_data = request.params.get("append_data", True)
         request.params.pop("time_range_generator", None) # so sub_requests don't use long data range requests as well
 
         self._data_requests[subscription_name] = request
+
+        # A chunked run reopens a stream for each following chunk, which resumes a
+        # request covering the whole range it is given, while a request carrying a
+        # schedule of its own, a single point or a set of durations or a registered
+        # range generator, is left to the chunk which opened it, since reopening
+        # restarts that schedule rather than continuing it.
+        if (
+            get_time_range_generator(range_generator_name) is default_time_range_generator
+            and not request.params.get("point_data", False)
+            and request.params.get("durations_seconds", [None]) == [None]
+        ):
+            self._subscription_resume_ns[subscription_name] = self._end_ns + 1
+
         self._data_iterator.init_data(
             subscription_name,
             self._subscription_generator(
@@ -1004,6 +1018,48 @@ cdef class BacktestEngine:
             ),
             append_data
         )
+
+    cdef void _resume_subscription_streams(self):
+        # A chunked run replaces the data iterator between chunks, dropping every
+        # subscription stream it holds, so each is reopened over the time range of the
+        # chunk in hand and its data interleaves with that chunk by timestamp instead
+        # of being delivered in full while an earlier chunk runs.
+        cdef dict all_data = self._data_iterator.all_data()
+        cdef str subscription_name
+        cdef uint64_t resume_ns
+        cdef RequestData request
+        cdef RequestData window_request
+
+        for subscription_name in list(self._subscription_resume_ns):
+            resume_ns = self._subscription_resume_ns[subscription_name]
+
+            # A stream the iterator still holds is already open over this range, and a
+            # chunk which ends before the stream resumes has nothing left to carry.
+            if subscription_name in all_data or resume_ns > self._end_ns:
+                continue
+
+            request = self._data_requests[subscription_name]
+            window_request = request.with_dates(
+                unix_nanos_to_dt(resume_ns),
+                unix_nanos_to_dt(self._end_ns),
+                self._last_ns,
+                self._handle_data_response,
+            )
+            self._log.debug(
+                f"Reopening {subscription_name} from {window_request.start} to {window_request.end}"
+            )
+
+            time_range_generator = default_time_range_generator(window_request)
+            self._subscription_resume_ns[subscription_name] = self._end_ns + 1
+
+            self._data_iterator.init_data(
+                subscription_name,
+                self._subscription_generator(
+                    subscription_name,
+                    time_range_generator,
+                ),
+                request.params.get("append_data", True),
+            )
 
     def _subscription_generator(
         self,
@@ -1079,6 +1135,7 @@ cdef class BacktestEngine:
         self._log.debug(f"Unsubscribing {subscription_name}")
         self._data_iterator.remove_data(subscription_name, complete_remove=True)
         self._data_requests.pop(subscription_name, None)
+        self._subscription_resume_ns.pop(subscription_name, None)
 
     def dump_pickled_data(self) -> bytes:
         """
@@ -1667,6 +1724,9 @@ cdef class BacktestEngine:
                 if start_ns <= self._data[i].ts_init:
                     self._data_iterator.set_index("backtest_data", i)
                     break
+
+        if streaming:
+            self._resume_subscription_streams()
 
         # -- MAIN BACKTEST LOOP -----------------------------------------------#
         cdef uint64_t raw_handlers_count = 0

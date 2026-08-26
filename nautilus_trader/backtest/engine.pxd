@@ -124,6 +124,7 @@ cdef class BacktestEngine:
     cdef uint64_t _end_ns
     cdef bint _sorted
     cdef dict[str, RequestData] _data_requests
+    cdef dict[str, uint64_t] _subscription_resume_ns
     cdef set[str] _backtest_subscription_names
     cdef dict[str, uint64_t] _last_subscription_ts
     cdef list[Data] _response_data
@@ -143,6 +144,7 @@ cdef class BacktestEngine:
 
     cpdef void _handle_data_command(self, DataCommand command)
     cdef void _handle_subscribe(self, SubscribeData command)
+    cdef void _resume_subscription_streams(self)
     cpdef void _update_subscription_data(self, str subscription_name, uint64_t request_start_ns, uint64_t request_end_ns)
     cpdef void _handle_data_response(self, DataResponse response)
     cpdef void _handle_unsubscribe(self, UnsubscribeData command)

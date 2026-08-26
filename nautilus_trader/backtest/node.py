@@ -630,6 +630,28 @@ class BacktestNode:
         # seeded series until it delivers and report those which never do.
         undelivered_names: set[str] = set(subscription_names)
 
+        def run_chunk(chunk_data: list[Data], chunk_end: str | int | None) -> None:
+            # Run the engine over one chunk of the stream
+            engine.add_data(
+                data=chunk_data,
+                validate=False,  # Cannot validate mixed type stream
+                sort=True,  # Already sorted from backend
+            )
+            engine.run(
+                start=start,
+                end=chunk_end,
+                run_config_id=run_config_id,
+                streaming=True,
+            )
+            engine.clear_data()
+
+        # Each chunk is held back until the next one arrives, so that the engine can be
+        # given the time range the chunk actually covers rather than the range of the
+        # run, and a subscription served from a data catalog is opened over that range,
+        # which leaves a record of such a series falling between two chunks to the
+        # earlier of them, the only chunk whose range can reach it.
+        pending_data: list[Data] | None = None
+
         for chunk in session.to_query_result():
             # The Rust backend returns a PyCapsule for built-in-only chunks
             # and a Python list when any custom data is present in the chunk.
@@ -650,22 +672,28 @@ class BacktestNode:
                         if not undelivered_names:
                             break
 
-            engine.add_data(
-                data=data,
-                validate=False,  # Cannot validate mixed type stream
-                sort=True,  # Already sorted from backend
-            )
-            engine.run(
-                start=start,
-                end=end,
-                run_config_id=run_config_id,
-                streaming=True,
-            )
-            engine.clear_data()
+            if pending_data is not None:
+                # This chunk opens where the held one closes, so the held one runs to
+                # the last timestamp before it, or to its own last when a timestamp is
+                # carried by both, which leaves a catalog-backed record tying with such
+                # a duplicated timestamp delivered ahead of the records the following
+                # chunk carries at it, where a one-shot run delivers it after them.
+                run_chunk(pending_data, max(pending_data[-1].ts_init, data[0].ts_init - 1))
+
+                if is_backtest_force_stop():
+                    # Shutdown requested during the chunk; skip remaining chunks,
+                    # engine.run() already finalized via end() on the force-stop path.
+                    return
+
+            pending_data = data
+
+        if pending_data is not None:
+            # The last chunk closes on the end of the run, bound or open
+            run_chunk(pending_data, end)
 
             if is_backtest_force_stop():
-                # Shutdown requested during the chunk; skip remaining chunks.
-                # engine.run() already finalized via end() on the force-stop path
+                # Shutdown requested during the chunk; skip the end of run report,
+                # engine.run() already finalized via end() on the force-stop path.
                 return
 
         for subscription_name in sorted(undelivered_names):

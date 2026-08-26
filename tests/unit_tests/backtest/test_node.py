@@ -133,14 +133,19 @@ _ONE_MINUTE_NS = 60_000_000_000
 class StreamingRecorderActor(Actor):
     """
     Records the quotes and bars delivered to a subscriber, in delivery order.
+
+    `bar_params` is passed to the bar subscription, so a test can reach the parameters
+    a data request is made with.
+
     """
 
-    def __init__(self) -> None:
+    def __init__(self, bar_params: dict[str, object] | None = None) -> None:
         super().__init__()
         self.received: list[tuple[str, int]] = []
+        self.bar_params = bar_params
 
     def on_start(self) -> None:
-        self.subscribe_bars(_STREAMING_BAR_TYPE)
+        self.subscribe_bars(_STREAMING_BAR_TYPE, params=self.bar_params)
         self.subscribe_quote_ticks(_AUDUSD_SIM.id)
 
     def on_bar(self, bar: Bar) -> None:
@@ -204,6 +209,51 @@ def load_catalog_with_quotes_and_bars(
     return written
 
 
+def load_catalog_with_a_boundary_quote_and_bars(catalog: ParquetDataCatalog) -> None:
+    """
+    Load three quotes and two bars for AUD/USD.SIM to the catalog.
+
+    The second quote sits one nanosecond past the first, so a run reading one record at
+    a time closes its first chunk exactly on the first quote, and a bar sits on each of
+    those two timestamps.
+
+    """
+    timestamps = [
+        _STREAMING_START_NS,
+        _STREAMING_START_NS + 1,
+        _STREAMING_START_NS + 2 * _ONE_MINUTE_NS,
+    ]
+    quotes = [
+        QuoteTick(
+            instrument_id=_AUDUSD_SIM.id,
+            bid_price=Price.from_str("0.67000"),
+            ask_price=Price.from_str("0.67010"),
+            bid_size=Quantity.from_int(1_000_000),
+            ask_size=Quantity.from_int(1_000_000),
+            ts_event=ts_event,
+            ts_init=ts_event,
+        )
+        for ts_event in timestamps
+    ]
+    bars = [
+        Bar(
+            bar_type=_STREAMING_BAR_TYPE,
+            open=Price.from_str("0.67000"),
+            high=Price.from_str("0.67020"),
+            low=Price.from_str("0.66990"),
+            close=Price.from_str("0.67005"),
+            volume=Quantity.from_int(1_000_000),
+            ts_event=ts_event,
+            ts_init=ts_event,
+        )
+        for ts_event in timestamps[:2]
+    ]
+
+    catalog.write_data([_AUDUSD_SIM])
+    catalog.write_data(quotes)
+    catalog.write_data(bars)
+
+
 def run_quotes_and_bars_backtest(
     catalog: ParquetDataCatalog,
     venue_config: BacktestVenueConfig,
@@ -211,6 +261,8 @@ def run_quotes_and_bars_backtest(
     start: str | None = None,
     end: str | None = None,
     quote_time_window: tuple[int | None, int | None] | None = None,
+    configure_bars: bool = True,
+    bar_params: dict[str, object] | None = None,
 ) -> tuple[list[tuple[str, int]], BacktestResult]:
     """
     Run the quotes and bars catalog through a node, returning what was delivered.
@@ -218,31 +270,40 @@ def run_quotes_and_bars_backtest(
     The engine is given the catalog so that a subscription which the engines own data
     does not cover is served from it. `quote_time_window` narrows the quote config to a
     (start, end) range, which a test can place away from the written quotes.
+    `configure_bars` set to ``False`` leaves the bar series outside every data config,
+    so its subscription is served by a data catalog request. `bar_params` is passed to
+    that subscription.
 
     """
     quote_start, quote_end = quote_time_window or (None, None)
-    config = BacktestRunConfig(
-        engine=BacktestEngineConfig(
-            logging=LoggingConfig(bypass_logging=True),
-            catalogs=[DataCatalogConfig(path=catalog.path, fs_protocol=catalog.fs_protocol)],
+    data_configs = [
+        BacktestDataConfig(
+            catalog_path=catalog.path,
+            catalog_fs_protocol=catalog.fs_protocol,
+            data_cls=QuoteTick,
+            instrument_id=_AUDUSD_SIM.id,
+            start_time=quote_start,
+            end_time=quote_end,
         ),
-        venues=[venue_config],
-        data=[
-            BacktestDataConfig(
-                catalog_path=catalog.path,
-                catalog_fs_protocol=catalog.fs_protocol,
-                data_cls=QuoteTick,
-                instrument_id=_AUDUSD_SIM.id,
-                start_time=quote_start,
-                end_time=quote_end,
-            ),
+    ]
+
+    if configure_bars:
+        data_configs.append(
             BacktestDataConfig(
                 catalog_path=catalog.path,
                 catalog_fs_protocol=catalog.fs_protocol,
                 data_cls=Bar,
                 bar_types=[str(_STREAMING_BAR_TYPE)],
             ),
-        ],
+        )
+
+    config = BacktestRunConfig(
+        engine=BacktestEngineConfig(
+            logging=LoggingConfig(bypass_logging=True),
+            catalogs=[DataCatalogConfig(path=catalog.path, fs_protocol=catalog.fs_protocol)],
+        ),
+        venues=[venue_config],
+        data=data_configs,
         chunk_size=chunk_size,
         start=start,
         end=end,
@@ -252,7 +313,7 @@ def run_quotes_and_bars_backtest(
     node_instance = BacktestNode(configs=[config])
     node_instance.build()
 
-    actor = StreamingRecorderActor()
+    actor = StreamingRecorderActor(bar_params)
     node_instance.get_engine(config.id).add_actor(actor)
     results = node_instance.run()
 
@@ -932,9 +993,9 @@ class TestBacktestNodeStreaming:
         """
         Verify a chunked run bound by `BacktestRunConfig.end` matches the one-shot run.
 
-        The bound `end` becomes the engines end timestamp for every chunk, so a
-        catalog-backed stream opened for a configured series spans the whole run rather
-        than a single chunk, delivering every record of that series a second time.
+        A configured series is supplied by the stream the run reads its chunks from, so
+        opening a catalog-backed stream for it as well would deliver every record of
+        that series a second time.
 
         """
         # Arrange - bars sit one nanosecond off the quotes, so no timestamps are shared
@@ -966,6 +1027,168 @@ class TestBacktestNodeStreaming:
         assert streamed == oneshot
         assert streamed_result.iterations == oneshot_result.iterations
 
+    def test_streaming_interleaves_catalog_backed_subscription_with_later_chunks(self):
+        """
+        Verify a chunked run interleaves a catalog-backed subscription by timestamp.
+
+        A series outside every data config is served by a request to a data catalog. A
+        chunked run replaces the engines data iterator between chunks, so that stream
+        has to be opened over the range of the chunk in hand and carried across the
+        boundary, rather than delivered in full while the first chunk runs, which would
+        show the strategy the future of that series.
+
+        """
+        # Arrange - bars sit one nanosecond past each quote and are outside every config
+        written = load_catalog_with_quotes_and_bars(self.catalog, bar_offset_ns=1)
+        end = "2024-01-01T00:05:00"
+        end_ns = _STREAMING_START_NS + 5 * _ONE_MINUTE_NS
+
+        # The run ends on the first record past `end`, so every earlier record is due
+        expected = [record for record in written if record[1] <= end_ns]
+
+        # Act
+        streamed, streamed_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=1,
+            end=end,
+            configure_bars=False,
+        )
+        oneshot, oneshot_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=None,
+            end=end,
+            configure_bars=False,
+        )
+
+        # Assert
+        assert [record for record in expected if record[0] == "bar"], "Test data proves nothing"
+        assert oneshot == expected
+        assert streamed == expected
+        assert streamed_result.iterations == oneshot_result.iterations
+
+    def test_streaming_delivers_catalog_backed_subscription_without_a_bound_end(self):
+        """
+        Verify an unbound run still delivers a catalog-backed subscription in full.
+
+        Without `BacktestRunConfig.end` a run closes on the last record it reads, so the
+        stream opened while the first chunk runs reaches no further than the range that
+        chunk covers. Every later chunk has to reopen it, or the series is delivered
+        once and then silently stops.
+
+        """
+        # Arrange - bars sit one nanosecond past each quote and are outside every config
+        written = load_catalog_with_quotes_and_bars(self.catalog, bar_offset_ns=1)
+
+        # The run ends with the last quote, since the bars are not part of its own data
+        last_quote_ns = _STREAMING_START_NS + 5 * _ONE_MINUTE_NS
+        expected = [record for record in written if record[1] <= last_quote_ns]
+
+        # Act
+        streamed, streamed_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=1,
+            configure_bars=False,
+        )
+        oneshot, oneshot_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=None,
+            configure_bars=False,
+        )
+
+        # Assert
+        assert [record for record in expected if record[0] == "bar"], "Test data proves nothing"
+        assert oneshot == expected
+        assert streamed == expected
+        assert streamed_result.iterations == oneshot_result.iterations
+
+    def test_streaming_delivers_a_point_subscription_once_like_a_oneshot_run(self):
+        """
+        Verify a chunked run delivers a point subscription exactly once.
+
+        A subscription made with `point_data` asks a data catalog for a single
+        timestamp rather than for a range, and the run makes that request when the
+        subscription is made. A chunked run reopens a subscription for each chunk to
+        carry it across the boundary, which must leave a point request alone rather
+        than repeat it once per chunk.
+
+        """
+        # Arrange - each bar ties with a quote, so the point requests can reach a bar
+        load_catalog_with_quotes_and_bars(self.catalog, bar_offset_ns=0)
+
+        # The request is made as the run opens, so the point it asks for is the first
+        # quote, and the bar sharing that timestamp is the only one due.
+        expected = [("quote", _STREAMING_START_NS), ("bar", _STREAMING_START_NS)]
+        expected += [("quote", _STREAMING_START_NS + i * _ONE_MINUTE_NS) for i in range(1, 6)]
+
+        # Act
+        streamed, streamed_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=1,
+            configure_bars=False,
+            bar_params={"point_data": True},
+        )
+        oneshot, oneshot_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=None,
+            configure_bars=False,
+            bar_params={"point_data": True},
+        )
+
+        # Assert
+        assert oneshot == expected
+        assert streamed == expected
+        assert streamed_result.iterations == oneshot_result.iterations
+
+    def test_streaming_leaves_a_point_subscription_alone_on_a_chunk_boundary(self):
+        """
+        Verify a point subscription is left alone when its point closes a chunk.
+
+        A chunk ends on the last timestamp before the chunk which follows it, so a point
+        request made as the run opens can ask for exactly that timestamp. Reaching the
+        end of a chunk is what tells a stream apart from one which is finished, and a
+        point request which does so is still finished.
+
+        """
+        # Arrange - the second quote is one nanosecond past the first, so the first
+        # chunk ends on the first quote, where the point request is made.
+        load_catalog_with_a_boundary_quote_and_bars(self.catalog)
+
+        # The request is made as the run opens, so the bar sharing the first quotes
+        # timestamp is the only one due.
+        expected = [
+            ("quote", _STREAMING_START_NS),
+            ("bar", _STREAMING_START_NS),
+            ("quote", _STREAMING_START_NS + 1),
+            ("quote", _STREAMING_START_NS + 2 * _ONE_MINUTE_NS),
+        ]
+
+        # Act
+        streamed, streamed_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=1,
+            configure_bars=False,
+            bar_params={"point_data": True},
+        )
+        oneshot, oneshot_result = run_quotes_and_bars_backtest(
+            self.catalog,
+            self.venue_config,
+            chunk_size=None,
+            configure_bars=False,
+            bar_params={"point_data": True},
+        )
+
+        # Assert
+        assert oneshot == expected
+        assert streamed == expected
+        assert streamed_result.iterations == oneshot_result.iterations
+
     def test_streaming_empty_window_config_is_still_served_from_catalog(self):
         """
         Verify a config whose window holds no catalog files keeps its catalog stream.
@@ -975,9 +1198,9 @@ class TestBacktestNodeStreaming:
         instead. A chunked run must do the same, rather than treat the empty config as
         covering the series and drop it from the run.
 
-        Delivery order is not compared here. A catalog-backed stream opened during a
-        chunked run is drained while the first chunk runs, since `clear_data()` replaces
-        the data iterator between chunks, which is a separate concern.
+        Only the set of records delivered is compared here, since what this test pins is
+        the series being served at all. Delivery order is pinned by the tests covering
+        the chunk boundary.
 
         """
         # Arrange - bars sit one nanosecond ahead of the quotes so the first chunk holds a
