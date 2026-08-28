@@ -35,12 +35,16 @@ from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.live.data_engine import LiveDataEngine
 from nautilus_trader.live.execution_engine import LiveExecutionEngine
+from nautilus_trader.live.reconciliation import POSITION_REPAIR_OPEN
+from nautilus_trader.live.reconciliation import POSITION_REPAIR_TRIM
+from nautilus_trader.live.reconciliation import diff_position_scope
 from nautilus_trader.live.reconciliation import is_within_single_unit_tolerance
 from nautilus_trader.live.risk_engine import LiveRiskEngine
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import LiquiditySide
+from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
@@ -61,12 +65,14 @@ from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.position import Position
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.functions import eventually
 from nautilus_trader.test_kit.mocks.exec_clients import MockLiveExecutionClient
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 from nautilus_trader.trading.strategy import Strategy
 
@@ -1003,225 +1009,221 @@ class TestLiveExecutionEngine:
             precision,
         )
 
-    def test_check_position_discrepancy_both_flat(self):
-        """
-        Test no discrepancy when both cached and venue are flat.
-        """
-        # Arrange
-        engine = self.exec_engine
-        self.cache.add_instrument(AUDUSD_SIM)
-
-        # Act
-        has_discrepancy = engine._check_position_discrepancy(
-            cached_positions=[],
-            venue_report=None,
-            instrument_id=AUDUSD_SIM.id,
+    def _seed_position(self, instrument, order_side, quantity, position_id) -> Position:
+        order = TestExecStubs.limit_order(
+            instrument=instrument,
+            order_side=order_side,
+            quantity=quantity,
+            client_order_id=ClientOrderId(f"O-SEED-{position_id.value}"),
         )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=instrument,
+            account_id=AccountId("SIM-001"),
+            last_qty=quantity,
+            last_px=instrument.make_price(1),
+            position_id=position_id,
+        )
+        position = Position(instrument=instrument, fill=fill)
+        self.cache.add_position(position, OmsType.HEDGING)
+        return position
+
+    def test_diff_position_scope_both_flat(self):
+        """
+        Test no repair when both the cache and the venue are flat.
+        """
+        # Act
+        intents = diff_position_scope([], [], AUDUSD_SIM.size_precision)
 
         # Assert
-        assert not has_discrepancy
+        assert intents == []
 
-    def test_check_position_discrepancy_exact_match(self):
+    def test_diff_position_scope_exact_match(self):
         """
-        Test no discrepancy when cached and venue quantities match exactly.
+        Test no repair when cached and venue quantities match exactly.
         """
         # Arrange
-        engine = self.exec_engine
-        self.cache.add_instrument(AUDUSD_SIM)
+        position = self._seed_position(
+            AUDUSD_SIM,
+            OrderSide.BUY,
+            Quantity.from_int(1000),
+            PositionId("P-EXACT"),
+        )
+        report = PositionStatusReport(
+            account_id=position.account_id,
+            instrument_id=AUDUSD_SIM.id,
+            position_side=PositionSide.LONG,
+            quantity=Quantity.from_int(1000),
+            report_id=UUID4(),
+            ts_last=0,
+            ts_init=0,
+        )
 
-        venue_report = PositionStatusReport(
+        # Act
+        intents = diff_position_scope([report], [position], AUDUSD_SIM.size_precision)
+
+        # Assert
+        assert intents == []
+
+    def test_diff_position_scope_sub_unit_difference_is_a_discrepancy(self):
+        """
+        Test position quantities compare with strict equality, not a size tolerance.
+        """
+        # Arrange
+        ethusdt = TestInstrumentProvider.ethusdt_binance()
+        self.cache.add_instrument(ethusdt)
+        position = self._seed_position(
+            ethusdt,
+            OrderSide.BUY,
+            Quantity.from_str("1.00000"),
+            PositionId("P-SUBUNIT"),
+        )
+        report = PositionStatusReport(
+            account_id=position.account_id,
+            instrument_id=ethusdt.id,
+            position_side=PositionSide.LONG,
+            quantity=Quantity.from_str("0.99999"),  # One size increment below the cache
+            report_id=UUID4(),
+            ts_last=0,
+            ts_init=0,
+        )
+
+        # Act
+        intents = diff_position_scope([report], [position], ethusdt.size_precision)
+
+        # Assert
+        assert len(intents) == 1
+        assert intents[0].action == POSITION_REPAIR_TRIM
+        assert intents[0].order_side == OrderSide.SELL
+        assert intents[0].quantity == Decimal("0.00001")
+        assert intents[0].target_position_id == PositionId("P-SUBUNIT")
+
+    def test_diff_position_scope_sub_increment_difference_compares_equal(self):
+        """
+        Test a difference finer than the declared size precision compares equal.
+        """
+        # Arrange
+        ethusdt = TestInstrumentProvider.ethusdt_binance()
+        self.cache.add_instrument(ethusdt)
+        position = self._seed_position(
+            ethusdt,
+            OrderSide.BUY,
+            Quantity.from_str("1.00000"),
+            PositionId("P-SUBINCREMENT"),
+        )
+        report = PositionStatusReport(
+            account_id=position.account_id,
+            instrument_id=ethusdt.id,
+            position_side=PositionSide.LONG,
+            quantity=Quantity.from_str("0.999995"),  # Half a size increment below the cache
+            report_id=UUID4(),
+            ts_last=0,
+            ts_init=0,
+        )
+
+        # Act
+        intents = diff_position_scope([report], [position], ethusdt.size_precision)
+
+        # Assert
+        assert intents == []
+
+    def test_diff_position_scope_cached_nonzero_venue_flat(self):
+        """
+        Test an absent venue position closes the cached position in full.
+        """
+        # Arrange
+        position = self._seed_position(
+            AUDUSD_SIM,
+            OrderSide.BUY,
+            Quantity.from_int(1000),
+            PositionId("P-ABSENT"),
+        )
+
+        # Act
+        intents = diff_position_scope([], [position], AUDUSD_SIM.size_precision)
+
+        # Assert
+        assert len(intents) == 1
+        assert intents[0].action == POSITION_REPAIR_TRIM
+        assert intents[0].order_side == OrderSide.SELL
+        assert intents[0].quantity == Decimal(1000)
+        assert intents[0].target_position_id == PositionId("P-ABSENT")
+
+    def test_diff_position_scope_venue_only_position_opens(self):
+        """
+        Test a venue position absent from the cache is opened.
+        """
+        # Arrange
+        report = PositionStatusReport(
             account_id=AccountId("SIM-001"),
             instrument_id=AUDUSD_SIM.id,
+            venue_position_id=PositionId("P-VENUE-LONG"),
             position_side=PositionSide.LONG,
-            quantity=Quantity.from_str("1000"),
+            quantity=Quantity.from_int(1000),
             report_id=UUID4(),
             ts_last=0,
             ts_init=0,
         )
 
-        position = Mock()
-        position.signed_decimal_qty.return_value = Decimal(1000)
-
         # Act
-        has_discrepancy = engine._check_position_discrepancy(
-            cached_positions=[position],
-            venue_report=venue_report,
+        intents = diff_position_scope([report], [], AUDUSD_SIM.size_precision)
+
+        # Assert
+        assert len(intents) == 1
+        assert intents[0].action == POSITION_REPAIR_OPEN
+        assert intents[0].order_side == OrderSide.BUY
+        assert intents[0].quantity == Decimal(1000)
+        assert intents[0].target_position_id == PositionId("P-VENUE-LONG")
+
+    def test_diff_position_scope_hedge_sides_are_compared_independently(self):
+        """
+        Test both hedge sides survive: a flat side must not mask an open one.
+        """
+        # Arrange
+        long_id = PositionId(f"{AUDUSD_SIM.id}-LONG")
+        short_id = PositionId(f"{AUDUSD_SIM.id}-SHORT")
+        position = self._seed_position(
+            AUDUSD_SIM,
+            OrderSide.BUY,
+            Quantity.from_int(9000),
+            long_id,
+        )
+        long_report = PositionStatusReport(
+            account_id=position.account_id,
             instrument_id=AUDUSD_SIM.id,
-        )
-
-        # Assert
-        assert not has_discrepancy
-
-    def test_check_position_discrepancy_within_tolerance_fractional(self):
-        """
-        Test no discrepancy when difference is within 1 unit of precision (fractional).
-        """
-        # Arrange
-        engine = self.exec_engine
-        eth_usdt = TestInstrumentProvider.ethusdt_binance()
-        self.cache.add_instrument(eth_usdt)
-
-        venue_report = PositionStatusReport(
-            account_id=AccountId("BINANCE-001"),
-            instrument_id=eth_usdt.id,
+            venue_position_id=long_id,
             position_side=PositionSide.LONG,
-            quantity=Quantity.from_str("0.000525"),
+            quantity=Quantity.from_int(9000),
             report_id=UUID4(),
             ts_last=0,
             ts_init=0,
         )
-
-        position = Mock()
-        position.signed_decimal_qty.return_value = Decimal("0.000524")
-
-        # Act
-        has_discrepancy = engine._check_position_discrepancy(
-            cached_positions=[position],
-            venue_report=venue_report,
-            instrument_id=eth_usdt.id,
-        )
-
-        # Assert
-        assert not has_discrepancy
-
-    def test_check_position_discrepancy_within_tolerance_cached_zero(self):
-        """
-        Test no discrepancy when cached is near-zero within tolerance and venue is flat.
-        """
-        # Arrange
-        engine = self.exec_engine
-        eth_usdt = TestInstrumentProvider.ethusdt_binance()
-        self.cache.add_instrument(eth_usdt)
-
-        position = Mock()
-        position.signed_decimal_qty.return_value = Decimal("0.000001")
-
-        # Act
-        has_discrepancy = engine._check_position_discrepancy(
-            cached_positions=[position],
-            venue_report=None,
-            instrument_id=eth_usdt.id,
-        )
-
-        # Assert
-        assert not has_discrepancy
-
-    def test_check_position_discrepancy_exceeds_tolerance(self):
-        """
-        Test discrepancy detected when difference exceeds 1 unit of precision.
-        """
-        # Arrange
-        engine = self.exec_engine
-        eth_usdt = TestInstrumentProvider.ethusdt_binance()
-        self.cache.add_instrument(eth_usdt)
-
-        venue_report = PositionStatusReport(
-            account_id=AccountId("BINANCE-001"),
-            instrument_id=eth_usdt.id,
-            position_side=PositionSide.LONG,
-            quantity=Quantity.from_str("0.00052"),
-            report_id=UUID4(),
-            ts_last=0,
-            ts_init=0,
-        )
-
-        position = Mock()
-        position.signed_decimal_qty.return_value = Decimal("0.00050")
-
-        # Act
-        has_discrepancy = engine._check_position_discrepancy(
-            cached_positions=[position],
-            venue_report=venue_report,
-            instrument_id=eth_usdt.id,
-        )
-
-        # Assert
-        assert has_discrepancy
-
-    def test_check_position_discrepancy_integer_precision_requires_exact_match(self):
-        """
-        Test discrepancy detected for integer precision (futures) with 1-contract
-        difference.
-        """
-        # Arrange
-        engine = self.exec_engine
-        es_future = TestInstrumentProvider.es_future(expiry_year=2024, expiry_month=12)
-        self.cache.add_instrument(es_future)
-
-        venue_report = PositionStatusReport(
-            account_id=AccountId("CME-001"),
-            instrument_id=es_future.id,
-            position_side=PositionSide.LONG,
-            quantity=Quantity.from_int(11),
-            report_id=UUID4(),
-            ts_last=0,
-            ts_init=0,
-        )
-
-        position = Mock()
-        position.signed_decimal_qty.return_value = Decimal(10)
-
-        # Act
-        has_discrepancy = engine._check_position_discrepancy(
-            cached_positions=[position],
-            venue_report=venue_report,
-            instrument_id=es_future.id,
-        )
-
-        # Assert
-        assert has_discrepancy
-
-    def test_check_position_discrepancy_cached_nonzero_venue_none(self):
-        """
-        Test discrepancy when cached has position but venue has no report.
-        """
-        # Arrange
-        engine = self.exec_engine
-        self.cache.add_instrument(AUDUSD_SIM)
-
-        position = Mock()
-        position.signed_decimal_qty.return_value = Decimal(1000)
-
-        # Act
-        has_discrepancy = engine._check_position_discrepancy(
-            cached_positions=[position],
-            venue_report=None,
+        flat_short_report = PositionStatusReport(
+            account_id=position.account_id,
             instrument_id=AUDUSD_SIM.id,
-        )
-
-        # Assert
-        assert has_discrepancy
-
-    def test_check_position_discrepancy_instrument_not_in_cache(self):
-        """
-        Test discrepancy detected when instrument is not in cache (no tolerance
-        applied).
-        """
-        # Arrange
-        engine = self.exec_engine
-
-        venue_report = PositionStatusReport(
-            account_id=AccountId("SIM-001"),
-            instrument_id=AUDUSD_SIM.id,
-            position_side=PositionSide.LONG,
-            quantity=Quantity.from_str("0.000001"),
+            venue_position_id=short_id,
+            position_side=PositionSide.FLAT,
+            quantity=Quantity.from_int(0),
             report_id=UUID4(),
             ts_last=0,
             ts_init=0,
         )
 
-        position = Mock()
-        position.signed_decimal_qty.return_value = Decimal(0)
-
         # Act
-        has_discrepancy = engine._check_position_discrepancy(
-            cached_positions=[position],
-            venue_report=venue_report,
-            instrument_id=AUDUSD_SIM.id,
+        forward = diff_position_scope(
+            [long_report, flat_short_report],
+            [position],
+            AUDUSD_SIM.size_precision,
+        )
+        reversed_order = diff_position_scope(
+            [flat_short_report, long_report],
+            [position],
+            AUDUSD_SIM.size_precision,
         )
 
         # Assert
-        assert has_discrepancy
+        assert forward == []
+        assert reversed_order == []
 
     def test_find_order_by_venue_order_id_with_none_venue_order_id_does_not_crash(self):
         # Arrange

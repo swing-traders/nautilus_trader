@@ -27,6 +27,8 @@ from nautilus_trader.adapters.bybit.config import BybitExecClientConfig
 from nautilus_trader.adapters.bybit.constants import BYBIT_VENUE
 from nautilus_trader.adapters.bybit.execution import BybitExecutionClient
 from nautilus_trader.adapters.bybit.execution import _is_confirmed_submit_rejection_error
+from nautilus_trader.adapters.bybit.execution import _is_gone_order_cancel_error
+from nautilus_trader.adapters.bybit.execution import _is_post_cancel_lookup_error
 from nautilus_trader.adapters.bybit.execution import _parse_bybit_tp_sl_params
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.core import nautilus_pyo3
@@ -2448,6 +2450,93 @@ async def test_submit_order_list_live_ws_failure_waits_for_reconciliation(
 )
 def test_is_confirmed_submit_rejection_error(exc, expected):
     assert _is_confirmed_submit_rejection_error(exc) is expected
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            ValueError(
+                "Order lookup failed after cancellation: No order returned after cancellation",
+            ),
+            True,
+        ),
+        # Any source behind the same variant is still the post-cancel lookup shape
+        (
+            ValueError("Order lookup failed after cancellation: Bybit error 10001: Request error"),
+            True,
+        ),
+        # Sibling lookup variants of other request paths must not match
+        (
+            ValueError(
+                "Order lookup failed after submission: No order returned after submission",
+            ),
+            False,
+        ),
+        (
+            ValueError("Order lookup failed after amendment: No order returned after amendment"),
+            False,
+        ),
+        # The gone-order cancel shape is a different variant, matched by its own predicate
+        (ValueError("Bybit error 110001: order does not exist"), False),
+        (ValueError("No order_id in cancel response"), False),
+        (RuntimeError("Network error: Timed out after 60000ms"), False),
+        # The prefix only counts at the start of the reason
+        (
+            ValueError(
+                "Batch cancel failed: Order lookup failed after cancellation: No order returned",
+            ),
+            False,
+        ),
+    ],
+)
+def test_is_post_cancel_lookup_error(exc, expected):
+    assert _is_post_cancel_lookup_error(exc) is expected
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        # The message measured live at scenario teardown, where Bybit had already removed
+        # the reduce-only exit when its position closed
+        (
+            ValueError("Bybit error 110001: order not exists or too late to cancel"),
+            True,
+        ),
+        # Any message behind the same code is still the gone-order shape
+        (ValueError("Bybit error 110001: order does not exist"), True),
+        # Sibling Bybit codes are different conditions and must not match
+        (ValueError("Bybit error 10001: Request parameter error"), False),
+        (
+            ValueError(
+                "Bybit error 110017: current position is zero, cannot fix reduce-only order qty",
+            ),
+            False,
+        ),
+        # A longer code sharing the leading digits is a different code
+        (ValueError("Bybit error 1100011: some other condition"), False),
+        # The post-cancel lookup variant is matched by its own predicate
+        (
+            ValueError(
+                "Order lookup failed after cancellation: No order returned after cancellation",
+            ),
+            False,
+        ),
+        # A genuine cancel failure keeps its error level
+        (ValueError("No order_id in cancel response"), False),
+        (RuntimeError("Network error: Timed out after 60000ms"), False),
+        # The code only counts at the start of the reason
+        (
+            ValueError(
+                "Order lookup failed after cancellation: "
+                "Bybit error 110001: order not exists or too late to cancel",
+            ),
+            False,
+        ),
+    ],
+)
+def test_is_gone_order_cancel_error(exc, expected):
+    assert _is_gone_order_cancel_error(exc) is expected
 
 
 # Reasons carrying a Bybit V5 retCode documented at

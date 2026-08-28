@@ -1525,7 +1525,21 @@ class BybitExecutionClient(LiveExecutionClient):
                     venue_order_id=pyo3_venue_order_id,
                 )
         except Exception as e:
-            self._log.error(f"Failed to cancel order {command.client_order_id}: {e}")
+            if self._is_demo and _is_post_cancel_lookup_error(e):
+                self._log.info(
+                    f"Cancel of {command.client_order_id} not confirmed by lookup: {e}; "
+                    "on demo the venue completed the cancel and the authoritative "
+                    "`OrderCanceled` follows over the private WebSocket",
+                )
+            elif self._is_demo and _is_gone_order_cancel_error(e):
+                self._log.info(
+                    f"Cancel of {command.client_order_id} found no order: {e}; "
+                    "on demo the venue had already removed the order and the authoritative "
+                    "terminal event follows over the private WebSocket",
+                )
+            else:
+                self._log.error(f"Failed to cancel order {command.client_order_id}: {e}")
+
             self.generate_order_cancel_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
@@ -1596,7 +1610,21 @@ class BybitExecutionClient(LiveExecutionClient):
                         venue_order_id=pyo3_venue_order_id,
                     )
                 except Exception as e:
-                    self._log.error(f"Failed to cancel order {cancel.client_order_id}: {e}")
+                    if self._is_demo and _is_post_cancel_lookup_error(e):
+                        self._log.info(
+                            f"Cancel of {cancel.client_order_id} not confirmed by lookup: {e}; "
+                            "on demo the venue completed the cancel and the authoritative "
+                            "`OrderCanceled` follows over the private WebSocket",
+                        )
+                    elif self._is_demo and _is_gone_order_cancel_error(e):
+                        self._log.info(
+                            f"Cancel of {cancel.client_order_id} found no order: {e}; "
+                            "on demo the venue had already removed the order and the authoritative "
+                            "terminal event follows over the private WebSocket",
+                        )
+                    else:
+                        self._log.error(f"Failed to cancel order {cancel.client_order_id}: {e}")
+
                     order = self._cache.order(cancel.client_order_id)
                     if order and not order.is_closed:
                         self.generate_order_cancel_rejected(
@@ -2071,6 +2099,28 @@ def _is_confirmed_submit_rejection_error(exc: BaseException) -> bool:
     return reason.startswith("Order rejected: ") or reason.startswith(
         _BYBIT_CONFIRMED_REJECTION_PREFIXES,
     )
+
+
+# Anchored to the `BybitCancelOrderError::PostCancelLookup` display shape
+# "Order lookup failed after cancellation: {source}", which is the only shape carrying the
+# lookup which follows a cancel the venue has already accepted, so sibling submit and amend
+# lookup variants and every other cancel failure are excluded.
+_BYBIT_POST_CANCEL_LOOKUP_PREFIX = "Order lookup failed after cancellation"
+
+
+def _is_post_cancel_lookup_error(exc: BaseException) -> bool:
+    return str(exc).startswith(_BYBIT_POST_CANCEL_LOOKUP_PREFIX)
+
+
+# Anchored to the `BybitHttpError::BybitError` display shape "Bybit error {error_code}: {message}"
+# carrying code 110001, which Bybit returns for an order it no longer holds, so a reason which
+# merely embeds the shape leaves the order possibly live at the venue and must not be read as
+# the venue having already removed it.
+_BYBIT_GONE_ORDER_CANCEL_PREFIX = "Bybit error 110001: "
+
+
+def _is_gone_order_cancel_error(exc: BaseException) -> bool:
+    return str(exc).startswith(_BYBIT_GONE_ORDER_CANCEL_PREFIX)
 
 
 def _validate_price_string(key: str, val: str) -> str:

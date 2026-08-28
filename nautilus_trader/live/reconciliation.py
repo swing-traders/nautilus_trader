@@ -16,7 +16,11 @@
 Reconciliation functions for live trading.
 """
 
+from decimal import ROUND_DOWN
 from decimal import Decimal
+from decimal import localcontext
+from typing import Final
+from typing import NamedTuple
 
 from nautilus_trader.cache.transformers import transform_instrument_to_pyo3
 from nautilus_trader.common.component import Logger
@@ -26,9 +30,12 @@ from nautilus_trader.execution.client import ExecutionClient
 from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
+from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.model.currencies import register_currency
 from nautilus_trader.model.enums import LiquiditySide
+from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderType
+from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderCanceled
 from nautilus_trader.model.events import OrderExpired
@@ -38,6 +45,7 @@ from nautilus_trader.model.events import OrderTriggered
 from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import PositionId
+from nautilus_trader.model.identifiers import StrategyId
 from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.identifiers import VenueOrderId
@@ -47,6 +55,7 @@ from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
+from nautilus_trader.model.position import Position
 
 
 def is_within_single_unit_tolerance(
@@ -696,3 +705,349 @@ def adjust_fills_for_partial_window(
         results[instrument.id] = (orders, fills)
 
     return results
+
+
+POSITION_REPAIR_TRIM: Final[str] = "TRIM"
+POSITION_REPAIR_OPEN: Final[str] = "OPEN"
+
+# Locally generated position IDs carry this prefix (see `PositionId.is_virtual_c`), so
+# they hold no venue claim and the venue's own rows are authority over what they hold
+VIRTUAL_POSITION_ID_PREFIX: Final[str] = "P-"
+
+
+class PositionRepairIntent(NamedTuple):
+    """
+    Represents a single target-safe position repair action.
+
+    Parameters
+    ----------
+    action : str
+        The repair action, either ``TRIM`` (reduce a cached position toward the venue)
+        or ``OPEN`` (open exposure the venue holds and the cache does not).
+    order_side : OrderSide
+        The side of the reconciliation order which applies the repair.
+    quantity : Decimal
+        The repair quantity at the instrument's declared size precision, never exceeding
+        the target's observed quantity for a trim.
+    target_position_id : PositionId or ``None``
+        The position ID the repair is bound to. Always set for a trim; set for an open
+        when the venue reports a position ID at that granularity.
+    target_strategy_id : StrategyId or ``None``
+        The strategy owning the target position (trims only).
+    avg_px : Decimal or ``None``
+        The average price to apply the repair at, when known.
+
+    """
+
+    action: str
+    order_side: OrderSide
+    quantity: Decimal
+    target_position_id: PositionId | None
+    target_strategy_id: StrategyId | None
+    avg_px: Decimal | None
+
+
+# Quantity arithmetic runs at the operand digits plus the declared size precision with
+# headroom: the default 28-digit context rounds a large aggregate below one size
+# increment, and makes `quantize` raise at the maximum representable quantity.
+QUANTITY_CONTEXT_PRECISION: Final[int] = 60
+
+
+def quantities_equal_at_size_precision(
+    value1: Decimal,
+    value2: Decimal,
+    size_precision: int,
+) -> bool:
+    """
+    Check whether two position quantities are equal at a declared size precision.
+
+    A difference finer than one size increment is representational noise the venue
+    cannot hold and no order could repair, so it compares equal. A difference of one
+    increment or more stays a real discrepancy, which is why the quantized magnitude is
+    tested against zero rather than the raw difference against a tolerance one increment
+    wide.
+
+    Parameters
+    ----------
+    value1 : Decimal
+        The first quantity to compare.
+    value2 : Decimal
+        The second quantity to compare.
+    size_precision : int
+        The instrument's declared size precision.
+
+    Returns
+    -------
+    bool
+
+    """
+    # Quantity convergence assumes the declared precision and magnitude fit a double's 15
+    # significant digits, as NT positions store their quantity as a double.
+    with localcontext(prec=QUANTITY_CONTEXT_PRECISION):
+        increment = Decimal(1).scaleb(-size_precision)
+
+        return abs(value1 - value2).quantize(increment, rounding=ROUND_DOWN) == 0
+
+
+def _quantized_repair_quantity(value: Decimal, size_precision: int) -> Decimal:
+    # A repair is placed at the instrument's declared size precision, rounding toward zero
+    # so it moves the cache toward the venue's truth and never past it.
+    return value.quantize(Decimal(1).scaleb(-size_precision), rounding=ROUND_DOWN)
+
+
+def _repair_target_sort_key(position: Position) -> tuple[int, str]:
+    return position.ts_opened, position.id.value
+
+
+def _trim_intents(
+    positions: list[Position],
+    quantity: Decimal,
+    size_precision: int,
+) -> tuple[list[PositionRepairIntent], Decimal]:
+    # Build trims oldest `ts_opened` first (tiebreak position ID), each capped at the
+    # target's own quantity so a repair can never over-close or flip its target.
+    intents: list[PositionRepairIntent] = []
+    remaining = quantity
+
+    for position in sorted(positions, key=_repair_target_sort_key):
+        if remaining <= 0:
+            break
+
+        take = _quantized_repair_quantity(
+            min(remaining, position.quantity.as_decimal()),
+            size_precision,
+        )
+
+        if take <= 0:
+            continue
+
+        intents.append(
+            PositionRepairIntent(
+                action=POSITION_REPAIR_TRIM,
+                order_side=(
+                    OrderSide.SELL if position.side == PositionSide.LONG else OrderSide.BUY
+                ),
+                quantity=take,
+                target_position_id=position.id,
+                target_strategy_id=position.strategy_id,
+                avg_px=(Decimal(str(position.avg_px_open)) if position.avg_px_open else None),
+            ),
+        )
+        remaining -= take
+
+    return intents, remaining
+
+
+def _unambiguous_avg_px(reports: list[PositionStatusReport]) -> Decimal | None:
+    # Only use an average price all candidate reports agree on, so the result does not
+    # depend on the order reports were delivered in.
+    values = {report.avg_px_open for report in reports if report.avg_px_open is not None}
+
+    if len(values) != 1:
+        return None
+
+    return next(iter(values))
+
+
+def _side_deficit_opens(
+    reports: list[PositionStatusReport],
+    targets: list[Position],
+    side: PositionSide,
+    deficit: Decimal,
+    size_precision: int,
+) -> list[PositionRepairIntent]:
+    # What the side's cache exposure leaves uncovered is opened under the venue IDs which
+    # reported that side, each capped at what its own row holds beyond the cache positions
+    # already carrying that ID, so a repair never grows an ID past its row. A remainder no
+    # reported ID can carry is left unrepaired rather than fabricated unbound.
+    cached_by_id: dict[PositionId, Decimal] = {}
+
+    for position in targets:
+        cached_by_id[position.id] = (
+            cached_by_id.get(position.id, Decimal(0)) + position.quantity.as_decimal()
+        )
+
+    reported_by_id: dict[PositionId, Decimal] = {}
+
+    for report in reports:
+        venue_position_id = report.venue_position_id
+
+        if venue_position_id is None or report.position_side != side:
+            continue
+
+        reported_by_id[venue_position_id] = (
+            reported_by_id.get(venue_position_id, Decimal(0)) + report.quantity.as_decimal()
+        )
+
+    intents: list[PositionRepairIntent] = []
+    remaining = deficit
+
+    for venue_position_id in sorted(reported_by_id, key=lambda pid: pid.value):
+        if remaining <= 0:
+            break
+
+        uncovered = reported_by_id[venue_position_id] - cached_by_id.get(
+            venue_position_id,
+            Decimal(0),
+        )
+        take = _quantized_repair_quantity(min(remaining, uncovered), size_precision)
+
+        if take <= 0:
+            continue
+
+        matching = [
+            report
+            for report in reports
+            if report.venue_position_id == venue_position_id and report.position_side == side
+        ]
+        intents.append(
+            PositionRepairIntent(
+                action=POSITION_REPAIR_OPEN,
+                order_side=OrderSide.BUY if side == PositionSide.LONG else OrderSide.SELL,
+                quantity=take,
+                target_position_id=venue_position_id,
+                target_strategy_id=None,
+                avg_px=_unambiguous_avg_px(matching),
+            ),
+        )
+        remaining -= take
+
+    return intents
+
+
+def _diff_by_venue_position_id(
+    reports: list[PositionStatusReport],
+    positions_open: list[Position],
+    size_precision: int,
+) -> list[PositionRepairIntent]:
+    # An ID-bearing snapshot compares per side: the venue's exposure on a side is the sum
+    # of its rows there, and the cache's is the sum of its open positions on that side
+    # whatever ID they are held under, virtual IDs included. A venue position ID labels the
+    # venue's own rows and is never a handle on a cache position, so counting the cache by
+    # label hides the exposure held elsewhere and fabricates against a side which is
+    # already covered.
+    trims: list[PositionRepairIntent] = []
+    opens: list[PositionRepairIntent] = []
+
+    for side in (PositionSide.LONG, PositionSide.SHORT):
+        venue_qty = sum(
+            (report.quantity.as_decimal() for report in reports if report.position_side == side),
+            Decimal(0),
+        )
+        targets = [position for position in positions_open if position.side == side]
+        cached_qty = sum(
+            (position.quantity.as_decimal() for position in targets),
+            Decimal(0),
+        )
+
+        if quantities_equal_at_size_precision(cached_qty, venue_qty, size_precision):
+            continue
+
+        if cached_qty > venue_qty:
+            side_trims, _ = _trim_intents(targets, cached_qty - venue_qty, size_precision)
+            trims.extend(side_trims)
+        else:
+            opens.extend(
+                _side_deficit_opens(
+                    reports,
+                    targets,
+                    side,
+                    venue_qty - cached_qty,
+                    size_precision,
+                ),
+            )
+
+    return trims + opens
+
+
+def _diff_by_net_quantity(
+    reports: list[PositionStatusReport],
+    positions_open: list[Position],
+    size_precision: int,
+) -> list[PositionRepairIntent]:
+    venue_net = sum((report.signed_decimal_qty for report in reports), Decimal(0))
+    cached_net = sum((position.signed_decimal_qty() for position in positions_open), Decimal(0))
+
+    if quantities_equal_at_size_precision(venue_net, Decimal(0), size_precision):
+        # The venue holds nothing in this scope, so every cached position is excess
+        intents, _ = _trim_intents(
+            positions_open,
+            sum(
+                (position.quantity.as_decimal() for position in positions_open),
+                Decimal(0),
+            ),
+            size_precision,
+        )
+        return intents
+
+    if quantities_equal_at_size_precision(venue_net, cached_net, size_precision):
+        return []
+
+    delta = venue_net - cached_net
+
+    if delta < 0:
+        reducible = [p for p in positions_open if p.side == PositionSide.LONG]
+        open_side = OrderSide.SELL
+    else:
+        reducible = [p for p in positions_open if p.side == PositionSide.SHORT]
+        open_side = OrderSide.BUY
+
+    intents, remaining = _trim_intents(reducible, abs(delta), size_precision)
+    open_quantity = _quantized_repair_quantity(remaining, size_precision)
+
+    # Trims absorb the discrepancy in whole increments, so what is left over here can be
+    # the sub-increment remainder of the venue quantity, which no order could carry
+    if open_quantity > 0:
+        intents.append(
+            PositionRepairIntent(
+                action=POSITION_REPAIR_OPEN,
+                order_side=open_side,
+                quantity=open_quantity,
+                target_position_id=None,
+                target_strategy_id=None,
+                avg_px=_unambiguous_avg_px(reports),
+            ),
+        )
+
+    return intents
+
+
+def diff_position_scope(
+    reports: list[PositionStatusReport],
+    positions_open: list[Position],
+    size_precision: int,
+) -> list[PositionRepairIntent]:
+    """
+    Return the target-safe repairs which converge the cache onto the venue snapshot.
+
+    Comparison granularity follows what the venue reported: reports carrying venue
+    position IDs are compared per side, summing the venue's rows on a side against the
+    cache's open positions on that side whatever ID they are held under; reports without
+    them are compared on the scope's net quantity. Quantities compare with strict
+    equality at the instrument's declared size precision, so a difference finer than one
+    size increment compares equal while a difference of one increment or more is a
+    discrepancy. Repair quantities are placed at the same declared precision, rounded
+    toward zero. A trim binds to the cache position it reduces; an opening binds to the
+    venue position ID which reported the uncovered quantity, when the venue gave one.
+
+    Parameters
+    ----------
+    reports : list[PositionStatusReport]
+        The venue-reported positions for one (instrument, account) scope. An empty list
+        means the venue holds no position in the scope.
+    positions_open : list[Position]
+        The cache-open positions for the same scope.
+    size_precision : int
+        The instrument's declared size precision, which quantities compare at.
+
+    Returns
+    -------
+    list[PositionRepairIntent]
+        The repairs to apply, trims before opens. Empty when the scope has converged.
+
+    """
+    with localcontext(prec=QUANTITY_CONTEXT_PRECISION):
+        if any(report.venue_position_id is not None for report in reports):
+            return _diff_by_venue_position_id(reports, positions_open, size_precision)
+
+        return _diff_by_net_quantity(reports, positions_open, size_precision)

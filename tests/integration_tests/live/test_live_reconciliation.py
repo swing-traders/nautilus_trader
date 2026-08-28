@@ -2021,7 +2021,8 @@ async def test_position_reconciliation_handles_generate_fill_reports_exception(
     Simulates a scenario where:
     1. Venue reports a position discrepancy
     2. generate_fill_reports raises an exception (API error, network error, etc.)
-    3. Exception is handled gracefully, position remains at local value
+    3. Exception is handled gracefully and the complete position snapshot still
+       authorizes the repair, so the scope converges on the venue quantity
 
     """
     # Arrange
@@ -2120,13 +2121,14 @@ async def test_position_reconciliation_handles_generate_fill_reports_exception(
     # Act - Run position check (should handle exception gracefully without crashing)
     await exec_engine._check_positions_consistency()
 
-    # Assert - Position should remain at local value (reconciliation failed gracefully)
-    # The system logs an error about the exception but doesn't crash
+    # Assert - the fill query failure is logged without crashing, and the complete
+    # position snapshot still converges the scope on the venue quantity.
     positions = cache.positions_open(instrument_id=AUDUSD_SIM.id)
-    assert len(positions) == 1, "Should still have the position"
-    assert positions[0].quantity == Quantity.from_int(
-        50_000,
-    ), "Position should remain at local value when exception occurs"
+    assert positions, "Should still have exposure"
+    assert sum(p.signed_decimal_qty() for p in positions) == Decimal(
+        80_000,
+    ), "Scope net should converge on the venue quantity"
+    assert (AUDUSD_SIM.id, account_id) not in exec_engine._position_recon_retries
 
     # Cleanup
     exec_engine.stop()
