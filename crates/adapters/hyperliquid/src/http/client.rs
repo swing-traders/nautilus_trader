@@ -2619,7 +2619,8 @@ impl HyperliquidHttpClient {
     /// # Errors
     ///
     /// Returns an error if either clearinghouse request fails (when that
-    /// product is in scope) or parsing fails.
+    /// product is in scope), or a position for a cached instrument cannot be
+    /// parsed, so a partial result never passes as success.
     ///
     /// Returns an error if `account_id` has not been set on the client.
     pub async fn request_position_status_reports(
@@ -2682,11 +2683,17 @@ impl HyperliquidHttpClient {
                 continue;
             }
 
-            // Parse to PositionStatusReport
-            match parse_position_status_report(&position_value, &instrument, account_id, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => log::error!("Failed to parse position status report: {e}"),
-            }
+            // A row for a cached instrument that fails to parse must fail the query,
+            // skipping it would report a real position as absent.
+            let report =
+                parse_position_status_report(&position_value, &instrument, account_id, ts_init)
+                    .map_err(|e| {
+                        Error::decode(format!(
+                            "Failed to parse position status report for {}: {e}",
+                            instrument.id()
+                        ))
+                    })?;
+            reports.push(report);
         }
 
         // Spot positions are part of the report truth; propagate fetch errors
@@ -2795,7 +2802,9 @@ impl HyperliquidHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if `account_id` has not been set or the API request fails.
+    /// Returns an error if `account_id` has not been set, the API request fails, or a
+    /// balance for a cached instrument cannot be parsed, so a partial result never
+    /// passes as success.
     pub async fn request_spot_position_status_reports(
         &self,
         user: &str,
@@ -2844,13 +2853,17 @@ impl HyperliquidHttpClient {
                 continue;
             }
 
-            match parse_spot_position_status_report(balance, &instrument, account_id, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => log::error!(
-                    "Failed to parse spot position status report for {}: {e}",
-                    balance.coin,
-                ),
-            }
+            // A balance for a cached instrument that fails to parse must fail the query,
+            // skipping it would report a real holding as absent.
+            let report =
+                parse_spot_position_status_report(balance, &instrument, account_id, ts_init)
+                    .map_err(|e| {
+                        Error::decode(format!(
+                            "Failed to parse spot position status report for {}: {e}",
+                            balance.coin
+                        ))
+                    })?;
+            reports.push(report);
         }
 
         Ok(reports)

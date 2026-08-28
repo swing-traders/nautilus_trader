@@ -184,10 +184,14 @@ enum ReportFixtureMode {
     Gtd,
     HedgePositions,
     InvalidFill,
+    InvalidPositionAmount,
+    InvalidPositionEntryPrice,
     PaginatedFills,
     Populated,
     MismatchedAlgoId,
     DirectAlgo,
+    UncachedInvalidPosition,
+    UncachedPosition,
 }
 
 fn record_query(state: &CommandResponseState, path: &'static str, query: HashMap<String, String>) {
@@ -428,6 +432,30 @@ async fn handle_position_risk_query(
         ReportFixtureMode::HedgePositions => {
             json_response(&load_fixture("position_risk_hedge.json"))
         }
+        ReportFixtureMode::InvalidPositionAmount => {
+            let mut positions = load_fixture("position_risk.json");
+            positions[0]["positionAmt"] = json!("not-a-number");
+            json_response(&positions)
+        }
+        ReportFixtureMode::InvalidPositionEntryPrice => {
+            let mut positions = load_fixture("position_risk.json");
+            positions[0]["entryPrice"] = json!("not-a-number");
+            json_response(&positions)
+        }
+        ReportFixtureMode::UncachedPosition | ReportFixtureMode::UncachedInvalidPosition => {
+            let positions = load_fixture("position_risk.json");
+            let mut uncached = positions[0].clone();
+            uncached["symbol"] = json!("ETHUSDT");
+            uncached["positionAmt"] = json!(if matches!(
+                state.report_fixture_mode,
+                ReportFixtureMode::UncachedInvalidPosition
+            ) {
+                "not-a-number"
+            } else {
+                "1.5"
+            });
+            json_response(&json!([uncached, positions[0].clone()]))
+        }
         ReportFixtureMode::InvalidFill
         | ReportFixtureMode::PaginatedFills
         | ReportFixtureMode::Populated
@@ -446,7 +474,12 @@ async fn handle_open_orders_query(
     }
     record_query(&state, "openOrders", query);
     match state.report_fixture_mode {
-        ReportFixtureMode::Empty | ReportFixtureMode::FillsOnly => json_response(&json!([])),
+        ReportFixtureMode::Empty
+        | ReportFixtureMode::FillsOnly
+        | ReportFixtureMode::InvalidPositionAmount
+        | ReportFixtureMode::InvalidPositionEntryPrice
+        | ReportFixtureMode::UncachedInvalidPosition
+        | ReportFixtureMode::UncachedPosition => json_response(&json!([])),
         ReportFixtureMode::Gtd => {
             let mut order = load_fixture("order_response.json");
             order["timeInForce"] = json!("GTD");
@@ -479,7 +512,12 @@ async fn handle_open_algo_orders_query(
     }
     record_query(&state, "openAlgoOrders", query);
     match state.report_fixture_mode {
-        ReportFixtureMode::Empty | ReportFixtureMode::FillsOnly => json_response(&json!([])),
+        ReportFixtureMode::Empty
+        | ReportFixtureMode::FillsOnly
+        | ReportFixtureMode::InvalidPositionAmount
+        | ReportFixtureMode::InvalidPositionEntryPrice
+        | ReportFixtureMode::UncachedInvalidPosition
+        | ReportFixtureMode::UncachedPosition => json_response(&json!([])),
         ReportFixtureMode::Gtd => {
             let mut orders = load_fixture("open_algo_orders.json");
             orders[0]["timeInForce"] = json!("GTD");
@@ -544,7 +582,11 @@ async fn handle_all_algo_orders_query(
         ReportFixtureMode::Delivery
         | ReportFixtureMode::Empty
         | ReportFixtureMode::FillsOnly
-        | ReportFixtureMode::Gtd => json_response(&json!([])),
+        | ReportFixtureMode::Gtd
+        | ReportFixtureMode::InvalidPositionAmount
+        | ReportFixtureMode::InvalidPositionEntryPrice
+        | ReportFixtureMode::UncachedInvalidPosition
+        | ReportFixtureMode::UncachedPosition => json_response(&json!([])),
         ReportFixtureMode::InvalidFill
         | ReportFixtureMode::PaginatedFills
         | ReportFixtureMode::Populated
@@ -599,9 +641,13 @@ async fn handle_user_trades_query(
         - 30_000;
     record_query(&state, "userTrades", query);
     match state.report_fixture_mode {
-        ReportFixtureMode::Delivery | ReportFixtureMode::Empty | ReportFixtureMode::Gtd => {
-            json_response(&json!([]))
-        }
+        ReportFixtureMode::Delivery
+        | ReportFixtureMode::Empty
+        | ReportFixtureMode::Gtd
+        | ReportFixtureMode::InvalidPositionAmount
+        | ReportFixtureMode::InvalidPositionEntryPrice
+        | ReportFixtureMode::UncachedInvalidPosition
+        | ReportFixtureMode::UncachedPosition => json_response(&json!([])),
         ReportFixtureMode::FillsOnly
         | ReportFixtureMode::Populated
         | ReportFixtureMode::HedgePositions
@@ -3923,6 +3969,124 @@ async fn test_position_report_generation_preserves_hedge_legs() {
         Some(rust_decimal_macros::dec!(52000.0)),
     );
     assert_eq!(reports[1].ts_last, reports[1].ts_init);
+}
+
+async fn position_report_error(mode: ReportFixtureMode) -> String {
+    let (addr, _captured_queries) =
+        start_exec_test_server_with_query_capture_and_responses(CommandResponses::default(), mode)
+            .await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    add_test_instrument_to_cache(&cache);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let error = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect_err("a cached instrument's unparsable position must fail the query");
+
+    format!("{error:#}")
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_position_reports_error_when_cached_instrument_amount_fails_to_parse() {
+    let error = position_report_error(ReportFixtureMode::InvalidPositionAmount).await;
+
+    assert!(
+        error.contains("BTCUSDT"),
+        "error should name the position row: {error}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_position_reports_error_when_cached_instrument_row_fails_to_parse() {
+    let error = position_report_error(ReportFixtureMode::InvalidPositionEntryPrice).await;
+
+    assert!(
+        error.contains("BTCUSDT"),
+        "error should name the position row: {error}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_position_reports_skip_rows_for_instruments_not_in_cache() {
+    let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::UncachedPosition,
+    )
+    .await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    add_test_instrument_to_cache(&cache);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let reports = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].instrument_id, test_instrument_id());
+    assert_eq!(reports[0].quantity, Quantity::from("0.001"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_position_reports_skip_unparsable_rows_for_instruments_not_in_cache() {
+    let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::UncachedInvalidPosition,
+    )
+    .await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    add_test_instrument_to_cache(&cache);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let reports = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect("an unparsable row for an instrument that is not loaded stays out of scope");
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].instrument_id, test_instrument_id());
+    assert_eq!(reports[0].quantity, Quantity::from("0.001"));
 }
 
 #[rstest]

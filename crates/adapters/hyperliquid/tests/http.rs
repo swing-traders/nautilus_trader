@@ -63,6 +63,7 @@ struct TestServerState {
     frontend_open_orders_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     order_status_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     clearinghouse_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    spot_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     spot_fails: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -75,6 +76,7 @@ impl Default for TestServerState {
             frontend_open_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
             order_status_response: Arc::new(tokio::sync::Mutex::new(None)),
             clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
+            spot_response: Arc::new(tokio::sync::Mutex::new(None)),
             spot_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -219,8 +221,11 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
                 )
                     .into_response();
             }
-            let spot = load_json("http_spot_clearinghouse_state.json");
-            Json(spot).into_response()
+            let custom = state.spot_response.lock().await;
+            let body = custom
+                .clone()
+                .unwrap_or_else(|| load_json("http_spot_clearinghouse_state.json"));
+            Json(body).into_response()
         }
         "candleSnapshot" => Json(json!([
             {
@@ -1122,6 +1127,173 @@ async fn test_request_position_status_reports_skips_perp_fetch_for_outcome_filte
         *state.request_count.lock().await,
         1,
         "outcome filter must issue exactly one info request"
+    );
+}
+
+/// Builds a perp asset position row for the given coin and size.
+fn asset_position_row(coin: &str, szi: &str) -> Value {
+    json!({
+        "position": {
+            "coin": coin,
+            "cumFunding": {
+                "allTime": "0.0",
+                "sinceOpen": "0.0",
+                "sinceChange": "0.0"
+            },
+            "entryPx": "95000.0",
+            "leverage": {"type": "cross", "value": 5},
+            "liquidationPx": "50000.0",
+            "marginUsed": "100.0",
+            "maxLeverage": 50,
+            "positionValue": "9500.0",
+            "returnOnEquity": "0.0",
+            "szi": szi,
+            "unrealizedPnl": "0.0"
+        },
+        "type": "oneWay"
+    })
+}
+
+fn clearinghouse_state_with(positions: &Value) -> Value {
+    json!({
+        "marginSummary": {
+            "accountValue": "10000.0",
+            "totalMarginUsed": "0.0",
+            "totalNtlPos": "0.0",
+            "totalRawUsd": "10000.0"
+        },
+        "crossMarginSummary": {
+            "accountValue": "10000.0",
+            "totalMarginUsed": "0.0",
+            "totalNtlPos": "0.0",
+            "totalRawUsd": "10000.0"
+        },
+        "crossMaintenanceMarginUsed": "0.0",
+        "withdrawable": "10000.0",
+        "assetPositions": positions.clone()
+    })
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_position_status_reports_error_when_cached_instrument_row_fails_to_parse() {
+    let state = TestServerState::default();
+    *state.clearinghouse_response.lock().await =
+        Some(clearinghouse_state_with(&json!([asset_position_row(
+            "BTC",
+            "not-a-number"
+        )])));
+    let addr = start_mock_server(state).await;
+
+    let client = create_domain_client(&addr);
+    cache_btc_instrument(&client);
+
+    let error = client
+        .request_position_status_reports("0x1234567890123456789012345678901234567890", None)
+        .await
+        .expect_err("a cached instrument's unparsable position must fail the query");
+
+    assert!(
+        matches!(error, Error::Decode(ref message) if message.contains("BTC-USD-PERP")),
+        "error should name the position row: {error}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_position_status_reports_skips_rows_for_instruments_not_in_cache() {
+    let state = TestServerState::default();
+    *state.clearinghouse_response.lock().await = Some(clearinghouse_state_with(&json!([
+        asset_position_row("SOL", "12.0"),
+        asset_position_row("BTC", "0.5"),
+    ])));
+    let addr = start_mock_server(state).await;
+
+    let client = create_domain_client(&addr);
+    cache_btc_instrument(&client);
+
+    let reports = client
+        .request_position_status_reports("0x1234567890123456789012345678901234567890", None)
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].instrument_id,
+        InstrumentId::from("BTC-USD-PERP.HYPERLIQUID")
+    );
+    assert_eq!(reports[0].quantity.as_f64(), 0.5);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_spot_position_status_reports_error_when_cached_instrument_row_fails_to_parse()
+{
+    use nautilus_model::{
+        enums::CurrencyType,
+        identifiers::Symbol,
+        instruments::{CurrencyPair, InstrumentAny},
+        types::{Currency, Price, Quantity},
+    };
+
+    let state = TestServerState::default();
+
+    // A negative balance cannot become a Quantity, so the row fails to parse
+    *state.spot_response.lock().await = Some(json!({
+        "balances": [
+            {
+                "coin": "PURR",
+                "token": 1,
+                "total": "-2000",
+                "hold": "0.0",
+                "entryNtl": "1234.56"
+            }
+        ]
+    }));
+    let addr = start_mock_server(state).await;
+
+    let client = create_domain_client(&addr);
+
+    let purr = Currency::new("PURR", 8, 0, "PURR", CurrencyType::Crypto);
+    let usdc = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
+    let ts = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
+
+    let instrument = CurrencyPair::new(
+        InstrumentId::from("PURR-USDC-SPOT.HYPERLIQUID"),
+        Symbol::new("PURR/USDC"),
+        purr,
+        usdc,
+        5,
+        0,
+        Price::from("0.00001"),
+        Quantity::from("1"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ts,
+        ts,
+    );
+    client.cache_instrument(&InstrumentAny::CurrencyPair(instrument));
+
+    let error = client
+        .request_spot_position_status_reports("0x1234567890123456789012345678901234567890", None)
+        .await
+        .expect_err("a cached instrument's unparsable balance must fail the query");
+
+    assert!(
+        matches!(error, Error::Decode(ref message) if message.contains("PURR")),
+        "error should name the balance row: {error}"
     );
 }
 

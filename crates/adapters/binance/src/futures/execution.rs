@@ -891,6 +891,21 @@ impl BinanceFuturesExecutionClient {
             .map_or((8, 8), |i| (i.price_precision(), i.size_precision()))
     }
 
+    /// Returns the loaded instrument matching the venue `symbol` for this product type.
+    ///
+    /// A position row whose instrument is absent is out of reconciliation scope.
+    fn loaded_instrument_for_symbol(&self, symbol: &str) -> Option<InstrumentAny> {
+        self.core
+            .cache()
+            .instruments(&BINANCE_VENUE, None)
+            .into_iter()
+            .find(|instrument| {
+                instrument.raw_symbol().as_str() == symbol
+                    && is_instrument_for_product(instrument, self.product_type)
+            })
+            .cloned()
+    }
+
     /// Creates a position status report from Binance position risk data.
     fn create_position_report(
         &self,
@@ -2090,6 +2105,19 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             let position_amt = match position.position_amt.parse::<Decimal>() {
                 Ok(value) => value,
                 Err(e) => {
+                    // A row for a loaded instrument that fails to parse must fail the
+                    // query: skipping it would report a real position as absent, while
+                    // rows for instruments that are not loaded stay out of reconciliation.
+                    if self
+                        .loaded_instrument_for_symbol(position.symbol.as_str())
+                        .is_some()
+                    {
+                        anyhow::bail!(
+                            "Failed to parse Futures position_amt for symbol={}: {e}",
+                            position.symbol
+                        );
+                    }
+
                     log::warn!(
                         "Failed to parse Futures position_amt for symbol={}: {e}",
                         position.symbol
@@ -2102,30 +2130,20 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 continue;
             }
 
-            let cache = self.core.cache();
-            if let Some(instrument) =
-                cache
-                    .instruments(&BINANCE_VENUE, None)
-                    .into_iter()
-                    .find(|instrument| {
-                        instrument.raw_symbol().as_str() == position.symbol.as_str()
-                            && is_instrument_for_product(instrument, self.product_type)
-                    })
-            {
-                match self.create_position_report(
-                    &position,
-                    instrument.id(),
-                    instrument.size_precision(),
-                ) {
-                    Ok(report) => reports.push(report),
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to create Futures position report for symbol={}: {e}",
-                            position.symbol
-                        );
-                    }
-                }
-            }
+            let Some(instrument) = self.loaded_instrument_for_symbol(position.symbol.as_str())
+            else {
+                continue;
+            };
+
+            let report = self
+                .create_position_report(&position, instrument.id(), instrument.size_precision())
+                .with_context(|| {
+                    format!(
+                        "failed to create Futures position report for symbol={}",
+                        position.symbol
+                    )
+                })?;
+            reports.push(report);
         }
 
         Ok(reports)

@@ -2466,6 +2466,189 @@ async fn test_spot_position_report_short_from_borrowed_balance() {
     assert_eq!(eth_report.quantity, Quantity::new(0.06142, 5));
 }
 
+/// Position rows served by the position scenario server.
+#[derive(Clone)]
+struct PositionScenarioState {
+    rows: Arc<Value>,
+}
+
+/// Builds a LINEAR position row with the given symbol and size.
+fn position_scenario_row(symbol: &str, size: &str) -> Value {
+    json!({
+        "positionIdx": 0,
+        "riskId": 1,
+        "riskLimitValue": "150",
+        "symbol": symbol,
+        "side": "Buy",
+        "size": size,
+        "avgPrice": "50000.00",
+        "positionValue": "25000",
+        "tradeMode": 0,
+        "positionStatus": "Normal",
+        "autoAddMargin": 1,
+        "adlRankIndicator": 2,
+        "leverage": "10",
+        "positionBalance": "2500.00",
+        "markPrice": "50500.00",
+        "liqPrice": "45000.00",
+        "bustPrice": "44500.00",
+        "positionMM": "250.00",
+        "positionIM": "2500.00",
+        "tpslMode": "Full",
+        "takeProfit": "55000.00",
+        "stopLoss": "48000.00",
+        "trailingStop": "0.00",
+        "unrealisedPnl": "250.00",
+        "curRealisedPnl": "100.00",
+        "cumRealisedPnl": "500.00",
+        "seq": 5723621632i64,
+        "isReduceOnly": false,
+        "mmrSysUpdatedTime": "",
+        "leverageSysUpdatedTime": "",
+        "createdTime": "1676538056258",
+        "updatedTime": "1697673600012"
+    })
+}
+
+async fn handle_get_positions_scenario(
+    State(state): State<PositionScenarioState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    // The LINEAR all-positions path queries each settle coin in turn, so serve
+    // the scenario rows for USDT only and leave USDC empty.
+    let list = match query.get("settleCoin").map(String::as_str) {
+        None | Some("USDT") => state.rows.as_ref().clone(),
+        Some(_) => json!([]),
+    };
+
+    Json(json!({
+        "retCode": 0,
+        "retMsg": "OK",
+        "result": {
+            "list": list,
+            "nextPageCursor": "",
+            "category": "linear"
+        },
+        "retExtInfo": {},
+        "time": 1697673900000i64
+    }))
+    .into_response()
+}
+
+async fn start_position_scenario_server(
+    rows: Value,
+) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = PositionScenarioState {
+        rows: Arc::new(rows),
+    };
+    let router = Router::new()
+        .route("/v5/market/time", get(handle_get_server_time))
+        .route("/v5/market/instruments-info", get(handle_get_instruments))
+        .route("/v5/account/fee-rate", get(handle_get_fee_rate))
+        .route("/v5/position/list", get(handle_get_positions_scenario))
+        .with_state(state);
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    wait_for_server(addr, "/v5/market/time").await;
+    Ok(addr)
+}
+
+/// Returns a client with the LINEAR test instruments (BTCUSDT, ETHUSDT) cached.
+async fn position_scenario_client(addr: SocketAddr) -> BybitHttpClient {
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        5_000,
+        None,
+    )
+    .unwrap();
+
+    let instruments = client
+        .request_instruments(BybitProductType::Linear, None, None)
+        .await
+        .unwrap();
+
+    for instrument in instruments {
+        client.cache_instrument(instrument);
+    }
+
+    client
+}
+
+#[rstest]
+#[case::all_positions(None)]
+#[case::single_instrument(Some(InstrumentId::from("BTCUSDT-LINEAR.BYBIT")))]
+#[tokio::test]
+async fn test_position_status_reports_error_when_cached_instrument_row_fails_to_parse(
+    #[case] instrument_id: Option<InstrumentId>,
+) {
+    let rows = json!([
+        position_scenario_row("ETHUSDT", "5.0"),
+        position_scenario_row("BTCUSDT", "not-a-number"),
+    ]);
+    let addr = start_position_scenario_server(rows).await.unwrap();
+    let client = position_scenario_client(addr).await;
+
+    let result = client
+        .request_position_status_reports(
+            AccountId::from("BYBIT-UNIFIED"),
+            BybitProductType::Linear,
+            instrument_id,
+        )
+        .await;
+
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.contains("BTCUSDT-LINEAR"),
+        "error should name the position row: {error}"
+    );
+    assert!(
+        error.contains("not-a-number"),
+        "error should carry the parse cause: {error}"
+    );
+}
+
+#[rstest]
+#[case::all_positions(None)]
+#[case::single_instrument(Some(InstrumentId::from("BTCUSDT-LINEAR.BYBIT")))]
+#[tokio::test]
+async fn test_position_status_reports_skips_rows_for_instruments_not_in_cache(
+    #[case] instrument_id: Option<InstrumentId>,
+) {
+    let rows = json!([
+        position_scenario_row("SOLUSDT", "3.0"),
+        position_scenario_row("BTCUSDT", "0.5"),
+    ]);
+    let addr = start_position_scenario_server(rows).await.unwrap();
+    let client = position_scenario_client(addr).await;
+
+    let reports = client
+        .request_position_status_reports(
+            AccountId::from("BYBIT-UNIFIED"),
+            BybitProductType::Linear,
+            instrument_id,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].instrument_id,
+        InstrumentId::from("BTCUSDT-LINEAR.BYBIT")
+    );
+    assert_eq!(reports[0].quantity, Quantity::new(0.5, 3));
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_request_order_status_reports_with_time_filtering() {

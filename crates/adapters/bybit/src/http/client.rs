@@ -29,6 +29,7 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
@@ -4666,7 +4667,10 @@ impl BybitHttpClient {
     ///
     /// # Errors
     ///
-    /// This function returns an error if the request fails.
+    /// This function returns an error if:
+    /// - The request fails.
+    /// - A position for a loaded instrument cannot be parsed, so a partial result never
+    ///   passes as success.
     ///
     /// # References
     ///
@@ -4744,17 +4748,20 @@ impl BybitHttpClient {
                             continue;
                         };
 
-                        match parse_position_status_report(
+                        // A row for a loaded instrument that fails to parse must fail
+                        // the query: skipping it would report a real position as absent.
+                        let report = parse_position_status_report(
                             &position,
                             account_id,
                             &instrument,
                             ts_init,
-                        ) {
-                            Ok(report) => reports.push(report),
-                            Err(e) => {
-                                log::error!("Failed to parse position status report: {e}");
-                            }
-                        }
+                        )
+                        .with_context(|| {
+                            format!(
+                                "failed to parse position status report for {symbol_with_product}"
+                            )
+                        })?;
+                        reports.push(report);
                     }
 
                     cursor = response.result.next_page_cursor;
@@ -4799,13 +4806,16 @@ impl BybitHttpClient {
                         continue;
                     };
 
-                    match parse_position_status_report(&position, account_id, &instrument, ts_init)
-                    {
-                        Ok(report) => reports.push(report),
-                        Err(e) => {
-                            log::error!("Failed to parse position status report: {e}");
-                        }
-                    }
+                    // A row for a loaded instrument that fails to parse must fail the
+                    // query: skipping it would report a real position as absent.
+                    let report =
+                        parse_position_status_report(&position, account_id, &instrument, ts_init)
+                            .with_context(|| {
+                            format!(
+                                "failed to parse position status report for {symbol_with_product}"
+                            )
+                        })?;
+                    reports.push(report);
                 }
 
                 cursor = response.result.next_page_cursor;
