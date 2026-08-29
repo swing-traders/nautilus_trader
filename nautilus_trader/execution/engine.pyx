@@ -1588,7 +1588,14 @@ cdef class ExecutionEngine(Component):
             order.apply(event)
         except InvalidStateTrigger as e:
             log_msg = f"InvalidStateTrigger: {e}, did not apply {event}"
-            if order.status_c() == OrderStatus.ACCEPTED and isinstance(event, OrderAccepted):
+
+            # A stale state notification refused on an order already terminal is the replay
+            # ordering which reconciliation absorbs, while anything refused that could move
+            # money stays warned.
+            if (
+                (order.status_c() == OrderStatus.ACCEPTED and isinstance(event, OrderAccepted))
+                or (order.is_closed_c() and not isinstance(event, OrderFilled))
+            ):
                 self._log.debug(log_msg)
             else:
                 self._log.warning(log_msg)
