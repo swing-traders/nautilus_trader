@@ -81,7 +81,7 @@ use crate::{
     common::{
         enums::{
             HyperliquidBarInterval::{self, *},
-            HyperliquidOrderStatus, HyperliquidTpSl,
+            HyperliquidLeverageType, HyperliquidOrderStatus, HyperliquidTpSl,
         },
         types::HyperliquidAssetId,
     },
@@ -914,14 +914,15 @@ pub fn parse_trigger_price(trigger_px: &str) -> anyhow::Result<Decimal> {
 
 /// Parses Hyperliquid clearinghouse state into Nautilus account balances and margins.
 ///
-/// Uses the same field selection as the HTTP account-state path
-/// (`cross_margin_summary.total_raw_usd` for total, top-level `state.withdrawable`
-/// for free) so the execution adapter and the HTTP client emit consistent balances
-/// for the same clearinghouse snapshot.
+/// Total is the realized collateral: the account value less the unrealized PnL of every
+/// position, since Hyperliquid's `totalRawUsd` moves with the open cost basis and its
+/// `withdrawable` with marks. Free is the withdrawable balance, capped at that total.
 ///
 /// # Errors
 ///
-/// Returns an error if the data cannot be parsed.
+/// Returns an error if the data cannot be parsed, or if the state cannot value its own
+/// positions: a non-cross position without the account-wide margin summary, or open
+/// notional with no position listed.
 pub fn parse_account_balances_and_margins(
     state: &ClearinghouseState,
 ) -> anyhow::Result<(Vec<AccountBalance>, Vec<MarginBalance>)> {
@@ -935,14 +936,45 @@ pub fn parse_account_balances_and_margins(
         None => return Ok((balances, margins)),
     };
 
-    let mut total_value = cross_margin_summary.total_raw_usd;
-    let free_value = state.withdrawable.unwrap_or(total_value).max(Decimal::ZERO);
+    // Isolated margin is the account's collateral too, and only the account-wide summary
+    // carries it: the cross summary values cross positions alone.
+    let (account_value, total_ntl_pos) = match &state.margin_summary {
+        Some(margin_summary) => (margin_summary.account_value, margin_summary.total_ntl_pos),
+        None => {
+            let all_cross = state.asset_positions.iter().all(|asset_position| {
+                asset_position.position.leverage.leverage_type == HyperliquidLeverageType::Cross
+            });
 
-    // Withdrawable may include spot balances that sit outside a positive margin
-    // account value; raise total so those funds are not silently clamped away.
-    if total_value >= Decimal::ZERO && free_value > total_value {
-        total_value = free_value;
+            if !all_cross {
+                anyhow::bail!(
+                    "Clearinghouse state holds a non-cross position without a margin summary"
+                );
+            }
+
+            (
+                cross_margin_summary.account_value,
+                cross_margin_summary.total_ntl_pos,
+            )
+        }
+    };
+
+    // Open notional with no position listed leaves unrealized PnL in the account value
+    if !total_ntl_pos.is_zero() && state.asset_positions.is_empty() {
+        anyhow::bail!("Clearinghouse state reports open notional with no position listed");
     }
+
+    let unrealized_pnl: Decimal = state
+        .asset_positions
+        .iter()
+        .map(|asset_position| asset_position.position.unrealized_pnl)
+        .sum();
+
+    let total_value = account_value - unrealized_pnl;
+    let free_value = state
+        .withdrawable
+        .unwrap_or(total_value)
+        .max(Decimal::ZERO)
+        .min(total_value);
 
     balances.push(AccountBalance::from_total_and_free(
         total_value,
@@ -2047,21 +2079,25 @@ mod tests {
         assert!(wide > tight);
     }
 
-    // Locks in the field-selection invariant; diverging from it would silently
-    // disagree with the HTTP parser whenever `account_value != total_raw_usd`
-    // or the nested and top-level `withdrawable` values differ.
+    // Total is the realized collateral in every position regime, moving only when
+    // collateral does and never with marks or open notional.
     #[rstest]
-    fn test_parse_account_balances_uses_total_raw_usd_and_top_level_withdrawable() {
+    fn test_parse_account_balances_flat_account_reports_collateral() {
         let json = r#"{
             "assetPositions": [],
-            "crossMarginSummary": {
-                "accountValue": "150",
+            "marginSummary": {
+                "accountValue": "10000",
                 "totalNtlPos": "0",
-                "totalRawUsd": "100",
-                "totalMarginUsed": "20",
-                "withdrawable": "120"
+                "totalRawUsd": "10000",
+                "totalMarginUsed": "0"
             },
-            "withdrawable": "80",
+            "crossMarginSummary": {
+                "accountValue": "10000",
+                "totalNtlPos": "0",
+                "totalRawUsd": "10000",
+                "totalMarginUsed": "0"
+            },
+            "withdrawable": "10000",
             "time": 1700000000000
         }"#;
 
@@ -2070,63 +2106,472 @@ mod tests {
 
         assert_eq!(balances.len(), 1);
         let balance = &balances[0];
-        // Total comes from total_raw_usd (100), not account_value (150); free comes
-        // from top-level state.withdrawable (80), not the nested summary.withdrawable (120).
-        assert_eq!(balance.total.as_decimal(), dec!(100));
-        assert_eq!(balance.free.as_decimal(), dec!(80));
-        assert_eq!(balance.locked.as_decimal(), dec!(20));
-
-        assert_eq!(margins.len(), 1);
-        assert_eq!(margins[0].initial.as_decimal(), dec!(20));
+        assert_eq!(balance.total.as_decimal(), dec!(10000));
+        assert_eq!(balance.free.as_decimal(), dec!(10000));
+        assert_eq!(balance.locked.as_decimal(), dec!(0));
+        assert_eq!(balance.currency.code.as_str(), "USDC");
+        assert!(margins.is_empty());
     }
 
     #[rstest]
-    fn test_parse_account_balances_preserves_negative_total_raw_usd() {
+    fn test_parse_account_balances_excludes_unrealized_profit_from_total() {
+        // 10,000 collateral, cross long of 1,000 entry notional at 10x, mark +5%:
+        // account value 10,000 + 50 = 10,050, margin used 1,050 / 10 = 105,
+        // withdrawable 10,050 - 105 = 9,945, so total is 10,050 - 50 = 10,000 and
+        // locked 10,000 - 9,945 = 55. Free reads the top-level withdrawable, never
+        // the summary's own.
+        let json = r#"{
+            "assetPositions": [{
+                "position": {
+                    "coin": "BTC",
+                    "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"},
+                    "entryPx": "100000",
+                    "leverage": {"type": "cross", "value": 10},
+                    "liquidationPx": "91000",
+                    "marginUsed": "105",
+                    "maxLeverage": 40,
+                    "positionValue": "1050",
+                    "returnOnEquity": "0.5",
+                    "szi": "0.01",
+                    "unrealizedPnl": "50"
+                },
+                "type": "oneWay"
+            }],
+            "marginSummary": {
+                "accountValue": "10050",
+                "totalNtlPos": "1050",
+                "totalRawUsd": "9000",
+                "totalMarginUsed": "105"
+            },
+            "crossMarginSummary": {
+                "accountValue": "10050",
+                "totalNtlPos": "1050",
+                "totalRawUsd": "9000",
+                "totalMarginUsed": "105",
+                "withdrawable": "9999"
+            },
+            "withdrawable": "9945",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_decimal(), dec!(10000));
+        assert_eq!(balance.free.as_decimal(), dec!(9945));
+        assert_eq!(balance.locked.as_decimal(), dec!(55));
+        assert_eq!(balance.currency.code.as_str(), "USDC");
+
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(105));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(105));
+        assert_eq!(margins[0].currency.code.as_str(), "USDC");
+        assert!(margins[0].instrument_id.is_none());
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_excludes_unrealized_loss_from_total() {
+        // The same book at mark -5%: account value 10,000 - 50 = 9,950, margin used
+        // 950 / 10 = 95, withdrawable 9,950 - 95 = 9,855, so total is
+        // 9,950 + 50 = 10,000 and locked 10,000 - 9,855 = 145.
+        let json = r#"{
+            "assetPositions": [{
+                "position": {
+                    "coin": "BTC",
+                    "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"},
+                    "entryPx": "100000",
+                    "leverage": {"type": "cross", "value": 10},
+                    "liquidationPx": "91000",
+                    "marginUsed": "95",
+                    "maxLeverage": 40,
+                    "positionValue": "950",
+                    "returnOnEquity": "-0.5",
+                    "szi": "0.01",
+                    "unrealizedPnl": "-50"
+                },
+                "type": "oneWay"
+            }],
+            "marginSummary": {
+                "accountValue": "9950",
+                "totalNtlPos": "950",
+                "totalRawUsd": "9000",
+                "totalMarginUsed": "95"
+            },
+            "crossMarginSummary": {
+                "accountValue": "9950",
+                "totalNtlPos": "950",
+                "totalRawUsd": "9000",
+                "totalMarginUsed": "95"
+            },
+            "withdrawable": "9855",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_decimal(), dec!(10000));
+        assert_eq!(balance.free.as_decimal(), dec!(9855));
+        assert_eq!(balance.locked.as_decimal(), dec!(145));
+        assert_eq!(balance.currency.code.as_str(), "USDC");
+
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(95));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(95));
+        assert_eq!(margins[0].currency.code.as_str(), "USDC");
+        assert!(margins[0].instrument_id.is_none());
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_stays_positive_when_total_raw_usd_negative() {
+        // 10,000 collateral, cross long of 10,001 entry notional at 10x, mark flat:
+        // raw USD 10,000 - 10,001 = -1 while the collateral is untouched, margin used
+        // 10,001 / 10 = 1,000.1, withdrawable 10,000 - 1,000.1 = 8,999.9, so total is
+        // the 10,000 collateral and locked the 1,000.1 of margin.
+        let json = r#"{
+            "assetPositions": [{
+                "position": {
+                    "coin": "BTC",
+                    "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"},
+                    "entryPx": "100000",
+                    "leverage": {"type": "cross", "value": 10},
+                    "liquidationPx": "91000",
+                    "marginUsed": "1000.1",
+                    "maxLeverage": 40,
+                    "positionValue": "10001",
+                    "returnOnEquity": "0",
+                    "szi": "0.10001",
+                    "unrealizedPnl": "0"
+                },
+                "type": "oneWay"
+            }],
+            "marginSummary": {
+                "accountValue": "10000",
+                "totalNtlPos": "10001",
+                "totalRawUsd": "-1",
+                "totalMarginUsed": "1000.1"
+            },
+            "crossMarginSummary": {
+                "accountValue": "10000",
+                "totalNtlPos": "10001",
+                "totalRawUsd": "-1",
+                "totalMarginUsed": "1000.1"
+            },
+            "withdrawable": "8999.9",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_decimal(), dec!(10000));
+        assert_eq!(balance.free.as_decimal(), dec!(8999.9));
+        assert_eq!(balance.locked.as_decimal(), dec!(1000.1));
+        assert_eq!(balance.currency.code.as_str(), "USDC");
+
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(1000.1));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(1000.1));
+        assert_eq!(margins[0].currency.code.as_str(), "USDC");
+        assert!(margins[0].instrument_id.is_none());
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_ignores_short_inflated_total_raw_usd() {
+        // 10,000 collateral, cross short of 1,000 entry notional at 10x, mark +2%:
+        // raw USD 10,000 + 1,000 = 11,000 (the cost basis is negative on a short),
+        // account value 10,000 - 20 = 9,980, margin used 1,020 / 10 = 102,
+        // withdrawable 9,980 - 102 = 9,878, so total is 9,980 + 20 = 10,000 and
+        // locked 10,000 - 9,878 = 122.
+        let json = r#"{
+            "assetPositions": [{
+                "position": {
+                    "coin": "BTC",
+                    "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"},
+                    "entryPx": "100000",
+                    "leverage": {"type": "cross", "value": 10},
+                    "liquidationPx": "190000",
+                    "marginUsed": "102",
+                    "maxLeverage": 40,
+                    "positionValue": "1020",
+                    "returnOnEquity": "-0.2",
+                    "szi": "-0.01",
+                    "unrealizedPnl": "-20"
+                },
+                "type": "oneWay"
+            }],
+            "marginSummary": {
+                "accountValue": "9980",
+                "totalNtlPos": "1020",
+                "totalRawUsd": "11000",
+                "totalMarginUsed": "102"
+            },
+            "crossMarginSummary": {
+                "accountValue": "9980",
+                "totalNtlPos": "1020",
+                "totalRawUsd": "11000",
+                "totalMarginUsed": "102"
+            },
+            "withdrawable": "9878",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_decimal(), dec!(10000));
+        assert_eq!(balance.free.as_decimal(), dec!(9878));
+        assert_eq!(balance.locked.as_decimal(), dec!(122));
+        assert_eq!(balance.currency.code.as_str(), "USDC");
+
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(102));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(102));
+        assert_eq!(margins[0].currency.code.as_str(), "USDC");
+        assert!(margins[0].instrument_id.is_none());
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_caps_free_at_total_when_withdrawable_exceeds() {
+        // 10,000 collateral, cross long of 1,000 entry notional at 10x, mark +50%:
+        // account value 10,000 + 500 = 10,500, margin used 1,500 / 10 = 150, so
+        // withdrawable 10,500 - 150 = 10,350 exceeds the 10,000 collateral and free
+        // caps at the total.
+        let json = r#"{
+            "assetPositions": [{
+                "position": {
+                    "coin": "BTC",
+                    "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"},
+                    "entryPx": "100000",
+                    "leverage": {"type": "cross", "value": 10},
+                    "liquidationPx": "91000",
+                    "marginUsed": "150",
+                    "maxLeverage": 40,
+                    "positionValue": "1500",
+                    "returnOnEquity": "5",
+                    "szi": "0.01",
+                    "unrealizedPnl": "500"
+                },
+                "type": "oneWay"
+            }],
+            "marginSummary": {
+                "accountValue": "10500",
+                "totalNtlPos": "1500",
+                "totalRawUsd": "9000",
+                "totalMarginUsed": "150"
+            },
+            "crossMarginSummary": {
+                "accountValue": "10500",
+                "totalNtlPos": "1500",
+                "totalRawUsd": "9000",
+                "totalMarginUsed": "150"
+            },
+            "withdrawable": "10350",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_decimal(), dec!(10000));
+        assert_eq!(balance.free.as_decimal(), dec!(10000));
+        assert_eq!(balance.locked.as_decimal(), dec!(0));
+        assert_eq!(balance.currency.code.as_str(), "USDC");
+
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), dec!(150));
+        assert_eq!(margins[0].maintenance.as_decimal(), dec!(150));
+        assert_eq!(margins[0].currency.code.as_str(), "USDC");
+        assert!(margins[0].instrument_id.is_none());
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_includes_isolated_collateral_in_total() {
+        // 10,000 collateral with 100 allocated to an isolated long of 1,000 entry
+        // notional, mark +2%: the cross summary sees only the 9,900 left behind while
+        // the account summary sees 9,900 + 100 + 20 = 10,020, so total is
+        // 10,020 - 20 = 10,000 and the 100 in isolated margin is locked. The margin
+        // balance stays the cross summary's own margin used.
+        let json = r#"{
+            "assetPositions": [{
+                "position": {
+                    "coin": "BTC",
+                    "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"},
+                    "entryPx": "100000",
+                    "leverage": {"type": "isolated", "value": 10},
+                    "liquidationPx": "91000",
+                    "marginUsed": "100",
+                    "maxLeverage": 40,
+                    "positionValue": "1020",
+                    "returnOnEquity": "0.2",
+                    "szi": "0.01",
+                    "unrealizedPnl": "20"
+                },
+                "type": "oneWay"
+            }],
+            "marginSummary": {
+                "accountValue": "10020",
+                "totalNtlPos": "1020",
+                "totalRawUsd": "9000",
+                "totalMarginUsed": "100"
+            },
+            "crossMarginSummary": {
+                "accountValue": "9900",
+                "totalNtlPos": "0",
+                "totalRawUsd": "9900",
+                "totalMarginUsed": "0"
+            },
+            "withdrawable": "9900",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_decimal(), dec!(10000));
+        assert_eq!(balance.free.as_decimal(), dec!(9900));
+        assert_eq!(balance.locked.as_decimal(), dec!(100));
+        assert_eq!(balance.currency.code.as_str(), "USDC");
+        assert!(margins.is_empty());
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_uses_cross_account_value_without_margin_summary() {
+        let json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "10000",
+                "totalNtlPos": "0",
+                "totalRawUsd": "10000",
+                "totalMarginUsed": "0"
+            },
+            "withdrawable": "10000",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState = serde_json::from_str(json).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_decimal(), dec!(10000));
+        assert_eq!(balance.free.as_decimal(), dec!(10000));
+        assert_eq!(balance.locked.as_decimal(), dec!(0));
+        assert_eq!(balance.currency.code.as_str(), "USDC");
+        assert!(margins.is_empty());
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_rejects_open_notional_without_positions() {
+        // The capture reports 24,094.9691 of notional and no position to value it
+        // with, so its 1,736.030875 account value still carries unrealized PnL.
         let json =
             include_str!("../../test_data/http_clearinghouse_state_negative_total_raw_usd.json");
 
         let state: ClearinghouseState = serde_json::from_str(json).unwrap();
-        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+        let error = parse_account_balances_and_margins(&state)
+            .expect_err("an unlisted position leaves the realized balance unknowable");
 
-        assert_eq!(balances.len(), 1);
-        let balance = &balances[0];
-        assert_eq!(balance.total.as_decimal(), dec!(-22358.938225));
-        assert_eq!(balance.free.as_decimal(), dec!(772.232111));
-        assert_eq!(balance.locked.as_decimal(), dec!(-23131.170336));
-
-        assert_eq!(margins.len(), 1);
-        assert_eq!(margins[0].initial.as_decimal(), dec!(963.798764));
+        assert!(error.to_string().contains("open notional"));
     }
 
     #[rstest]
-    fn test_parse_account_balances_bumps_positive_total_when_withdrawable_exceeds() {
+    #[case("isolated")]
+    #[case("portfolio")]
+    fn test_parse_account_balances_rejects_non_cross_position_without_margin_summary(
+        #[case] leverage_type: &str,
+    ) {
+        // The cross summary values cross positions alone, so netting any other
+        // position's PnL out of it would move the total with the mark.
+        let json = r#"{
+            "assetPositions": [{
+                "position": {
+                    "coin": "BTC",
+                    "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"},
+                    "entryPx": "100000",
+                    "leverage": {"type": "LEVERAGE_TYPE", "value": 10},
+                    "liquidationPx": "91000",
+                    "marginUsed": "100",
+                    "maxLeverage": 40,
+                    "positionValue": "1020",
+                    "returnOnEquity": "0.2",
+                    "szi": "0.01",
+                    "unrealizedPnl": "20"
+                },
+                "type": "oneWay"
+            }],
+            "crossMarginSummary": {
+                "accountValue": "9900",
+                "totalNtlPos": "0",
+                "totalRawUsd": "9900",
+                "totalMarginUsed": "0"
+            },
+            "withdrawable": "9900",
+            "time": 1700000000000
+        }"#;
+
+        let state: ClearinghouseState =
+            serde_json::from_str(&json.replace("LEVERAGE_TYPE", leverage_type)).unwrap();
+        let error = parse_account_balances_and_margins(&state)
+            .expect_err("non-cross collateral is unknowable without the account-wide summary");
+
+        assert!(error.to_string().contains("non-cross position"));
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_keeps_free_at_or_below_a_negative_total() {
         let json = r#"{
             "assetPositions": [],
-            "crossMarginSummary": {
-                "accountValue": "100",
+            "marginSummary": {
+                "accountValue": "-10",
                 "totalNtlPos": "0",
-                "totalRawUsd": "100",
-                "totalMarginUsed": "0",
-                "withdrawable": "100"
+                "totalRawUsd": "-10",
+                "totalMarginUsed": "0"
             },
-            "withdrawable": "150",
+            "crossMarginSummary": {
+                "accountValue": "-10",
+                "totalNtlPos": "0",
+                "totalRawUsd": "-10",
+                "totalMarginUsed": "0"
+            },
+            "withdrawable": "0",
             "time": 1700000000000
         }"#;
 
         let state: ClearinghouseState = serde_json::from_str(json).unwrap();
-        let (balances, _) = parse_account_balances_and_margins(&state).unwrap();
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
 
+        assert!(margins.is_empty());
         assert_eq!(balances.len(), 1);
         let balance = &balances[0];
-        assert_eq!(balance.total.as_decimal(), dec!(150));
-        assert_eq!(balance.free.as_decimal(), dec!(150));
+        assert_eq!(balance.total.as_decimal(), dec!(-10));
+        assert_eq!(balance.free.as_decimal(), dec!(-10));
         assert_eq!(balance.locked.as_decimal(), dec!(0));
+        assert_eq!(balance.currency.code.as_str(), "USDC");
     }
 
     #[rstest]
     fn test_parse_account_balances_returns_empty_when_no_cross_margin_summary() {
         let json = r#"{
             "assetPositions": [],
+            "marginSummary": {
+                "accountValue": "100",
+                "totalNtlPos": "0",
+                "totalRawUsd": "100",
+                "totalMarginUsed": "0"
+            },
             "withdrawable": "100",
             "time": 1700000000000
         }"#;
@@ -2362,6 +2807,8 @@ mod tests {
 
     #[rstest]
     fn test_parse_combined_deduplicates_usdc_when_perp_withdrawable_non_zero() {
+        // A withdrawable balance keeps USDC on the perp side, carrying the zero
+        // collateral the summary reports rather than the spot token's own balance.
         let perp_json = r#"{
             "assetPositions": [],
             "crossMarginSummary": {
@@ -2389,8 +2836,8 @@ mod tests {
         assert!(margins.is_empty());
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].currency.code.as_str(), "USDC");
-        assert_eq!(balances[0].total.as_decimal(), dec!(50));
-        assert_eq!(balances[0].free.as_decimal(), dec!(50));
+        assert_eq!(balances[0].total.as_decimal(), dec!(0));
+        assert_eq!(balances[0].free.as_decimal(), dec!(0));
         assert_eq!(balances[1].currency.code.as_str(), "PURR");
         assert_eq!(balances[1].total.as_decimal(), dec!(10));
     }

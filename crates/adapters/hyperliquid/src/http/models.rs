@@ -1988,6 +1988,9 @@ pub struct ClearinghouseState {
     /// List of asset positions (perpetual contracts).
     #[serde(default)]
     pub asset_positions: Vec<AssetPosition>,
+    /// Account-wide margin summary, covering cross and isolated positions.
+    #[serde(default)]
+    pub margin_summary: Option<MarginSummary>,
     /// Cross margin summary information.
     #[serde(default)]
     pub cross_margin_summary: Option<CrossMarginSummary>,
@@ -2182,6 +2185,40 @@ impl SpotBalance {
     }
 }
 
+/// Account-wide margin summary information, covering cross and isolated positions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarginSummary {
+    /// Account value in USD.
+    #[serde(
+        rename = "accountValue",
+        serialize_with = "serialize_decimal_as_str",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub account_value: Decimal,
+    /// Total notional position value.
+    #[serde(
+        rename = "totalNtlPos",
+        serialize_with = "serialize_decimal_as_str",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub total_ntl_pos: Decimal,
+    /// Total raw USD: the collateral less the signed entry notional of open positions.
+    #[serde(
+        rename = "totalRawUsd",
+        serialize_with = "serialize_decimal_as_str",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub total_raw_usd: Decimal,
+    /// Total margin used across all positions.
+    #[serde(
+        rename = "totalMarginUsed",
+        serialize_with = "serialize_decimal_as_str",
+        deserialize_with = "deserialize_decimal_from_str"
+    )]
+    pub total_margin_used: Decimal,
+}
+
 /// Cross margin summary information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2200,14 +2237,14 @@ pub struct CrossMarginSummary {
         deserialize_with = "deserialize_decimal_from_str"
     )]
     pub total_ntl_pos: Decimal,
-    /// Total raw USD value (collateral).
+    /// Total raw USD: the collateral less the signed entry notional of open positions.
     #[serde(
         rename = "totalRawUsd",
         serialize_with = "serialize_decimal_as_str",
         deserialize_with = "deserialize_decimal_from_str"
     )]
     pub total_raw_usd: Decimal,
-    /// Total margin used across all positions.
+    /// Total margin used by cross positions.
     #[serde(
         rename = "totalMarginUsed",
         serialize_with = "serialize_decimal_as_str",
