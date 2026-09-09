@@ -13,6 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import subprocess
+import sys
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
@@ -2678,3 +2680,108 @@ class TestStrategy:
         # Assert - strategy should be stopped and market exit state cleaned up
         assert strategy.state == ComponentState.STOPPED
         assert not strategy.is_exiting()
+
+
+_LOG_CAPTURE_CHILD = """
+import sys
+
+from nautilus_trader.common.component import MessageBus
+from nautilus_trader.common.component import TestClock
+from nautilus_trader.common.component import flush_logger
+from nautilus_trader.common.component import init_logging
+from nautilus_trader.common.enums import LogLevel
+from nautilus_trader.config import StrategyConfig
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.objects import Quantity
+from nautilus_trader.portfolio.portfolio import Portfolio
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
+from nautilus_trader.trading.strategy import Strategy
+
+
+class StrategyShell(Strategy):
+    pass
+
+
+_guard = init_logging(level_stdout=LogLevel.INFO, colors=False, bypass=False)
+
+instrument = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+clock = TestClock()
+trader_id = TestIdStubs.trader_id()
+msgbus = MessageBus(trader_id=trader_id, clock=clock)
+cache = TestComponentStubs.cache()
+cache.add_instrument(instrument)
+portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=clock)
+
+strategy = StrategyShell(
+    config=StrategyConfig(strategy_id=sys.argv[1] or None, order_id_tag="001"),
+)
+strategy.register(
+    trader_id=trader_id,
+    portfolio=portfolio,
+    msgbus=msgbus,
+    cache=cache,
+    clock=clock,
+)
+strategy.submit_order(
+    strategy.order_factory.market(
+        instrument_id=instrument.id,
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_int(100_000),
+    ),
+)
+flush_logger()
+"""
+
+
+def _submit_order_logging_to_stdout(strategy_id: str) -> str:
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", _LOG_CAPTURE_CHILD, strategy_id],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"log capture child failed with exit code {result.returncode}\nstderr:\n{result.stderr}"
+    )
+    return result.stdout
+
+
+def _submit_order_command_line(stdout: str) -> str:
+    lines = [line for line in stdout.splitlines() if "[CMD]--> [Risk] SubmitOrder" in line]
+    assert len(lines) == 1, f"expected one submit order command line, got {lines}"
+    return lines[0]
+
+
+def test_order_manager_logs_under_configured_strategy_id() -> None:
+    """
+    The order manager's command lines carry the configured `strategy_id`.
+
+    Runs in a child process: the suite initializes the logging subsystem once with
+    `bypass=True`, and it cannot be re-initialized to write real output.
+
+    """
+    # Arrange, Act
+    stdout = _submit_order_logging_to_stdout("Impl")
+
+    # Assert
+    assert "TRADER-000.Impl: [CMD]--> [Risk] SubmitOrder" in _submit_order_command_line(stdout)
+    assert "StrategyShell" not in stdout
+
+
+def test_order_manager_logs_under_class_name_without_strategy_id() -> None:
+    """
+    The order manager's command lines carry the class name when no `strategy_id` is
+    configured.
+
+    Runs in a child process for the same reason as the configured case.
+
+    """
+    # Arrange, Act
+    stdout = _submit_order_logging_to_stdout("")
+
+    # Assert
+    command_line = _submit_order_command_line(stdout)
+    assert "TRADER-000.StrategyShell: [CMD]--> [Risk] SubmitOrder" in command_line
