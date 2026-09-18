@@ -3658,6 +3658,40 @@ class TestSimulatedExchangeMarginAccount:
         assert entry.status == OrderStatus.ACCEPTED
         assert entry.quantity == 100000
 
+    def test_latency_model_commands_queued_behind_a_slower_one_are_all_processed(self) -> None:
+        # Arrange: a modify due a second out sits in the in-flight queue while immediate
+        # commands arrive, drain, and arrive again at the same instant.
+        self.exchange.set_latency_model(LatencyModel(0, 0, secs_to_nanos(1), 0))
+
+        def limit():
+            return self.strategy.order_factory.limit(
+                instrument_id=_USDJPY_SIM.id,
+                order_side=OrderSide.BUY,
+                price=_USDJPY_SIM.make_price(100),
+                quantity=_USDJPY_SIM.make_qty(200_000),
+            )
+
+        entry = limit()
+        self.strategy.submit_order(entry)
+        self.exchange.process(0)
+        self.strategy.modify_order(entry, quantity=_USDJPY_SIM.make_qty(100_000))
+
+        # Act
+        first_batch = [limit(), limit()]
+        for order in first_batch:
+            self.strategy.submit_order(order)
+        self.exchange.process(0)
+        second_batch = [limit(), limit()]
+        for order in second_batch:
+            self.strategy.submit_order(order)
+        self.exchange.process(0)
+        self.exchange.process(secs_to_nanos(1))
+
+        # Assert
+        assert [order.status for order in first_batch + second_batch] == [OrderStatus.ACCEPTED] * 4
+        assert entry.status == OrderStatus.ACCEPTED
+        assert entry.quantity == 100_000
+
     def test_latency_model_large_int(self) -> None:
         # Arrange
         self.exchange.set_latency_model(LatencyModel(secs_to_nanos(10)))

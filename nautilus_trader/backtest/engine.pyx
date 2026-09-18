@@ -3729,7 +3729,10 @@ cdef class SimulatedExchange:
         while self._inflight_queue:
             ts = self._inflight_queue[0][0][0]
             if ts <= ts_now:
-                self._message_queue.appendleft(self._inflight_queue.pop(0)[1])
+                # A plain `pop(0)` breaks the heap invariant, leaving a due command behind a
+                # later one and its per-timestamp counter cleared, so a later push can reissue
+                # a key already in the heap.
+                self._message_queue.appendleft(heapq.heappop(self._inflight_queue)[1])
                 self._inflight_counter.pop(ts, None)
             else:
                 break
