@@ -48,7 +48,10 @@ use crate::{
     common::{
         consts::BYBIT_VENUE,
         enums::{BybitEnvironment, BybitPositionIdx, BybitProductType},
-        parse::{make_bybit_symbol, parse_bbo_level, parse_bbo_side_type},
+        parse::{
+            make_bybit_symbol, parse_bbo_level, parse_bbo_side_type, parse_tpsl_mode,
+            parse_trigger_type,
+        },
     },
     python::params::{BybitWsAmendOrderParams, BybitWsCancelOrderParams, BybitWsPlaceOrderParams},
     websocket::{
@@ -970,6 +973,9 @@ impl BybitWebSocketClient {
 
     /// Modifies an existing order using Nautilus domain objects.
     ///
+    /// The take-profit and stop-loss fields reach the venue as given: `None` leaves the order's
+    /// attached level unchanged, and `"0"` cancels it.
+    ///
     /// # Errors
     ///
     /// Returns an error if modification fails or if not authenticated.
@@ -983,6 +989,11 @@ impl BybitWebSocketClient {
         venue_order_id=None,
         quantity=None,
         price=None,
+        tpsl_mode=None,
+        take_profit=None,
+        stop_loss=None,
+        tp_trigger_by=None,
+        sl_trigger_by=None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_modify_order<'py>(
@@ -996,9 +1007,26 @@ impl BybitWebSocketClient {
         venue_order_id: Option<VenueOrderId>,
         quantity: Option<Quantity>,
         price: Option<Price>,
+        tpsl_mode: Option<String>,
+        take_profit: Option<String>,
+        stop_loss: Option<String>,
+        tp_trigger_by: Option<String>,
+        sl_trigger_by: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         let pending_py_requests = Arc::clone(self.pending_py_requests());
+        let tpsl_mode = tpsl_mode
+            .map(|value| parse_tpsl_mode(&value))
+            .transpose()
+            .map_err(to_pyvalue_err)?;
+        let tp_trigger_by = tp_trigger_by
+            .map(|value| parse_trigger_type(&value))
+            .transpose()
+            .map_err(to_pyvalue_err)?;
+        let sl_trigger_by = sl_trigger_by
+            .map(|value| parse_trigger_type(&value))
+            .transpose()
+            .map_err(to_pyvalue_err)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let req_id = client
@@ -1009,6 +1037,11 @@ impl BybitWebSocketClient {
                     venue_order_id,
                     quantity,
                     price,
+                    tpsl_mode,
+                    take_profit,
+                    stop_loss,
+                    tp_trigger_by,
+                    sl_trigger_by,
                 )
                 .await
                 .map_err(to_pyruntime_err)?;

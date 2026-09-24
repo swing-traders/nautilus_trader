@@ -580,6 +580,41 @@ mod tests {
         let err = RustNativeTpSlParams::try_from(params).unwrap_err();
         assert!(err.to_string().contains("invalid Bybit TP/SL mode"));
     }
+
+    fn amend_order_params(tpsl_mode: Option<&str>) -> BybitWsAmendOrderParams {
+        BybitWsAmendOrderParams {
+            category: BybitProductType::Linear,
+            symbol: "BTCUSDT".to_string(),
+            order_id: None,
+            order_link_id: Some("amend-1".to_string()),
+            qty: None,
+            price: None,
+            trigger_price: None,
+            tpsl_mode: tpsl_mode.map(str::to_string),
+            take_profit: None,
+            stop_loss: Some("110000".to_string()),
+            tp_trigger_by: None,
+            sl_trigger_by: None,
+            order_iv: None,
+        }
+    }
+
+    #[rstest]
+    fn test_amend_params_try_from_parses_tpsl_mode() {
+        let params =
+            messages::BybitWsAmendOrderParams::try_from(amend_order_params(Some("Full"))).unwrap();
+
+        assert_eq!(params.tpsl_mode, Some(BybitTpSlMode::Full));
+        assert_eq!(params.stop_loss.as_deref(), Some("110000"));
+    }
+
+    #[rstest]
+    fn test_amend_params_try_from_rejects_unknown_tpsl_mode() {
+        let err = messages::BybitWsAmendOrderParams::try_from(amend_order_params(Some("Unknown")))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Invalid tpsl_mode 'Unknown'"));
+    }
 }
 
 /// Parameters for amending an order via WebSocket.
@@ -602,6 +637,8 @@ pub struct BybitWsAmendOrderParams {
     #[pyo3(get, set)]
     pub trigger_price: Option<String>,
     #[pyo3(get, set)]
+    pub tpsl_mode: Option<String>,
+    #[pyo3(get, set)]
     pub take_profit: Option<String>,
     #[pyo3(get, set)]
     pub stop_loss: Option<String>,
@@ -618,6 +655,21 @@ pub struct BybitWsAmendOrderParams {
 impl BybitWsAmendOrderParams {
     /// Parameters for amending an order via WebSocket.
     #[new]
+    #[pyo3(signature = (
+        category,
+        symbol,
+        order_id,
+        order_link_id,
+        qty,
+        price,
+        trigger_price,
+        take_profit,
+        stop_loss,
+        tp_trigger_by,
+        sl_trigger_by,
+        order_iv,
+        tpsl_mode=None,
+    ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         category: BybitProductType,
@@ -632,6 +684,7 @@ impl BybitWsAmendOrderParams {
         tp_trigger_by: Option<String>,
         sl_trigger_by: Option<String>,
         order_iv: Option<String>,
+        tpsl_mode: Option<String>,
     ) -> Self {
         Self {
             category,
@@ -641,6 +694,7 @@ impl BybitWsAmendOrderParams {
             qty,
             price,
             trigger_price,
+            tpsl_mode,
             take_profit,
             stop_loss,
             tp_trigger_by,
@@ -672,6 +726,14 @@ impl TryFrom<BybitWsAmendOrderParams> for messages::BybitWsAmendOrderParams {
             })
             .transpose()?;
 
+        let tpsl_mode = params
+            .tpsl_mode
+            .map(|v| {
+                parse_tpsl_mode(&v)
+                    .map_err(|e| BybitWsError::ClientError(format!("Invalid tpsl_mode '{v}': {e}")))
+            })
+            .transpose()?;
+
         Ok(Self {
             category: params.category,
             symbol: Ustr::from(&params.symbol),
@@ -680,6 +742,7 @@ impl TryFrom<BybitWsAmendOrderParams> for messages::BybitWsAmendOrderParams {
             qty: params.qty,
             price: params.price,
             trigger_price: params.trigger_price,
+            tpsl_mode,
             take_profit: params.take_profit,
             stop_loss: params.stop_loss,
             tp_trigger_by,
@@ -703,6 +766,12 @@ impl From<messages::BybitWsAmendOrderParams> for BybitWsAmendOrderParams {
                 .trim_matches('"')
                 .to_string()
         });
+        let tpsl_mode = params.tpsl_mode.map(|v| {
+            serde_json::to_string(&v)
+                .expect("Failed to serialize BybitTpSlMode")
+                .trim_matches('"')
+                .to_string()
+        });
 
         Self {
             category: params.category,
@@ -712,6 +781,7 @@ impl From<messages::BybitWsAmendOrderParams> for BybitWsAmendOrderParams {
             qty: params.qty,
             price: params.price,
             trigger_price: params.trigger_price,
+            tpsl_mode,
             take_profit: params.take_profit,
             stop_loss: params.stop_loss,
             tp_trigger_by,

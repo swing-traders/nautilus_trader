@@ -56,8 +56,8 @@ use crate::{
         credential::Credential,
         enums::{
             BybitBboSideType, BybitEnvironment, BybitOrderSide, BybitOrderType, BybitPositionIdx,
-            BybitProductType, BybitTimeInForce, BybitTpSlMode, BybitWsOrderRequestOp,
-            resolve_trigger_type,
+            BybitProductType, BybitTimeInForce, BybitTpSlMode, BybitTriggerType,
+            BybitWsOrderRequestOp, resolve_trigger_type,
         },
         parse::{
             bar_spec_to_bybit_interval, extract_base_coin, extract_raw_symbol, map_time_in_force,
@@ -1638,9 +1638,13 @@ impl BybitWebSocketClient {
 
     /// Modifies an existing order using Nautilus domain objects.
     ///
+    /// The take-profit and stop-loss fields reach the venue as given: `None` leaves the order's
+    /// attached level unchanged, and `"0"` cancels it.
+    ///
     /// # Errors
     ///
     /// Returns an error if modification fails or if not authenticated.
+    #[expect(clippy::too_many_arguments)]
     pub async fn modify_order(
         &self,
         product_type: BybitProductType,
@@ -1649,8 +1653,13 @@ impl BybitWebSocketClient {
         venue_order_id: Option<VenueOrderId>,
         quantity: Option<Quantity>,
         price: Option<Price>,
+        tpsl_mode: Option<BybitTpSlMode>,
+        take_profit: Option<String>,
+        stop_loss: Option<String>,
+        tp_trigger_by: Option<BybitTriggerType>,
+        sl_trigger_by: Option<BybitTriggerType>,
     ) -> BybitWsResult<String> {
-        let params = self.build_amend_order_params(
+        let mut params = self.build_amend_order_params(
             product_type,
             instrument_id,
             venue_order_id,
@@ -1658,6 +1667,11 @@ impl BybitWebSocketClient {
             quantity,
             price,
         )?;
+        params.tpsl_mode = tpsl_mode;
+        params.take_profit = take_profit;
+        params.stop_loss = stop_loss;
+        params.tp_trigger_by = tp_trigger_by;
+        params.sl_trigger_by = sl_trigger_by;
 
         self.amend_order(params).await
     }
@@ -1854,6 +1868,7 @@ impl BybitWebSocketClient {
             qty: quantity.map(|q| q.to_string()),
             price: price.map(|p| p.to_string()),
             trigger_price: None,
+            tpsl_mode: None,
             take_profit: None,
             stop_loss: None,
             tp_trigger_by: None,

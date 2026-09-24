@@ -36,7 +36,7 @@ use axum::{
 use nautilus_bybit::{
     common::enums::{
         BybitBboSideType, BybitEnvironment, BybitOrderSide, BybitOrderType, BybitProductType,
-        BybitTimeInForce,
+        BybitTimeInForce, BybitTpSlMode, BybitTriggerType,
     },
     websocket::{
         client::BybitWebSocketClient,
@@ -46,7 +46,7 @@ use nautilus_bybit::{
 use nautilus_common::testing::wait_until_async;
 use nautilus_model::{
     data::BarType,
-    identifiers::InstrumentId,
+    identifiers::{ClientOrderId, InstrumentId, VenueOrderId},
     instruments::CurrencyPair,
     types::{Currency, Price, Quantity},
 };
@@ -2399,6 +2399,7 @@ async fn test_batch_amend_orders() {
         qty: Some("0.002".to_string()),
         price: Some("51000.0".to_string()),
         trigger_price: None,
+        tpsl_mode: None,
         take_profit: None,
         stop_loss: None,
         tp_trigger_by: None,
@@ -2970,6 +2971,7 @@ async fn test_batch_amend_order_with_order_iv() {
         qty: None,
         price: None,
         trigger_price: None,
+        tpsl_mode: None,
         take_profit: None,
         stop_loss: None,
         tp_trigger_by: None,
@@ -2991,6 +2993,140 @@ async fn test_batch_amend_order_with_order_iv() {
 
     assert_eq!(order["orderIv"], "0.90");
     assert_eq!(order["orderLinkId"], "option-test-1");
+
+    client.close().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_modify_order_without_tp_sl_sends_only_the_amend_fields() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/v5/private");
+
+    let mut client = BybitWebSocketClient::new_private(
+        BybitEnvironment::Mainnet,
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        Some(ws_url),
+        20,
+        TransportBackend::default(),
+        None,
+    );
+
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || async { state.authenticated.load(Ordering::Relaxed) },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client
+        .modify_order(
+            BybitProductType::Linear,
+            InstrumentId::from("BTCUSDT-LINEAR.BYBIT"),
+            ClientOrderId::from("amend-1"),
+            Some(VenueOrderId::from("venue-amend-1")),
+            Some(Quantity::from("0.002")),
+            Some(Price::from("51000.5")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_until_async(
+        || async { !state.captured_messages.lock().await.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let messages = state.captured_messages.lock().await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["op"], "order.amend");
+    assert_eq!(
+        messages[0]["args"],
+        json!([{
+            "category": "linear",
+            "symbol": "BTCUSDT",
+            "orderId": "venue-amend-1",
+            "orderLinkId": "amend-1",
+            "qty": "0.002",
+            "price": "51000.5",
+        }])
+    );
+
+    client.close().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_modify_order_forwards_the_attached_tp_sl() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/v5/private");
+
+    let mut client = BybitWebSocketClient::new_private(
+        BybitEnvironment::Mainnet,
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        Some(ws_url),
+        20,
+        TransportBackend::default(),
+        None,
+    );
+
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || async { state.authenticated.load(Ordering::Relaxed) },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client
+        .modify_order(
+            BybitProductType::Linear,
+            InstrumentId::from("BTCUSDT-LINEAR.BYBIT"),
+            ClientOrderId::from("amend-1"),
+            Some(VenueOrderId::from("venue-amend-1")),
+            None,
+            Some(Price::from("51000.5")),
+            Some(BybitTpSlMode::Full),
+            Some("0".to_string()),
+            Some("110000".to_string()),
+            Some(BybitTriggerType::MarkPrice),
+            Some(BybitTriggerType::LastPrice),
+        )
+        .await
+        .unwrap();
+
+    wait_until_async(
+        || async { !state.captured_messages.lock().await.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let messages = state.captured_messages.lock().await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["op"], "order.amend");
+    assert_eq!(
+        messages[0]["args"],
+        json!([{
+            "category": "linear",
+            "symbol": "BTCUSDT",
+            "orderId": "venue-amend-1",
+            "orderLinkId": "amend-1",
+            "price": "51000.5",
+            "tpslMode": "Full",
+            "takeProfit": "0",
+            "stopLoss": "110000",
+            "tpTriggerBy": "MarkPrice",
+            "slTriggerBy": "LastPrice",
+        }])
+    );
 
     client.close().await.unwrap();
 }

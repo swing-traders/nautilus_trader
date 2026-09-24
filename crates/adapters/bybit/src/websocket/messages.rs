@@ -328,6 +328,8 @@ pub struct BybitWsAmendOrderParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tpsl_mode: Option<BybitTpSlMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub take_profit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_loss: Option<String>,
@@ -1306,6 +1308,7 @@ mod tests {
             qty: None,
             price: None,
             trigger_price: None,
+            tpsl_mode: None,
             take_profit: None,
             stop_loss: None,
             tp_trigger_by: None,
@@ -1315,6 +1318,63 @@ mod tests {
 
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains("\"orderIv\":\"0.90\""));
+    }
+
+    #[rstest]
+    fn serialize_amend_params_without_tp_sl_carries_only_the_amend_fields() {
+        let params = BybitWsAmendOrderParams {
+            category: BybitProductType::Linear,
+            symbol: Ustr::from("BTCUSDT"),
+            order_id: Some("venue-amend-1".to_string()),
+            order_link_id: Some("amend-1".to_string()),
+            qty: Some("0.002".to_string()),
+            price: Some("51000.5".to_string()),
+            trigger_price: None,
+            tpsl_mode: None,
+            take_profit: None,
+            stop_loss: None,
+            tp_trigger_by: None,
+            sl_trigger_by: None,
+            order_iv: None,
+        };
+
+        assert_eq!(
+            serde_json::to_string(&params).unwrap(),
+            r#"{"category":"linear","symbol":"BTCUSDT","orderId":"venue-amend-1","orderLinkId":"amend-1","qty":"0.002","price":"51000.5"}"#,
+        );
+    }
+
+    #[rstest]
+    fn serialize_amend_params_carries_the_attached_tp_sl_when_set() {
+        let params = BybitWsAmendOrderParams {
+            category: BybitProductType::Linear,
+            symbol: Ustr::from("BTCUSDT"),
+            order_id: None,
+            order_link_id: Some("amend-1".to_string()),
+            qty: None,
+            price: None,
+            trigger_price: None,
+            tpsl_mode: Some(BybitTpSlMode::Full),
+            take_profit: Some("0".to_string()),
+            stop_loss: Some("110000".to_string()),
+            tp_trigger_by: Some(BybitTriggerType::MarkPrice),
+            sl_trigger_by: Some(BybitTriggerType::LastPrice),
+            order_iv: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&params).unwrap(),
+            serde_json::json!({
+                "category": "linear",
+                "symbol": "BTCUSDT",
+                "orderLinkId": "amend-1",
+                "tpslMode": "Full",
+                "takeProfit": "0",
+                "stopLoss": "110000",
+                "tpTriggerBy": "MarkPrice",
+                "slTriggerBy": "LastPrice",
+            }),
+        );
     }
 
     #[rstest]

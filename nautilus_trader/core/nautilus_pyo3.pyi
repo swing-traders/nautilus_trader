@@ -7519,6 +7519,11 @@ class BybitHttpClient:
         venue_order_id: VenueOrderId | None = None,
         quantity: Quantity | None = None,
         price: Price | None = None,
+        tpsl_mode: str | None = None,
+        take_profit: str | None = None,
+        stop_loss: str | None = None,
+        tp_trigger_by: str | None = None,
+        sl_trigger_by: str | None = None,
     ) -> OrderStatusReport: ...
 
 class BybitWebSocketClient:
@@ -7610,6 +7615,11 @@ class BybitWebSocketClient:
         venue_order_id: VenueOrderId | None = None,
         quantity: Quantity | None = None,
         price: Price | None = None,
+        tpsl_mode: str | None = None,
+        take_profit: str | None = None,
+        stop_loss: str | None = None,
+        tp_trigger_by: str | None = None,
+        sl_trigger_by: str | None = None,
     ) -> None: ...
     async def cancel_order(
         self,
@@ -7716,6 +7726,7 @@ class BybitWsAmendOrderParams:
     qty: str | None
     price: str | None
     trigger_price: str | None
+    tpsl_mode: str | None
     take_profit: str | None
     stop_loss: str | None
     tp_trigger_by: str | None

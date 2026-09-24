@@ -1696,6 +1696,11 @@ impl ExecutionClient for BybitExecutionClient {
                         venue_order_id,
                         quantity,
                         price,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                     .await;
 
@@ -1756,6 +1761,7 @@ impl ExecutionClient for BybitExecutionClient {
             qty: cmd.quantity.map(|q| q.to_string()),
             price: cmd.price.map(|p| p.to_string()),
             trigger_price: None,
+            tpsl_mode: None,
             take_profit: None,
             stop_loss: None,
             tp_trigger_by: None,

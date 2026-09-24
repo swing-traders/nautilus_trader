@@ -94,7 +94,7 @@ use crate::common::{
     enums::{
         BybitAccountType, BybitBboSideType, BybitContractType, BybitEnvironment, BybitMarginMode,
         BybitOpenOnly, BybitOrderFilter, BybitOrderSide, BybitOrderType, BybitPositionIdx,
-        BybitPositionMode, BybitProductType, BybitRepayStatus, BybitTpSlMode,
+        BybitPositionMode, BybitProductType, BybitRepayStatus, BybitTpSlMode, BybitTriggerType,
     },
     models::{BybitCursorListResponse, BybitErrorCheck, BybitResponseCheck},
     parse::{
@@ -2941,6 +2941,9 @@ impl BybitHttpClient {
 
     /// Modify an existing order.
     ///
+    /// The take-profit and stop-loss fields reach the venue as given: `None` leaves the order's
+    /// attached level unchanged, and `"0"` cancels it.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -2959,6 +2962,11 @@ impl BybitHttpClient {
         venue_order_id: Option<VenueOrderId>,
         quantity: Option<Quantity>,
         price: Option<Price>,
+        tpsl_mode: Option<BybitTpSlMode>,
+        take_profit: Option<String>,
+        stop_loss: Option<String>,
+        tp_trigger_by: Option<BybitTriggerType>,
+        sl_trigger_by: Option<BybitTriggerType>,
     ) -> anyhow::Result<OrderStatusReport> {
         let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
@@ -2981,6 +2989,12 @@ impl BybitHttpClient {
         if let Some(price) = price {
             amend_entry.price(Some(price.to_string()));
         }
+
+        amend_entry.tpsl_mode(tpsl_mode);
+        amend_entry.take_profit(take_profit);
+        amend_entry.stop_loss(stop_loss);
+        amend_entry.tp_trigger_by(tp_trigger_by);
+        amend_entry.sl_trigger_by(sl_trigger_by);
 
         let amend_entry = amend_entry.build().build_anyhow()?;
 

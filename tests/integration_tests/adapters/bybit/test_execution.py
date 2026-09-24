@@ -14,6 +14,7 @@
 # -------------------------------------------------------------------------------------------------
 
 import asyncio
+import inspect
 import re
 from decimal import Decimal
 from unittest.mock import ANY
@@ -2977,6 +2978,149 @@ async def test_modify_order_quantity(exec_client_builder, monkeypatch, instrumen
 
         # Assert - Bybit uses WebSocket for order modification
         ws_trade_client.modify_order.assert_awaited_once()
+    finally:
+        await client._disconnect()
+
+
+def _add_resting_limit_order(cache, instrument) -> LimitOrder:
+    order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-123456"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100"),
+        price=Price.from_str("50000.00"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    cache.add_order(order, None)
+    return order
+
+
+def _modify_price_command(order: LimitOrder, params: dict | None) -> ModifyOrder:
+    return ModifyOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("BYBIT-12345"),
+        quantity=order.quantity,
+        price=Price.from_str("51000.00"),
+        trigger_price=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        client_id=None,
+        params=params,
+    )
+
+
+_AMEND_TP_SL_KEYS = ("tpsl_mode", "take_profit", "stop_loss", "tp_trigger_by", "sl_trigger_by")
+
+
+@pytest.mark.asyncio
+async def test_modify_order_forwards_attached_stop_loss_to_ws_amend(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    client, ws_client, http_client, instrument_provider = exec_client_builder(monkeypatch)
+    client._ws_trade_client.modify_order = AsyncMock()
+    client._ws_trade_client.batch_modify_orders = AsyncMock()
+    await client._connect()
+
+    order = _add_resting_limit_order(cache, instrument)
+    command = _modify_price_command(order, params={"stop_loss": "110000", "tpsl_mode": "Full"})
+
+    try:
+        await client._modify_order(command)
+
+        client._ws_trade_client.batch_modify_orders.assert_not_awaited()
+        client._ws_trade_client.modify_order.assert_awaited_once()
+        assert client._ws_trade_client.modify_order.call_args.kwargs["stop_loss"] == "110000"
+        assert client._ws_trade_client.modify_order.call_args.kwargs["tpsl_mode"] == "Full"
+        assert client._ws_trade_client.modify_order.call_args.kwargs.get("take_profit") is None
+        assert client._ws_trade_client.modify_order.call_args.kwargs.get("tp_trigger_by") is None
+        assert client._ws_trade_client.modify_order.call_args.kwargs.get("sl_trigger_by") is None
+        inspect.signature(nautilus_pyo3.BybitWebSocketClient.modify_order).bind(
+            client._ws_trade_client,
+            **client._ws_trade_client.modify_order.call_args.kwargs,
+        )
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_modify_order_demo_forwards_attached_stop_loss_to_http_amend(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+):
+    client, ws_client, http_client, instrument_provider = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
+    )
+    client._ws_trade_client.modify_order = AsyncMock()
+    await client._connect()
+
+    order = _add_resting_limit_order(cache, instrument)
+    command = _modify_price_command(order, params={"stop_loss": "110000", "tpsl_mode": "Full"})
+
+    try:
+        await client._modify_order(command)
+
+        client._ws_trade_client.modify_order.assert_not_awaited()
+        http_client.modify_order.assert_awaited_once()
+        assert http_client.modify_order.call_args.kwargs["stop_loss"] == "110000"
+        assert http_client.modify_order.call_args.kwargs["tpsl_mode"] == "Full"
+        assert http_client.modify_order.call_args.kwargs.get("take_profit") is None
+        assert http_client.modify_order.call_args.kwargs.get("tp_trigger_by") is None
+        assert http_client.modify_order.call_args.kwargs.get("sl_trigger_by") is None
+        inspect.signature(nautilus_pyo3.BybitHttpClient.modify_order).bind(
+            http_client,
+            **http_client.modify_order.call_args.kwargs,
+        )
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "environment",
+    [nautilus_pyo3.BybitEnvironment.MAINNET, nautilus_pyo3.BybitEnvironment.DEMO],
+)
+async def test_modify_order_without_tp_sl_params_sends_none(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+    environment,
+):
+    client, ws_client, http_client, instrument_provider = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"environment": environment},
+    )
+    client._ws_trade_client.modify_order = AsyncMock()
+    await client._connect()
+
+    order = _add_resting_limit_order(cache, instrument)
+    command = _modify_price_command(order, params=None)
+
+    try:
+        await client._modify_order(command)
+
+        if environment == nautilus_pyo3.BybitEnvironment.DEMO:
+            client._ws_trade_client.modify_order.assert_not_awaited()
+            http_client.modify_order.assert_awaited_once()
+            for key in _AMEND_TP_SL_KEYS:
+                assert http_client.modify_order.call_args.kwargs.get(key) is None
+        else:
+            http_client.modify_order.assert_not_awaited()
+            client._ws_trade_client.modify_order.assert_awaited_once()
+            for key in _AMEND_TP_SL_KEYS:
+                assert client._ws_trade_client.modify_order.call_args.kwargs.get(key) is None
     finally:
         await client._disconnect()
 

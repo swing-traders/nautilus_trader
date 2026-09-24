@@ -4961,3 +4961,158 @@ async fn test_fetch_all_sub_api_keys_walks_cursor() {
         "second page must carry cursor: {log:?}"
     );
 }
+
+#[derive(Clone, Default)]
+struct AmendCapture {
+    bodies: Arc<tokio::sync::Mutex<Vec<String>>>,
+}
+
+async fn handle_amend_order_with_capture(
+    State(capture): State<AmendCapture>,
+    body: axum::body::Bytes,
+) -> Response {
+    capture
+        .bodies
+        .lock()
+        .await
+        .push(String::from_utf8(body.to_vec()).unwrap());
+
+    Json(json!({
+        "retCode": 0,
+        "retMsg": "OK",
+        "result": {
+            "orderId": "abcdef123456",
+            "orderLinkId": "client-1"
+        },
+        "retExtInfo": {},
+        "time": 1704470400123i64
+    }))
+    .into_response()
+}
+
+async fn handle_amended_order_lookup() -> Response {
+    Json(load_test_data("http_get_orders_history.json")).into_response()
+}
+
+async fn start_amend_capture_test_server()
+-> Result<(SocketAddr, AmendCapture), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let capture = AmendCapture::default();
+    let router = Router::new()
+        .route("/v5/market/time", get(handle_get_server_time))
+        .route("/v5/market/instruments-info", get(handle_get_instruments))
+        .route("/v5/order/amend", post(handle_amend_order_with_capture))
+        .route("/v5/order/realtime", get(handle_amended_order_lookup))
+        .route("/v5/account/fee-rate", get(handle_get_fee_rate))
+        .with_state(capture.clone());
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    wait_for_server(addr, "/v5/market/time").await;
+
+    Ok((addr, capture))
+}
+
+async fn amend_test_client(addr: SocketAddr) -> BybitHttpClient {
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        5_000,
+        None,
+    )
+    .unwrap();
+
+    let instruments = client
+        .request_instruments(BybitProductType::Linear, None, None)
+        .await
+        .unwrap();
+
+    for instrument in instruments {
+        client.cache_instrument(instrument);
+    }
+
+    client
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_modify_order_without_tp_sl_sends_only_the_amend_fields() {
+    let (addr, capture) = start_amend_capture_test_server().await.unwrap();
+    let client = amend_test_client(addr).await;
+
+    client
+        .modify_order(
+            AccountId::from("BYBIT-UNIFIED"),
+            BybitProductType::Linear,
+            InstrumentId::from("BTCUSDT-LINEAR.BYBIT"),
+            Some(ClientOrderId::from("amend-1")),
+            None,
+            Some(Quantity::from("0.002")),
+            Some(Price::from("51000.5")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *capture.bodies.lock().await,
+        vec![
+            r#"{"symbol":"BTCUSDT","orderLinkId":"amend-1","qty":"0.002","price":"51000.5","category":"linear"}"#
+                .to_string()
+        ],
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_modify_order_forwards_the_attached_tp_sl() {
+    let (addr, capture) = start_amend_capture_test_server().await.unwrap();
+    let client = amend_test_client(addr).await;
+
+    client
+        .modify_order(
+            AccountId::from("BYBIT-UNIFIED"),
+            BybitProductType::Linear,
+            InstrumentId::from("BTCUSDT-LINEAR.BYBIT"),
+            Some(ClientOrderId::from("amend-1")),
+            None,
+            None,
+            Some(Price::from("51000.5")),
+            Some(BybitTpSlMode::Full),
+            Some("0".to_string()),
+            Some("110000".to_string()),
+            Some(BybitTriggerType::MarkPrice),
+            Some(BybitTriggerType::LastPrice),
+        )
+        .await
+        .unwrap();
+
+    let bodies = capture.bodies.lock().await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&bodies[0]).unwrap(),
+        json!({
+            "category": "linear",
+            "symbol": "BTCUSDT",
+            "orderLinkId": "amend-1",
+            "price": "51000.5",
+            "tpslMode": "Full",
+            "takeProfit": "0",
+            "stopLoss": "110000",
+            "tpTriggerBy": "MarkPrice",
+            "slTriggerBy": "LastPrice",
+        }),
+    );
+}

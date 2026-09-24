@@ -1431,6 +1431,8 @@ class BybitExecutionClient(LiveExecutionClient):
             )
             return
 
+        params = command.params or {}
+
         try:
             if self._is_demo:
                 await self._http_client.modify_order(
@@ -1441,6 +1443,11 @@ class BybitExecutionClient(LiveExecutionClient):
                     venue_order_id=pyo3_venue_order_id,
                     quantity=pyo3_quantity,
                     price=pyo3_price,
+                    tpsl_mode=params.get("tpsl_mode"),
+                    take_profit=params.get("take_profit"),
+                    stop_loss=params.get("stop_loss"),
+                    tp_trigger_by=params.get("tp_trigger_by"),
+                    sl_trigger_by=params.get("sl_trigger_by"),
                 )
             elif order_iv is not None:
                 amend_params = self._ws_trade_client.build_amend_order_params(
@@ -1467,6 +1474,11 @@ class BybitExecutionClient(LiveExecutionClient):
                     venue_order_id=pyo3_venue_order_id,
                     quantity=pyo3_quantity,
                     price=pyo3_price,
+                    tpsl_mode=params.get("tpsl_mode"),
+                    take_profit=params.get("take_profit"),
+                    stop_loss=params.get("stop_loss"),
+                    tp_trigger_by=params.get("tp_trigger_by"),
+                    sl_trigger_by=params.get("sl_trigger_by"),
                 )
         except Exception as e:
             self._log.error(f"Failed to modify order {command.client_order_id}: {e}")
