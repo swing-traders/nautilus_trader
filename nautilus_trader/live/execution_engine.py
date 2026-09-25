@@ -90,9 +90,13 @@ from nautilus_trader.model.enums import order_side_to_str
 from nautilus_trader.model.enums import position_side_to_str
 from nautilus_trader.model.enums import trailing_offset_type_to_str
 from nautilus_trader.model.enums import trigger_type_to_str
+from nautilus_trader.model.events import OrderAccepted
+from nautilus_trader.model.events import OrderCanceled
 from nautilus_trader.model.events import OrderEvent
+from nautilus_trader.model.events import OrderExpired
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderInitialized
+from nautilus_trader.model.events import OrderTriggered
 from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
@@ -122,6 +126,29 @@ POSITION_SCOPE_CONVERGED: Final[str] = "CONVERGED"
 POSITION_SCOPE_DEFERRED: Final[str] = "DEFERRED"
 POSITION_SCOPE_UNCONVERGED: Final[str] = "UNCONVERGED"
 POSITION_SCOPE_HEALED_REASON: Final[str] = "applied missing venue fills, re-querying next pass"
+
+# The Rust model's `OrderStatus::is_closed`, VOIDED included although v1's `Order.is_closed` omits
+# it: a real terminal report inside the clock-skew window is never dropped as stale, whichever venue
+# stamps it
+_CLOSED_ORDER_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
+    {
+        OrderStatus.DENIED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELED,
+        OrderStatus.EXPIRED,
+        OrderStatus.FILLED,
+        OrderStatus.VOIDED,
+    },
+)
+
+_VENUE_STAMPED_ORDER_EVENTS: Final[tuple[type[OrderEvent], ...]] = (
+    OrderAccepted,
+    OrderUpdated,
+    OrderFilled,
+    OrderTriggered,
+    OrderCanceled,
+    OrderExpired,
+)
 
 
 class PositionScopeSnapshot(NamedTuple):
@@ -2560,16 +2587,16 @@ class LiveExecutionEngine(ExecutionEngine):
         ts_now = self._clock.timestamp_ns()
 
         for report in all_order_reports:
-            is_in_open_ids = report.client_order_id in open_order_ids
+            client_order_id = report.client_order_id
+
+            if client_order_id is None and report.venue_order_id is not None:
+                client_order_id = self._cache.client_order_id(report.venue_order_id)
+
+            is_in_open_ids = client_order_id in open_order_ids
 
             # Clear any retry counts for successfully queried orders
-            if report.client_order_id:
-                self._clear_recon_tracking(report.client_order_id)
-            elif report.venue_order_id:
-                # Try to map venue-only ID to client order ID and clear that retry counter
-                mapped_client_id = self._cache.client_order_id(report.venue_order_id)
-                if mapped_client_id:
-                    self._clear_recon_tracking(mapped_client_id)
+            if client_order_id:
+                self._clear_recon_tracking(client_order_id)
 
             # Check if we should reconcile this order
             should_reconcile = False
@@ -2578,8 +2605,8 @@ class LiveExecutionEngine(ExecutionEngine):
             if report.is_open != is_in_open_ids:
                 should_reconcile = True
                 reconcile_reason = f"venue_open={report.is_open}, cache_open={is_in_open_ids}"
-            elif report.client_order_id:
-                order = self._cache.order(report.client_order_id)
+            elif client_order_id:
+                order = self._cache.order(client_order_id)
                 if order:
                     # Check filled_qty mismatch, treating None as zero
                     report_filled = (
@@ -2598,16 +2625,16 @@ class LiveExecutionEngine(ExecutionEngine):
                 # Apply include filter before reconciling
                 if not self._consider_for_reconciliation(report.instrument_id):
                     self._log.debug(
-                        f"Skipping reconciliation for {report.client_order_id!r}: "
+                        f"Skipping reconciliation for {client_order_id!r}: "
                         f"instrument {report.instrument_id} not in include list",
                     )
                     continue
 
                 # Check for recent local activity to avoid race conditions with in-flight fills
-                local_activity = self._order_local_activity_ns.get(report.client_order_id)
+                local_activity = self._order_local_activity_ns.get(client_order_id)
                 if local_activity and (ts_now - local_activity) < self._open_check_threshold_ns:
                     self._log.debug(
-                        f"Deferring reconciliation for {report.client_order_id!r}: "
+                        f"Deferring reconciliation for {client_order_id!r}: "
                         f"recent local activity ({(ts_now - local_activity) / 1_000_000:.0f}ms < "
                         f"threshold={self.open_check_threshold_ms}ms), "
                         f"reason was: {reconcile_reason}",
@@ -2615,7 +2642,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     continue
 
                 self._log.debug(
-                    f"Reconciling {report.client_order_id!r}: {reconcile_reason}",
+                    f"Reconciling {client_order_id!r}: {reconcile_reason}",
                     LogColor.BLUE,
                 )
                 self._reconcile_order_report(report, trades=[])
@@ -4079,6 +4106,14 @@ class LiveExecutionEngine(ExecutionEngine):
         trades: list[FillReport],
         instrument: Instrument,
     ) -> bool | None:
+        if self._is_order_report_stale(order, report):
+            for trade in trades:
+                self._reconcile_fill_report(order, trade, instrument)
+
+            # A stale report's filled_qty lagging the cache is what staleness looks like, so the
+            # fill quantity check must neither infer a fill from it nor log an error
+            return True  # Reconciled
+
         if report.order_status == OrderStatus.REJECTED:
             if order.status != OrderStatus.REJECTED:
                 self._generate_order_rejected(order, report)
@@ -4137,6 +4172,33 @@ class LiveExecutionEngine(ExecutionEngine):
             return True  # Reconciled
 
         return None  # Continue with fill reconciliation
+
+    def _is_order_report_stale(self, order: Order, report: OrderStatusReport) -> bool:
+        if report.order_status in _CLOSED_ORDER_STATUSES:
+            return False
+
+        # A report is stamped on the venue's clock, so only the venue-stamped events are comparable
+        # with it: a locally stamped event moves `order.ts_last` on another clock
+        ts_last_venue = max(
+            (
+                event.ts_event
+                for event in order.events
+                if isinstance(event, _VENUE_STAMPED_ORDER_EVENTS)
+            ),
+            default=None,
+        )
+
+        if ts_last_venue is None or report.ts_last >= ts_last_venue:
+            return False
+
+        self._log.info(
+            f"Discarding stale order status report for {order.client_order_id!r}: "
+            f"report timestamp={report.ts_last} predates "
+            f"cached order venue timestamp={ts_last_venue}",
+            LogColor.BLUE,
+        )
+
+        return True
 
     def _should_update(self, order: Order, report: OrderStatusReport) -> bool:
         if report.quantity != order.quantity and report.quantity >= order.filled_qty:

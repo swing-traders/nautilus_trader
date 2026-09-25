@@ -5030,6 +5030,440 @@ def test_reconcile_position_report_reconciles_report_newer_than_last_fill(
     assert cache.position(venue_position_id).signed_decimal_qty() == Decimal(1000)
 
 
+# Tests for the order status report staleness guard
+
+_TS_ORDER_ACCEPT = 1_600_000_000_000_000_000
+_TS_ORDER_AMEND = _TS_ORDER_ACCEPT + 60_000_000_000
+_STOP_VENUE_ORDER_ID = VenueOrderId("V-STOP-001")
+
+
+def _seed_amended_stop(cache):
+    order_factory = OrderFactory(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=StrategyId("S-001"),
+        clock=LiveClock(),
+    )
+    order = order_factory.stop_market(
+        instrument_id=AUDUSD_SIM.id,
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_int(8000),
+        trigger_price=Price.from_str("0.98890"),
+        reduce_only=True,
+    )
+    order.apply(TestEventStubs.order_submitted(order))
+    order.apply(
+        TestEventStubs.order_accepted(
+            order,
+            venue_order_id=_STOP_VENUE_ORDER_ID,
+            ts_event=_TS_ORDER_ACCEPT,
+        ),
+    )
+    order.apply(
+        TestEventStubs.order_updated(
+            order,
+            quantity=Quantity.from_int(16000),
+            trigger_price=Price.from_str("0.94280"),
+            ts_event=_TS_ORDER_AMEND,
+        ),
+    )
+    cache.add_order(order)
+    cache.add_venue_order_id(order.client_order_id, _STOP_VENUE_ORDER_ID)
+
+    return order
+
+
+def _stop_report(
+    account_id,
+    order_status,
+    quantity,
+    trigger_price,
+    ts_last,
+    filled_qty=0,
+    avg_px=None,
+):
+    # A venue-created stop carries no client order ID, so the venue order ID alone names it
+    return OrderStatusReport(
+        account_id=account_id,
+        instrument_id=AUDUSD_SIM.id,
+        client_order_id=None,
+        venue_order_id=_STOP_VENUE_ORDER_ID,
+        order_side=OrderSide.SELL,
+        order_type=OrderType.STOP_MARKET,
+        time_in_force=TimeInForce.GTC,
+        order_status=order_status,
+        quantity=Quantity.from_int(quantity),
+        filled_qty=Quantity.from_int(filled_qty),
+        avg_px=avg_px,
+        trigger_price=Price.from_str(trigger_price),
+        trigger_type=TriggerType.DEFAULT,
+        report_id=UUID4(),
+        ts_accepted=_TS_ORDER_ACCEPT,
+        ts_last=ts_last,
+        ts_init=0,
+    )
+
+
+def test_reconcile_order_reports_leaves_amended_stop_on_stale_venue_only_report(
+    live_exec_engine,
+    cache,
+    account_id,
+):
+    # Arrange
+    order = _seed_amended_stop(cache)
+    event_count = order.event_count
+
+    # Captured before the venue amend
+    stale_report = _stop_report(
+        account_id,
+        OrderStatus.ACCEPTED,
+        8000,
+        "0.98890",
+        ts_last=_TS_ORDER_ACCEPT,
+    )
+
+    # Act
+    live_exec_engine._reconcile_order_reports([stale_report], {order.client_order_id})
+
+    # Assert
+    assert order.quantity == Quantity.from_int(16000)
+    assert order.trigger_price == Price.from_str("0.94280")
+    assert order.ts_last == _TS_ORDER_AMEND
+    assert order.event_count == event_count
+
+
+def test_reconcile_order_reports_defers_venue_only_report_on_recent_local_activity(
+    live_exec_engine,
+    cache,
+    account_id,
+):
+    # Arrange
+    order = _seed_amended_stop(cache)
+
+    # The strategy's cancel request, received just now
+    live_exec_engine._handle_event_with_tracking(
+        TestEventStubs.order_pending_cancel(order, ts_event=_TS_ORDER_AMEND + 10_000_000_000),
+    )
+
+    # A fill the cache has not received yet, reported while the cancel is in flight
+    report = _stop_report(
+        account_id,
+        OrderStatus.PARTIALLY_FILLED,
+        16000,
+        "0.94280",
+        ts_last=_TS_ORDER_AMEND + 1_000_000_000,
+        filled_qty=4000,
+        avg_px=Decimal("0.94280"),
+    )
+
+    # Act
+    live_exec_engine._reconcile_order_reports([report], {order.client_order_id})
+
+    # Assert
+    assert order.filled_qty == Quantity.from_int(0)
+    assert order.status == OrderStatus.PENDING_CANCEL
+
+
+def test_reconcile_execution_report_leaves_amended_stop_on_stale_report(
+    live_exec_engine,
+    cache,
+    account_id,
+):
+    # Arrange
+    order = _seed_amended_stop(cache)
+    event_count = order.event_count
+
+    # Captured before the venue amend
+    stale_report = _stop_report(
+        account_id,
+        OrderStatus.ACCEPTED,
+        8000,
+        "0.98890",
+        ts_last=_TS_ORDER_ACCEPT,
+    )
+
+    # Act
+    result = live_exec_engine.reconcile_execution_report(stale_report)
+
+    # Assert
+    assert result
+    assert order.quantity == Quantity.from_int(16000)
+    assert order.trigger_price == Price.from_str("0.94280")
+    assert order.ts_last == _TS_ORDER_AMEND
+    assert order.event_count == event_count
+
+
+def test_reconcile_execution_report_applies_stale_terminal_report(
+    live_exec_engine,
+    cache,
+    account_id,
+):
+    # Arrange
+    order = _seed_amended_stop(cache)
+
+    report = _stop_report(
+        account_id,
+        OrderStatus.CANCELED,
+        16000,
+        "0.94280",
+        ts_last=_TS_ORDER_AMEND - 1,
+    )
+
+    # Act
+    result = live_exec_engine.reconcile_execution_report(report)
+
+    # Assert
+    assert result
+    assert order.status == OrderStatus.CANCELED
+
+
+def test_reconcile_order_reports_applies_stale_terminal_venue_only_report(
+    live_exec_engine,
+    cache,
+    account_id,
+):
+    # Arrange
+    order = _seed_amended_stop(cache)
+
+    report = _stop_report(
+        account_id,
+        OrderStatus.CANCELED,
+        16000,
+        "0.94280",
+        ts_last=_TS_ORDER_AMEND - 1,
+    )
+
+    # Act
+    live_exec_engine._reconcile_order_reports([report], {order.client_order_id})
+
+    # Assert
+    assert order.status == OrderStatus.CANCELED
+
+
+@pytest.mark.parametrize(
+    "ts_last",
+    [_TS_ORDER_AMEND, _TS_ORDER_AMEND + 1],
+    ids=["equal_to_amend", "after_amend"],
+)
+def test_reconcile_execution_report_applies_fresh_report(
+    live_exec_engine,
+    cache,
+    account_id,
+    ts_last,
+):
+    # Arrange
+    order = _seed_amended_stop(cache)
+
+    report = _stop_report(
+        account_id,
+        OrderStatus.ACCEPTED,
+        24000,
+        "0.93000",
+        ts_last=ts_last,
+    )
+
+    # Act
+    result = live_exec_engine.reconcile_execution_report(report)
+
+    # Assert
+    assert result
+    assert order.quantity == Quantity.from_int(24000)
+    assert order.trigger_price == Price.from_str("0.93000")
+    assert order.ts_last == ts_last
+
+
+def test_reconcile_execution_report_applies_fresh_report_despite_later_local_stamp(
+    live_exec_engine,
+    cache,
+    account_id,
+):
+    # Arrange
+    order = _seed_amended_stop(cache)
+
+    # The strategy's cancel request, stamped on the local clock after the venue amend
+    order.apply(
+        TestEventStubs.order_pending_cancel(order, ts_event=_TS_ORDER_AMEND + 10_000_000_000),
+    )
+    cache.update_order(order)
+
+    # A second venue amend, stamped before the local event
+    report = _stop_report(
+        account_id,
+        OrderStatus.ACCEPTED,
+        24000,
+        "0.93000",
+        ts_last=_TS_ORDER_AMEND + 1_000_000_000,
+    )
+
+    # Act
+    result = live_exec_engine.reconcile_execution_report(report)
+
+    # Assert
+    assert result
+    assert order.quantity == Quantity.from_int(24000)
+    assert order.trigger_price == Price.from_str("0.93000")
+
+
+def test_reconcile_execution_report_discards_stale_report_despite_earlier_local_stamp(
+    live_exec_engine,
+    cache,
+    account_id,
+):
+    # Arrange
+    order = _seed_amended_stop(cache)
+
+    # The strategy's cancel request, stamped on a local clock running behind the venue's
+    order.apply(
+        TestEventStubs.order_pending_cancel(order, ts_event=_TS_ORDER_AMEND - 5_000_000_000),
+    )
+    cache.update_order(order)
+    event_count = order.event_count
+
+    # Captured after the local stamp but before the venue amend
+    stale_report = _stop_report(
+        account_id,
+        OrderStatus.ACCEPTED,
+        8000,
+        "0.98890",
+        ts_last=_TS_ORDER_AMEND - 1_000_000_000,
+    )
+
+    # Act
+    result = live_exec_engine.reconcile_execution_report(stale_report)
+
+    # Assert
+    assert result
+    assert order.quantity == Quantity.from_int(16000)
+    assert order.trigger_price == Price.from_str("0.94280")
+    assert order.status == OrderStatus.PENDING_CANCEL
+    assert order.event_count == event_count
+
+
+def test_reconcile_execution_report_applies_report_to_order_without_venue_events(
+    live_exec_engine,
+    cache,
+    account_id,
+):
+    # Arrange
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM, order_side=OrderSide.BUY)
+    order.apply(TestEventStubs.order_submitted(order, ts_event=_TS_ORDER_AMEND))
+    cache.add_order(order)
+
+    # Accepted on a venue clock behind the local submit stamp
+    report = OrderStatusReport(
+        account_id=account_id,
+        instrument_id=AUDUSD_SIM.id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("V-NEW-001"),
+        order_side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.GTC,
+        order_status=OrderStatus.ACCEPTED,
+        quantity=order.quantity,
+        filled_qty=Quantity.from_int(0),
+        price=order.price,
+        report_id=UUID4(),
+        ts_accepted=_TS_ORDER_ACCEPT,
+        ts_last=_TS_ORDER_ACCEPT,
+        ts_init=0,
+    )
+
+    # Act
+    result = live_exec_engine.reconcile_execution_report(report)
+
+    # Assert
+    assert result
+    assert order.status == OrderStatus.ACCEPTED
+
+
+def test_reconcile_order_report_applies_trades_of_stale_report(
+    live_exec_engine,
+    cache,
+    account_id,
+):
+    # Arrange
+    order = _seed_amended_stop(cache)
+
+    # Captured before the venue amend, carrying a fill the cache has not received yet
+    stale_report = _stop_report(
+        account_id,
+        OrderStatus.PARTIALLY_FILLED,
+        8000,
+        "0.98890",
+        ts_last=_TS_ORDER_AMEND - 1_000_000_000,
+        filled_qty=2000,
+        avg_px=Decimal("0.98890"),
+    )
+    trade = FillReport(
+        account_id=account_id,
+        instrument_id=AUDUSD_SIM.id,
+        client_order_id=None,
+        venue_order_id=_STOP_VENUE_ORDER_ID,
+        trade_id=TradeId("T-STALE-STOP-1"),
+        order_side=OrderSide.SELL,
+        last_qty=Quantity.from_int(2000),
+        last_px=Price.from_str("0.98890"),
+        commission=Money(0, USD),
+        liquidity_side=LiquiditySide.TAKER,
+        report_id=UUID4(),
+        ts_event=_TS_ORDER_AMEND - 1_000_000_000,
+        ts_init=0,
+    )
+
+    # Act
+    result = live_exec_engine._reconcile_order_report(stale_report, [trade])
+
+    # Assert
+    assert result
+    assert order.filled_qty == Quantity.from_int(2000)
+    assert order.quantity == Quantity.from_int(16000)
+    assert order.trigger_price == Price.from_str("0.94280")
+
+
+def test_reconcile_order_report_accepts_stale_report_filled_qty_behind_cache(
+    live_exec_engine,
+    cache,
+    account_id,
+):
+    # Arrange
+    order = _seed_amended_stop(cache)
+
+    for trade_id, ts_event in (
+        ("T-STOP-1", _TS_ORDER_AMEND + 1_000_000_000),
+        ("T-STOP-2", _TS_ORDER_AMEND + 2_000_000_000),
+    ):
+        order.apply(
+            TestEventStubs.order_filled(
+                order,
+                instrument=AUDUSD_SIM,
+                account_id=account_id,
+                trade_id=TradeId(trade_id),
+                last_qty=Quantity.from_int(1000),
+                last_px=Price.from_str("0.94280"),
+                ts_event=ts_event,
+            ),
+        )
+
+    cache.update_order(order)
+
+    # Captured between the two fills
+    stale_report = _stop_report(
+        account_id,
+        OrderStatus.PARTIALLY_FILLED,
+        16000,
+        "0.94280",
+        ts_last=_TS_ORDER_AMEND + 1_000_000_000,
+        filled_qty=1000,
+        avg_px=Decimal("0.94280"),
+    )
+
+    # Act
+    result = live_exec_engine._reconcile_order_report(stale_report, [])
+
+    # Assert
+    assert result
+    assert order.filled_qty == Quantity.from_int(2000)
+
+
 # Tests for venue-observed scopes in the position convergence pass
 
 
