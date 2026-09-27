@@ -72,10 +72,10 @@ use crate::{
         error::{BybitWsError, BybitWsResult},
         handler::{BybitWsFeedHandler, HandlerCommand},
         messages::{
-            BybitAuthRequest, BybitSubscription, BybitWsAmendOrderParams, BybitWsBatchCancelItem,
-            BybitWsBatchCancelOrderArgs, BybitWsBatchPlaceItem, BybitWsBatchPlaceOrderArgs,
-            BybitWsCancelOrderParams, BybitWsHeader, BybitWsMessage, BybitWsPlaceOrderParams,
-            BybitWsRequest,
+            BybitAuthRequest, BybitSubscription, BybitWsAmendOrderParams, BybitWsBatchAmendItem,
+            BybitWsBatchAmendOrderArgs, BybitWsBatchCancelItem, BybitWsBatchCancelOrderArgs,
+            BybitWsBatchPlaceItem, BybitWsBatchPlaceOrderArgs, BybitWsCancelOrderParams,
+            BybitWsHeader, BybitWsMessage, BybitWsPlaceOrderParams, BybitWsRequest,
         },
     },
 };
@@ -1506,13 +1506,37 @@ impl BybitWebSocketClient {
         &self,
         orders: Vec<BybitWsAmendOrderParams>,
     ) -> BybitWsResult<String> {
+        let category = orders[0].category;
         let batch_req_id = UUID4::new().to_string();
+
+        let request_items: Vec<BybitWsBatchAmendItem> = orders
+            .into_iter()
+            .map(|order| BybitWsBatchAmendItem {
+                symbol: order.symbol,
+                order_id: order.order_id,
+                order_link_id: order.order_link_id,
+                qty: order.qty,
+                price: order.price,
+                trigger_price: order.trigger_price,
+                tpsl_mode: order.tpsl_mode,
+                take_profit: order.take_profit,
+                stop_loss: order.stop_loss,
+                tp_trigger_by: order.tp_trigger_by,
+                sl_trigger_by: order.sl_trigger_by,
+                order_iv: order.order_iv,
+            })
+            .collect();
+
+        let args = BybitWsBatchAmendOrderArgs {
+            category,
+            request: request_items,
+        };
 
         let request = BybitWsRequest {
             req_id: Some(batch_req_id.clone()),
             op: BybitWsOrderRequestOp::AmendBatch,
             header: BybitWsHeader::now(),
-            args: orders,
+            args: vec![args],
         };
 
         let payload = serde_json::to_string(&request).map_err(BybitWsError::from)?;

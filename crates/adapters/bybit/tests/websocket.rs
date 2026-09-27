@@ -36,7 +36,7 @@ use axum::{
 use nautilus_bybit::{
     common::enums::{
         BybitBboSideType, BybitEnvironment, BybitOrderSide, BybitOrderType, BybitProductType,
-        BybitTimeInForce, BybitTpSlMode, BybitTriggerType,
+        BybitTimeInForce, BybitTpSlMode, BybitTriggerType, BybitWsOrderRequestOp,
     },
     websocket::{
         client::BybitWebSocketClient,
@@ -68,6 +68,7 @@ struct TestServerState {
     ping_count: Arc<AtomicUsize>,
     pong_count: Arc<AtomicUsize>,
     captured_messages: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    captured_texts: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 impl Default for TestServerState {
@@ -83,6 +84,7 @@ impl Default for TestServerState {
             ping_count: Arc::new(AtomicUsize::new(0)),
             pong_count: Arc::new(AtomicUsize::new(0)),
             captured_messages: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            captured_texts: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -394,6 +396,7 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                     }
                     Some("order.amend") => {
                         state.captured_messages.lock().await.push(value.clone());
+                        state.captured_texts.lock().await.push(text.to_string());
                         let req_id = value.get("req_id").and_then(|v| v.as_str());
                         let response = json!({
                             "success": true,
@@ -431,6 +434,7 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                     }
                     Some("order.create-batch") => {
                         state.captured_messages.lock().await.push(value.clone());
+                        state.captured_texts.lock().await.push(text.to_string());
                         let req_id = value.get("req_id").and_then(|v| v.as_str());
                         let response = json!({
                             "success": true,
@@ -450,6 +454,7 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                     }
                     Some("order.amend-batch") => {
                         state.captured_messages.lock().await.push(value.clone());
+                        state.captured_texts.lock().await.push(text.to_string());
                         let req_id = value.get("req_id").and_then(|v| v.as_str());
                         let response = json!({
                             "success": true,
@@ -457,6 +462,26 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                             "conn_id": "test-conn-id",
                             "req_id": req_id.unwrap_or(""),
                             "op": "order.amend-batch"
+                        });
+
+                        if socket
+                            .send(Message::Text(response.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Some("order.cancel-batch") => {
+                        state.captured_messages.lock().await.push(value.clone());
+                        state.captured_texts.lock().await.push(text.to_string());
+                        let req_id = value.get("req_id").and_then(|v| v.as_str());
+                        let response = json!({
+                            "success": true,
+                            "ret_msg": "",
+                            "conn_id": "test-conn-id",
+                            "req_id": req_id.unwrap_or(""),
+                            "op": "order.cancel-batch"
                         });
 
                         if socket
@@ -2297,6 +2322,28 @@ async fn test_unsubscribed_private_channel_not_resubscribed_after_disconnect() {
     client.close().await.unwrap();
 }
 
+/// The exact text of a trade request, with the captured message's own id and timestamp.
+fn request_text(
+    message: &serde_json::Value,
+    op: BybitWsOrderRequestOp,
+    header_tail: &str,
+    args: &str,
+) -> String {
+    let op = match op {
+        BybitWsOrderRequestOp::Create => "order.create",
+        BybitWsOrderRequestOp::Amend => "order.amend",
+        BybitWsOrderRequestOp::Cancel => "order.cancel",
+        BybitWsOrderRequestOp::CreateBatch => "order.create-batch",
+        BybitWsOrderRequestOp::AmendBatch => "order.amend-batch",
+        BybitWsOrderRequestOp::CancelBatch => "order.cancel-batch",
+    };
+    let req_id = message["reqId"].as_str().unwrap();
+    let timestamp = message["header"]["X-BAPI-TIMESTAMP"].as_str().unwrap();
+    format!(
+        r#"{{"reqId":"{req_id}","op":"{op}","header":{{"X-BAPI-TIMESTAMP":"{timestamp}"{header_tail}}},"args":{args}}}"#
+    )
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_batch_place_orders_with_cache_keys() {
@@ -2361,6 +2408,25 @@ async fn test_batch_place_orders_with_cache_keys() {
     assert!(
         result.is_ok(),
         "Batch place orders should succeed with proper cache keys"
+    );
+
+    wait_until_async(
+        || async { !state.captured_texts.lock().await.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let messages = state.captured_messages.lock().await;
+    let texts = state.captured_texts.lock().await;
+    assert_eq!(texts.len(), 1);
+    assert_eq!(
+        texts[0],
+        request_text(
+            &messages[0],
+            BybitWsOrderRequestOp::CreateBatch,
+            r#","Referer":"Qy000878""#,
+            r#"[{"category":"linear","request":[{"symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"0.001","price":"50000.0","timeInForce":"GTC","orderLinkId":"test-order-1"}]}]"#,
+        )
     );
 
     client.close().await.unwrap();
@@ -2457,6 +2523,25 @@ async fn test_batch_cancel_orders() {
     let result = client.batch_cancel_orders(orders).await;
 
     assert!(result.is_ok(), "Batch cancel orders should succeed");
+
+    wait_until_async(
+        || async { !state.captured_texts.lock().await.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let messages = state.captured_messages.lock().await;
+    let texts = state.captured_texts.lock().await;
+    assert_eq!(texts.len(), 1);
+    assert_eq!(
+        texts[0],
+        request_text(
+            &messages[0],
+            BybitWsOrderRequestOp::CancelBatch,
+            "",
+            r#"[{"category":"linear","request":[{"symbol":"BTCUSDT","orderLinkId":"test-order-1"},{"symbol":"ETHUSDT","orderLinkId":"test-order-2"}]}]"#,
+        )
+    );
 
     client.close().await.unwrap();
 }
@@ -2989,10 +3074,118 @@ async fn test_batch_amend_order_with_order_iv() {
 
     let msg = &messages[0];
     let args = msg.get("args").unwrap().as_array().unwrap();
-    let order = &args[0];
+    assert_eq!(args.len(), 1);
+    assert_eq!(args[0]["category"], "option");
+    assert_eq!(
+        args[0]["request"][0],
+        json!({
+            "symbol": "BTC-30JUN25-100000-C",
+            "orderLinkId": "option-test-1",
+            "orderIv": "0.90",
+        })
+    );
 
-    assert_eq!(order["orderIv"], "0.90");
-    assert_eq!(order["orderLinkId"], "option-test-1");
+    client.close().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_batch_amend_orders_send_a_chunk_in_one_envelope() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/v5/private");
+
+    let mut client = BybitWebSocketClient::new_private(
+        BybitEnvironment::Mainnet,
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        Some(ws_url),
+        20,
+        TransportBackend::default(),
+        None,
+    );
+
+    client.connect().await.unwrap();
+
+    wait_until_async(
+        || async { state.authenticated.load(Ordering::Relaxed) },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let amendment = BybitWsAmendOrderParams {
+        category: BybitProductType::Linear,
+        symbol: Ustr::from("BTCUSDT"),
+        order_id: None,
+        order_link_id: None,
+        qty: None,
+        price: None,
+        trigger_price: None,
+        tpsl_mode: None,
+        take_profit: None,
+        stop_loss: None,
+        tp_trigger_by: None,
+        sl_trigger_by: None,
+        order_iv: None,
+    };
+    let orders = vec![
+        BybitWsAmendOrderParams {
+            order_link_id: Some("amend-1".to_string()),
+            qty: Some("0.002".to_string()),
+            price: Some("51000.5".to_string()),
+            ..amendment.clone()
+        },
+        BybitWsAmendOrderParams {
+            symbol: Ustr::from("ETHUSDT"),
+            order_id: Some("venue-amend-2".to_string()),
+            tpsl_mode: Some(BybitTpSlMode::Full),
+            stop_loss: Some("2900".to_string()),
+            sl_trigger_by: Some(BybitTriggerType::MarkPrice),
+            ..amendment.clone()
+        },
+        BybitWsAmendOrderParams {
+            order_link_id: Some("amend-3".to_string()),
+            trigger_price: Some("52000".to_string()),
+            ..amendment
+        },
+    ];
+
+    client.batch_amend_orders(orders).await.unwrap();
+
+    wait_until_async(
+        || async { !state.captured_messages.lock().await.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let messages = state.captured_messages.lock().await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["op"], "order.amend-batch");
+    assert_eq!(
+        messages[0]["args"],
+        json!([{
+            "category": "linear",
+            "request": [
+                {
+                    "symbol": "BTCUSDT",
+                    "orderLinkId": "amend-1",
+                    "qty": "0.002",
+                    "price": "51000.5",
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "orderId": "venue-amend-2",
+                    "tpslMode": "Full",
+                    "stopLoss": "2900",
+                    "slTriggerBy": "MarkPrice",
+                },
+                {
+                    "symbol": "BTCUSDT",
+                    "orderLinkId": "amend-3",
+                    "triggerPrice": "52000",
+                },
+            ],
+        }])
+    );
 
     client.close().await.unwrap();
 }
@@ -3126,6 +3319,15 @@ async fn test_modify_order_forwards_the_attached_tp_sl() {
             "tpTriggerBy": "MarkPrice",
             "slTriggerBy": "LastPrice",
         }])
+    );
+    assert_eq!(
+        state.captured_texts.lock().await[0],
+        request_text(
+            &messages[0],
+            BybitWsOrderRequestOp::Amend,
+            "",
+            r#"[{"category":"linear","symbol":"BTCUSDT","orderId":"venue-amend-1","orderLinkId":"amend-1","price":"51000.5","tpslMode":"Full","takeProfit":"0","stopLoss":"110000","tpTriggerBy":"MarkPrice","slTriggerBy":"LastPrice"}]"#,
+        )
     );
 
     client.close().await.unwrap();
