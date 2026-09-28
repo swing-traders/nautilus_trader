@@ -741,6 +741,7 @@ impl HyperliquidOrderStatus {
             Self::IocCancelRejected => {
                 Some("Order could not immediately match against any resting orders")
             }
+            Self::BadTriggerPxRejected => Some("Invalid TP/SL price."),
             _ => None,
         }
     }

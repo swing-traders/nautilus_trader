@@ -23,7 +23,7 @@ import pytest
 from nautilus_trader.adapters.hyperliquid.config import HyperliquidExecClientConfig
 from nautilus_trader.adapters.hyperliquid.constants import HYPERLIQUID_VENUE
 from nautilus_trader.adapters.hyperliquid.execution import HyperliquidExecutionClient
-from nautilus_trader.adapters.hyperliquid.execution import _is_transport_error
+from nautilus_trader.adapters.hyperliquid.execution import _awaits_reconciliation
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
@@ -3918,14 +3918,35 @@ async def test_pending_fills_cleared_on_terminal_cleanup(
         (ValueError("transport error: HTTP client error: refused"), True),
         (ValueError("IO error: broken pipe"), True),
         (ValueError("timeout"), True),
+        (ValueError("decode error: expected action post response, received info payload"), True),
+        (ValueError("serde error: expected value at line 1 column 1"), True),
+        (ValueError("Rate limited on exchange (weight=1) retry_after_ms=None"), True),
+        (ValueError("HTTP error 502: Bad Gateway"), True),
+        (ValueError("exchange error: HTTP 503: server error"), True),
+        (ValueError("exchange error: WebSocket post error: 502 Bad Gateway"), True),
+        (ValueError("exchange error: WebSocket post error: HTTP/504 Gateway Timeout"), True),
+        (ValueError("exchange error: 520 Web Server Returned an Unknown Error"), True),
+        (ValueError("exchange error: WebSocket post error: \u00a0500 unavailable"), True),
         (ValueError("bad request: invalid payload"), False),
+        (ValueError("bad request: Order submission rejected: Invalid TP/SL price."), False),
+        (ValueError("HTTP error 400: bad request"), False),
+        (ValueError("HTTP error 422: unprocessable"), False),
         (ValueError("exchange error: insufficient margin"), False),
+        (ValueError("exchange error: 5000 is not a valid size"), False),
+        (ValueError("exchange error: 5\u0660\u0660 is not a valid size"), False),
+        (ValueError("exchange error: HTTP\u00a0500 refused"), False),
+        (ValueError("exchange error: \u001c500 refused"), False),
+        (ValueError("exchange error: \u001d500 refused"), False),
+        (ValueError("exchange error: \u001e500 refused"), False),
+        (ValueError("exchange error: \u001f500 refused"), False),
         (ValueError("auth error: invalid signature"), False),
+        (ValueError("nonce window error: nonce too old"), False),
+        (ValueError("URL parse error: relative URL without a base"), False),
         (Exception("Order already filled"), False),
     ],
 )
-def test_is_transport_error_classifier(exc, expected):
-    assert _is_transport_error(exc) is expected
+def test_awaits_reconciliation_classifier(exc, expected):
+    assert _awaits_reconciliation(exc) is expected
 
 
 def _make_limit_order(instrument, coid: str = "O-TXP-001") -> LimitOrder:
@@ -3949,18 +3970,106 @@ def _accept_order(order: LimitOrder, voi: str) -> None:
     )
 
 
-_TRANSPORT_EXC_CASES = [
+_AMBIGUOUS_EXC_CASES = [
     pytest.param(TimeoutError("connect timeout"), id="native-timeout"),
     pytest.param(
         ValueError("transport error: HTTP client error: connection refused"),
         id="pyo3-transport",
     ),
+    pytest.param(ValueError("HTTP error 502: Bad Gateway"), id="http-5xx"),
+    pytest.param(
+        ValueError("decode error: expected action post response, received info payload"),
+        id="decode",
+    ),
 ]
 
 
+def _make_submit_command(order: LimitOrder) -> SubmitOrder:
+    return SubmitOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        order=order,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        position_id=None,
+        client_id=None,
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
-async def test_submit_order_transport_failure_does_not_reject(
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param("HTTP error 502: Bad Gateway", id="http-5xx"),
+        pytest.param(
+            "decode error: expected action post response, received info payload",
+            id="decode",
+        ),
+    ],
+)
+async def test_submit_order_ambiguous_failure_warns_and_awaits_reconciliation(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    error,
+):
+    client, ws_client, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    log = MagicMock()
+    monkeypatch.setattr(HyperliquidExecutionClient, "_log", property(lambda _self: log))
+    client.generate_order_rejected = MagicMock()
+    ws_client.submit_order.side_effect = ValueError(error)
+    order = _make_limit_order(instrument, coid="O-AMBIGUOUS-SUBMIT")
+
+    try:
+        await client._submit_order(_make_submit_command(order))
+
+        client.generate_order_rejected.assert_not_called()
+        assert order.client_order_id.value not in client._terminal_orders
+        warnings = [call.args[0] for call in log.warning.call_args_list]
+        assert any(error in w and "awaiting WS reconciliation" in w for w in warnings)
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            "bad request: Order O-REFUSED-SUBMIT rejected: Invalid TP/SL price.",
+            id="venue-reply",
+        ),
+        pytest.param("HTTP error 400: bad request", id="http-4xx"),
+    ],
+)
+async def test_submit_order_venue_refusal_rejects_with_its_text(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    error,
+):
+    client, ws_client, _, _ = exec_client_builder(monkeypatch)
+    await client._connect()
+
+    client.generate_order_rejected = MagicMock()
+    ws_client.submit_order.side_effect = ValueError(error)
+    order = _make_limit_order(instrument, coid="O-REFUSED-SUBMIT")
+
+    try:
+        await client._submit_order(_make_submit_command(order))
+
+        client.generate_order_rejected.assert_called_once()
+        assert client.generate_order_rejected.call_args.kwargs["reason"] == error
+        assert order.client_order_id.value in client._terminal_orders
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", _AMBIGUOUS_EXC_CASES)
+async def test_submit_order_ambiguous_failure_does_not_reject(
     exec_client_builder,
     monkeypatch,
     instrument,
@@ -3995,8 +4104,8 @@ async def test_submit_order_transport_failure_does_not_reject(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
-async def test_submit_order_list_transport_failure_does_not_reject(
+@pytest.mark.parametrize("exc", _AMBIGUOUS_EXC_CASES)
+async def test_submit_order_list_ambiguous_failure_does_not_reject(
     exec_client_builder,
     monkeypatch,
     instrument,
@@ -4032,8 +4141,8 @@ async def test_submit_order_list_transport_failure_does_not_reject(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
-async def test_cancel_order_transport_failure_does_not_reject(
+@pytest.mark.parametrize("exc", _AMBIGUOUS_EXC_CASES)
+async def test_cancel_order_ambiguous_failure_does_not_reject(
     exec_client_builder,
     monkeypatch,
     instrument,
@@ -4072,8 +4181,8 @@ async def test_cancel_order_transport_failure_does_not_reject(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
-async def test_cancel_all_orders_transport_failure_does_not_reject(
+@pytest.mark.parametrize("exc", _AMBIGUOUS_EXC_CASES)
+async def test_cancel_all_orders_ambiguous_failure_does_not_reject(
     exec_client_builder,
     monkeypatch,
     instrument,
@@ -4117,8 +4226,8 @@ async def test_cancel_all_orders_transport_failure_does_not_reject(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
-async def test_batch_cancel_orders_transport_failure_does_not_reject(
+@pytest.mark.parametrize("exc", _AMBIGUOUS_EXC_CASES)
+async def test_batch_cancel_orders_ambiguous_failure_does_not_reject(
     exec_client_builder,
     monkeypatch,
     instrument,
@@ -4173,8 +4282,8 @@ async def test_batch_cancel_orders_transport_failure_does_not_reject(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exc", _TRANSPORT_EXC_CASES)
-async def test_modify_order_transport_failure_preserves_pending_state(
+@pytest.mark.parametrize("exc", _AMBIGUOUS_EXC_CASES)
+async def test_modify_order_ambiguous_failure_preserves_pending_state(
     exec_client_builder,
     monkeypatch,
     instrument,

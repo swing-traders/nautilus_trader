@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
 from decimal import Decimal
@@ -716,9 +717,9 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 reduce_only=order.is_reduce_only,
             )
         except Exception as e:
-            if _is_transport_error(e):
+            if _awaits_reconciliation(e):
                 self._log.warning(
-                    f"Submit transport failure for {order.client_order_id} "
+                    f"Submit failure for {order.client_order_id} "
                     f"({type(e).__name__}: {e}); awaiting WS reconciliation",
                 )
                 return
@@ -781,9 +782,9 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             pyo3_orders = [transform_order_to_pyo3(order) for order in orders]
             pyo3_reports = await self._ws_client.submit_orders(self._client, pyo3_orders)
         except Exception as e:
-            if _is_transport_error(e):
+            if _awaits_reconciliation(e):
                 self._log.warning(
-                    f"Submit order list transport failure "
+                    f"Submit order list failure "
                     f"({type(e).__name__}: {e}); awaiting WS reconciliation",
                 )
                 return
@@ -912,7 +913,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 pyo3_trigger_price = nautilus_pyo3.Price.from_str(str(trigger_price))
 
             # Mark in-flight BEFORE the await so the WS cancel handler sees it regardless of timing.
-            # Cleared on non-transport post errors; preserved on transport errors so WS can reconcile.
+            # Cleared on a rejected modify; preserved on an ambiguous failure so WS can reconcile.
             self._pending_modify_keys[command.client_order_id.value] = venue_order_id.value
             self._pending_modify_target_qty[command.client_order_id.value] = target_total_qty
             self._pending_modify_target_price[command.client_order_id.value] = price
@@ -934,10 +935,10 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             )
 
         except Exception as e:
-            if _is_transport_error(e):
+            if _awaits_reconciliation(e):
                 # Keep pending state so WS can reconcile target qty if the modify landed
                 self._log.warning(
-                    f"Modify transport failure for {command.client_order_id} "
+                    f"Modify failure for {command.client_order_id} "
                     f"({type(e).__name__}: {e}); awaiting WS reconciliation",
                 )
                 return
@@ -979,9 +980,9 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             )
             self._log.info(f"Order cancellation requested for {command.client_order_id}")
         except Exception as e:
-            if _is_transport_error(e):
+            if _awaits_reconciliation(e):
                 self._log.warning(
-                    f"Cancel transport failure for {command.client_order_id} "
+                    f"Cancel failure for {command.client_order_id} "
                     f"({type(e).__name__}: {e}); awaiting WS reconciliation",
                 )
                 return
@@ -1042,10 +1043,9 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                     ts_event=self._clock.timestamp_ns(),
                 )
         except Exception as e:
-            if _is_transport_error(e):
+            if _awaits_reconciliation(e):
                 self._log.warning(
-                    f"Cancel-all transport failure ({type(e).__name__}: {e}); "
-                    "awaiting WS reconciliation",
+                    f"Cancel-all failure ({type(e).__name__}: {e}); awaiting WS reconciliation",
                 )
                 return
 
@@ -1109,10 +1109,9 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                     ts_event=self._clock.timestamp_ns(),
                 )
         except Exception as e:
-            if _is_transport_error(e):
+            if _awaits_reconciliation(e):
                 self._log.warning(
-                    f"Batch cancel transport failure ({type(e).__name__}: {e}); "
-                    "awaiting WS reconciliation",
+                    f"Batch cancel failure ({type(e).__name__}: {e}); awaiting WS reconciliation",
                 )
                 return
 
@@ -1391,12 +1390,10 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 )
                 return
 
-            # Cancel-before-accept race: for an in-flight modify, Hyperliquid
-            # may deliver CANCELED(old_voi) before the replacement ACCEPTED.
-            # Suppress the old leg so the later ACCEPTED can route through the
-            # OrderUpdated path. The marker is cleared on non-transport modify
-            # failure; on transport failure it stays so a landed modify can
-            # still reconcile.
+            # Cancel-before-accept race: for an in-flight modify, Hyperliquid may deliver
+            # CANCELED(old_voi) before the replacement ACCEPTED. Suppress the old leg so the later
+            # ACCEPTED can route through the OrderUpdated path. The marker is cleared on a rejected
+            # modify; on an ambiguous failure it stays so a landed modify can still reconcile.
             pending_old_voi = self._pending_modify_keys.get(key)
             if (
                 pending_old_voi is not None
@@ -1736,12 +1733,47 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         return client_order_id
 
 
-# pyo3 HTTP errors arrive as ValueError carrying the Rust `Display` text
-_TRANSPORT_ERROR_PREFIXES = ("transport error:", "IO error:")
+# pyo3 errors arrive as ValueError carrying the Rust `Display` text
+_AMBIGUOUS_ERROR_PREFIXES = (
+    "transport error:",
+    "IO error:",
+    "decode error:",
+    "serde error:",
+    "Rate limited on ",
+)
+
+# A 5xx read as the Rust WebSocket post mapper reads a status: an optional `HTTP` token first, and
+# Rust's whitespace sets, which exclude the separators U+001C-U+001F that Python's `\s` matches
+_SERVER_ERROR = re.compile(
+    r"(?:HTTP error |exchange error: (?:WebSocket post error: )?[^\S\x1c-\x1f]*"
+    r"(?:(?i:http)[ \t\n\f\r:/]*)?)5[0-9]{2}(?![0-9A-Za-z])",
+)
 
 
-def _is_transport_error(exc: BaseException) -> bool:
+def _awaits_reconciliation(exc: BaseException) -> bool:
+    """
+    Return whether an order command's failure leaves the venue's outcome unknown.
+
+    | Failure                                              | Origin                 | Outcome  |
+    |------------------------------------------------------|------------------------|----------|
+    | `bad request:`, `auth error:`, `exchange error:`     | venue reply, or a      | rejected |
+    |                                                      | check before sending   |          |
+    | `HTTP error 4xx:`                                    | venue reply            | rejected |
+    | `nonce window error:`, `URL parse error:`, any other | before sending         | rejected |
+    | `HTTP error 5xx:`, `exchange error:` carrying a 5xx  | venue server failure   | awaits   |
+    | `Rate limited on`                                    | venue 429              | awaits   |
+    | `decode error:`, `serde error:`                      | unreadable venue reply | awaits   |
+    | `transport error:`, `IO error:`, `timeout`,          | connection             | awaits   |
+    | `TimeoutError`, `OSError`                            |                        |          |
+
+    The client's own rate limiters wait rather than fail, so every `Rate limited on` is the venue's.
+
+    """
     if isinstance(exc, (TimeoutError, OSError)):
         return True
     msg = str(exc)
-    return msg == "timeout" or msg.startswith(_TRANSPORT_ERROR_PREFIXES)
+    return (
+        msg == "timeout"
+        or msg.startswith(_AMBIGUOUS_ERROR_PREFIXES)
+        or _SERVER_ERROR.match(msg) is not None
+    )

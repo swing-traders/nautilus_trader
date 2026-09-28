@@ -32,9 +32,13 @@ use std::sync::Arc;
 
 use nautilus_common::messages::ExecutionEvent;
 use nautilus_core::{UUID4, UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_hyperliquid::websocket::dispatch::{
-    DispatchOutcome, OrderIdentity, WsDispatchState, dispatch_order_event, dispatch_order_fill,
-    promote_replacement_from_query,
+use nautilus_hyperliquid::websocket::{
+    dispatch::{
+        DispatchOutcome, OrderIdentity, WsDispatchState, dispatch_order_event, dispatch_order_fill,
+        promote_replacement_from_query,
+    },
+    messages::WsOrderData,
+    parse::parse_ws_order_status_report,
 };
 use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
@@ -45,6 +49,7 @@ use nautilus_model::{
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
     },
+    instruments::{InstrumentAny, stubs::crypto_perpetual_ethusdt},
     reports::{FillReport, OrderStatusReport},
     types::{Currency, Money, Price, Quantity},
 };
@@ -347,6 +352,47 @@ fn test_dispatch_passive_ioc_rejection_preserves_venue_reason() {
         "Order could not immediately match against any resting orders",
     );
     assert!(!rejected.due_post_only);
+}
+
+#[rstest]
+fn test_dispatch_bad_trigger_px_rejection_carries_venue_reason() {
+    let (emitter, mut rx) = test_emitter();
+    let state = Arc::new(WsDispatchState::new());
+    let cid = ClientOrderId::new("O-BAD-TRIGGER");
+    state.register_identity(cid, identity(OrderType::StopMarket));
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let order: WsOrderData = serde_json::from_value(serde_json::json!({
+        "order": {
+            "coin": "ETH",
+            "side": "A",
+            "limitPx": "2400.00",
+            "sz": "0.100",
+            "oid": 12345,
+            "timestamp": 1704470400000_u64,
+            "origSz": "0.100",
+            "cloid": "O-BAD-TRIGGER",
+            "reduceOnly": true,
+            "triggerPx": "2500.00",
+            "isMarket": true,
+            "tpsl": "sl"
+        },
+        "status": "badTriggerPxRejected",
+        "statusTimestamp": 1704470400000_u64
+    }))
+    .unwrap();
+    let report =
+        parse_ws_order_status_report(&order, &instrument, account_id(), UnixNanos::default())
+            .unwrap();
+
+    dispatch_order_event(&report, &state, &emitter, UnixNanos::default());
+
+    let events = drain_events(&mut rx);
+    let ExecutionEvent::Order(OrderEventAny::Rejected(rejected)) = &events[0] else {
+        panic!("expected OrderRejected, received {:?}", events[0]);
+    };
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(rejected.reason.as_str(), "Invalid TP/SL price.");
 }
 
 #[rstest]

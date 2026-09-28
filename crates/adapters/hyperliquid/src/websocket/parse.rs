@@ -652,6 +652,10 @@ mod tests {
         HyperliquidOrderStatusEnum::IocCancelRejected,
         "Order could not immediately match against any resting orders"
     )]
+    #[case(
+        HyperliquidOrderStatusEnum::BadTriggerPxRejected,
+        "Invalid TP/SL price."
+    )]
     fn test_parse_ws_rejection_preserves_venue_reason(
         #[case] status: HyperliquidOrderStatusEnum,
         #[case] expected_reason: &str,
