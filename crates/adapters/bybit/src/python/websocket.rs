@@ -1892,8 +1892,9 @@ fn handle_order_response(
                     .or_else(|| entries.get(idx));
 
                 if let Some(pending) = pending {
-                    let reason = Ustr::from(&error.msg);
-                    emit_rejection(pending, reason, account_id, ts_init, call_soon, callback);
+                    emit_rejection(
+                        pending, error.code, &error.msg, account_id, ts_init, call_soon, callback,
+                    );
                 } else {
                     log::warn!(
                         "Batch error at index {idx} without correlation: code={}, msg={}",
@@ -1937,21 +1938,33 @@ fn handle_order_response(
     };
 
     let ts_init = clock.get_time_ns();
-    let reason = Ustr::from(&resp.ret_msg);
 
     for pending in &entries {
-        emit_rejection(pending, reason, account_id, ts_init, call_soon, callback);
+        emit_rejection(
+            pending,
+            resp.ret_code,
+            &resp.ret_msg,
+            account_id,
+            ts_init,
+            call_soon,
+            callback,
+        );
     }
 }
 
+/// Emits the rejection event for `pending`'s operation, its reason in the shape the HTTP client's
+/// `BybitHttpError` displays, so a refusal reads the same on either transport.
 fn emit_rejection(
     pending: &PendingPyRequest,
-    reason: Ustr,
+    code: i64,
+    msg: &str,
     account_id: Option<AccountId>,
     ts_init: UnixNanos,
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
+    let reason = Ustr::from(&format!("Bybit error {code}: {msg}"));
+
     match pending.operation {
         PendingOperation::Place => {
             let event = OrderRejected::new(
@@ -2001,5 +2014,158 @@ fn emit_rejection(
             );
             send_to_python(event, call_soon, callback);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::types::PyList;
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::*;
+    use crate::{
+        common::enums::BybitWsOrderRequestOp, http::error::BybitHttpError,
+        websocket::messages::BybitWsOrderResponse,
+    };
+
+    const REQ_ID: &str = "req-1";
+    const RET_MSG: &str = "trigger price is past the last price";
+
+    fn pending_request(operation: PendingOperation) -> PendingPyRequest {
+        PendingPyRequest {
+            client_order_id: ClientOrderId::from("O-001"),
+            operation,
+            trader_id: TraderId::from("TRADER-001"),
+            strategy_id: StrategyId::from("S-001"),
+            instrument_id: InstrumentId::from("BTCUSDT-LINEAR.BYBIT"),
+            venue_order_id: Some(VenueOrderId::from("V-001")),
+        }
+    }
+
+    /// Runs `handle_order_response` with one pending request and returns what it sent to Python.
+    fn handle(resp: &BybitWsOrderResponse, operation: PendingOperation) -> Vec<Py<PyAny>> {
+        Python::initialize();
+        Python::attach(|py| {
+            let pending = DashMap::new();
+            pending.insert(REQ_ID.to_string(), vec![pending_request(operation)]);
+            let clock = AtomicTime::new(false, UnixNanos::from(1_u64));
+            let call_soon: Py<PyAny> = py
+                .eval(c"lambda cb, obj: cb(obj)", None, None)
+                .unwrap()
+                .unbind();
+            let sent = PyList::empty(py);
+            let callback: Py<PyAny> = sent.getattr("append").unwrap().unbind();
+
+            handle_order_response(
+                resp,
+                &pending,
+                Some(AccountId::from("BYBIT-001")),
+                &clock,
+                &call_soon,
+                &callback,
+            );
+
+            sent.iter().map(Bound::unbind).collect()
+        })
+    }
+
+    fn refused_response(op: BybitWsOrderRequestOp, ret_code: i64) -> BybitWsOrderResponse {
+        serde_json::from_value(json!({
+            "reqId": REQ_ID,
+            "retCode": ret_code,
+            "retMsg": RET_MSG,
+            "op": op,
+            "data": {},
+        }))
+        .unwrap()
+    }
+
+    fn rejected_reason(sent: &[Py<PyAny>]) -> String {
+        assert_eq!(sent.len(), 1);
+        Python::attach(|py| {
+            let event: OrderRejected = sent[0].bind(py).extract().unwrap();
+            assert_eq!(event.client_order_id, ClientOrderId::from("O-001"));
+            event.reason.to_string()
+        })
+    }
+
+    #[rstest]
+    fn test_refused_place_reason_carries_code() {
+        let sent = handle(
+            &refused_response(BybitWsOrderRequestOp::Create, 110092),
+            PendingOperation::Place,
+        );
+
+        assert_eq!(
+            rejected_reason(&sent),
+            format!("Bybit error 110092: {RET_MSG}")
+        );
+    }
+
+    #[rstest]
+    fn test_refused_cancel_reason_carries_code() {
+        let sent = handle(
+            &refused_response(BybitWsOrderRequestOp::Cancel, 110001),
+            PendingOperation::Cancel,
+        );
+
+        assert_eq!(sent.len(), 1);
+        let event: OrderCancelRejected = Python::attach(|py| sent[0].bind(py).extract().unwrap());
+        assert_eq!(event.client_order_id, ClientOrderId::from("O-001"));
+        assert_eq!(
+            event.reason.to_string(),
+            format!("Bybit error 110001: {RET_MSG}")
+        );
+    }
+
+    #[rstest]
+    fn test_refused_amend_reason_carries_code() {
+        let sent = handle(
+            &refused_response(BybitWsOrderRequestOp::Amend, 110001),
+            PendingOperation::Amend,
+        );
+
+        assert_eq!(sent.len(), 1);
+        let event: OrderModifyRejected = Python::attach(|py| sent[0].bind(py).extract().unwrap());
+        assert_eq!(event.client_order_id, ClientOrderId::from("O-001"));
+        assert_eq!(
+            event.reason.to_string(),
+            format!("Bybit error 110001: {RET_MSG}")
+        );
+    }
+
+    #[rstest]
+    fn test_refused_batch_item_reason_carries_code() {
+        let resp: BybitWsOrderResponse = serde_json::from_value(json!({
+            "reqId": REQ_ID,
+            "retCode": 0,
+            "retMsg": "OK",
+            "op": BybitWsOrderRequestOp::CreateBatch,
+            "data": {},
+            "retExtInfo": {"list": [{"code": 110092, "msg": RET_MSG}]},
+        }))
+        .unwrap();
+
+        let sent = handle(&resp, PendingOperation::Place);
+
+        assert_eq!(
+            rejected_reason(&sent),
+            format!("Bybit error 110092: {RET_MSG}")
+        );
+    }
+
+    #[rstest]
+    fn test_refused_reason_matches_http_error_display() {
+        let sent = handle(
+            &refused_response(BybitWsOrderRequestOp::Create, 110092),
+            PendingOperation::Place,
+        );
+        let http_error = BybitHttpError::BybitError {
+            error_code: 110092,
+            message: RET_MSG.to_string(),
+        };
+
+        assert_eq!(rejected_reason(&sent), http_error.to_string());
     }
 }
