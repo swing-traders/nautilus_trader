@@ -53,6 +53,7 @@ use crate::{
             parse_trigger_type,
         },
     },
+    http::error::is_bybit_ambiguous_order_error_code,
     python::params::{BybitWsAmendOrderParams, BybitWsCancelOrderParams, BybitWsPlaceOrderParams},
     websocket::{
         client::{BATCH_PROCESSING_LIMIT, BybitWebSocketClient, PendingPyRequest},
@@ -1880,6 +1881,15 @@ fn handle_order_response(
                     continue;
                 }
 
+                if is_bybit_ambiguous_order_error_code(error.code) {
+                    log::warn!(
+                        "Ambiguous batch order item failure at index {idx}: code={}, msg={}; awaiting reconciliation",
+                        error.code,
+                        error.msg,
+                    );
+                    continue;
+                }
+
                 let pending = data_array
                     .and_then(|arr| arr.get(idx))
                     .and_then(|item| item.get("orderLinkId"))
@@ -1928,26 +1938,33 @@ fn handle_order_response(
             pending_py_requests.remove(&key).map(|(_, v)| v)
         });
 
-    let Some(entries) = entries else {
+    // The venue may hold an order refused with an ambiguous code, so reconciliation resolves it.
+    if is_bybit_ambiguous_order_error_code(resp.ret_code) {
+        log::warn!(
+            "Ambiguous order response failure: op={}, ret_code={}, ret_msg={}; awaiting reconciliation",
+            resp.op,
+            resp.ret_code,
+            resp.ret_msg,
+        );
+    } else if let Some(entries) = entries {
+        let ts_init = clock.get_time_ns();
+
+        for pending in &entries {
+            emit_rejection(
+                pending,
+                resp.ret_code,
+                &resp.ret_msg,
+                account_id,
+                ts_init,
+                call_soon,
+                callback,
+            );
+        }
+    } else {
         log::warn!(
             "Unmatched order response: ret_code={}, ret_msg={}",
             resp.ret_code,
             resp.ret_msg,
-        );
-        return;
-    };
-
-    let ts_init = clock.get_time_ns();
-
-    for pending in &entries {
-        emit_rejection(
-            pending,
-            resp.ret_code,
-            &resp.ret_msg,
-            account_id,
-            ts_init,
-            call_soon,
-            callback,
         );
     }
 }
@@ -2019,6 +2036,9 @@ fn emit_rejection(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use log::{Level, LevelFilter, Log, Metadata, Record};
     use pyo3::types::PyList;
     use rstest::rstest;
     use serde_json::json;
@@ -2031,6 +2051,47 @@ mod tests {
 
     const REQ_ID: &str = "req-1";
     const RET_MSG: &str = "trigger price is past the last price";
+
+    struct CapturingLogger {
+        messages: Mutex<Vec<(Level, String)>>,
+    }
+
+    impl Log for CapturingLogger {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= Level::Warn
+        }
+
+        fn log(&self, record: &Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.messages
+                    .lock()
+                    .unwrap()
+                    .push((record.level(), record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static CAPTURING_LOGGER: CapturingLogger = CapturingLogger {
+        messages: Mutex::new(Vec::new()),
+    };
+
+    /// Installs the process-wide capturing logger; tests running beside each other share it, so
+    /// each asserts on a message only it can produce.
+    fn capture_logs() {
+        let _ = log::set_logger(&CAPTURING_LOGGER);
+        log::set_max_level(LevelFilter::Warn);
+    }
+
+    fn logged_warning(message: &str) -> bool {
+        CAPTURING_LOGGER
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(level, logged)| *level == Level::Warn && logged == message)
+    }
 
     fn pending_request(operation: PendingOperation) -> PendingPyRequest {
         PendingPyRequest {
@@ -2045,10 +2106,19 @@ mod tests {
 
     /// Runs `handle_order_response` with one pending request and returns what it sent to Python.
     fn handle(resp: &BybitWsOrderResponse, operation: PendingOperation) -> Vec<Py<PyAny>> {
+        handle_entries(resp, vec![pending_request(operation)])
+    }
+
+    /// Runs `handle_order_response` with `entries` pending under one request and returns what it
+    /// sent to Python.
+    fn handle_entries(
+        resp: &BybitWsOrderResponse,
+        entries: Vec<PendingPyRequest>,
+    ) -> Vec<Py<PyAny>> {
         Python::initialize();
         Python::attach(|py| {
             let pending = DashMap::new();
-            pending.insert(REQ_ID.to_string(), vec![pending_request(operation)]);
+            pending.insert(REQ_ID.to_string(), entries);
             let clock = AtomicTime::new(false, UnixNanos::from(1_u64));
             let call_soon: Py<PyAny> = py
                 .eval(c"lambda cb, obj: cb(obj)", None, None)
@@ -2167,5 +2237,57 @@ mod tests {
         };
 
         assert_eq!(rejected_reason(&sent), http_error.to_string());
+    }
+
+    #[rstest]
+    fn test_ambiguous_place_response_emits_nothing() {
+        capture_logs();
+
+        let sent = handle(
+            &refused_response(BybitWsOrderRequestOp::Create, 10006),
+            PendingOperation::Place,
+        );
+
+        assert!(sent.is_empty());
+        assert!(logged_warning(&format!(
+            "Ambiguous order response failure: op=order.create, ret_code=10006, ret_msg={RET_MSG}; awaiting reconciliation"
+        )));
+    }
+
+    #[rstest]
+    fn test_ambiguous_batch_item_emits_nothing_beside_confirmed_rejection() {
+        capture_logs();
+        let resp: BybitWsOrderResponse = serde_json::from_value(json!({
+            "reqId": REQ_ID,
+            "retCode": 0,
+            "retMsg": "OK",
+            "op": BybitWsOrderRequestOp::CreateBatch,
+            "data": {},
+            "retExtInfo": {"list": [
+                {"code": 10016, "msg": RET_MSG},
+                {"code": 110092, "msg": RET_MSG},
+            ]},
+        }))
+        .unwrap();
+        let confirmed = PendingPyRequest {
+            client_order_id: ClientOrderId::from("O-002"),
+            ..pending_request(PendingOperation::Place)
+        };
+
+        let sent = handle_entries(
+            &resp,
+            vec![pending_request(PendingOperation::Place), confirmed],
+        );
+
+        assert_eq!(sent.len(), 1);
+        let event: OrderRejected = Python::attach(|py| sent[0].bind(py).extract().unwrap());
+        assert_eq!(event.client_order_id, ClientOrderId::from("O-002"));
+        assert_eq!(
+            event.reason.to_string(),
+            format!("Bybit error 110092: {RET_MSG}")
+        );
+        assert!(logged_warning(&format!(
+            "Ambiguous batch order item failure at index 0: code=10016, msg={RET_MSG}; awaiting reconciliation"
+        )));
     }
 }
