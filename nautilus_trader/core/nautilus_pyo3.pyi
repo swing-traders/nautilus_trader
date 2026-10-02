@@ -2631,6 +2631,7 @@ class Cfd:
         ts_event: int,
         ts_init: int,
         base_currency: Currency | None = None,
+        multiplier: Quantity | None = None,
         lot_size: Quantity | None = None,
         max_quantity: Quantity | None = None,
         min_quantity: Quantity | None = None,
@@ -2663,6 +2664,8 @@ class Cfd:
     def price_increment(self) -> Price: ...
     @property
     def size_increment(self) -> Quantity: ...
+    @property
+    def multiplier(self) -> Quantity: ...
     @property
     def lot_size(self) -> Quantity | None: ...
     @property

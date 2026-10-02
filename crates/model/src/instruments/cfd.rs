@@ -67,6 +67,9 @@ pub struct Cfd {
     pub price_increment: Price,
     /// The minimum size increment.
     pub size_increment: Quantity,
+    /// The contract multiplier.
+    #[serde(default = "default_multiplier")]
+    pub multiplier: Quantity,
     /// The initial (order) margin requirement in percentage of order value.
     pub margin_init: Decimal,
     /// The maintenance (position) margin in percentage of position value.
@@ -99,6 +102,10 @@ pub struct Cfd {
     pub ts_init: UnixNanos,
 }
 
+fn default_multiplier() -> Quantity {
+    Quantity::from(1)
+}
+
 #[bon::bon]
 impl Cfd {
     /// Creates a new [`Cfd`] instance with correctness checking.
@@ -121,6 +128,7 @@ impl Cfd {
         size_precision: u8,
         price_increment: Price,
         size_increment: Quantity,
+        multiplier: Option<Quantity>,
         lot_size: Option<Quantity>,
         max_quantity: Option<Quantity>,
         min_quantity: Option<Quantity>,
@@ -153,6 +161,10 @@ impl Cfd {
         check_positive_quantity(size_increment, stringify!(size_increment))?;
         check_tick_scheme(tick_scheme)?;
 
+        if let Some(multiplier) = multiplier {
+            check_positive_quantity(multiplier, stringify!(multiplier))?;
+        }
+
         if let Some(lot_size) = lot_size {
             check_positive_quantity(lot_size, stringify!(lot_size))?;
         }
@@ -167,6 +179,7 @@ impl Cfd {
             size_precision,
             price_increment,
             size_increment,
+            multiplier: multiplier.unwrap_or_else(default_multiplier),
             lot_size,
             max_quantity,
             min_quantity,
@@ -202,6 +215,7 @@ impl Cfd {
         size_precision: u8,
         price_increment: Price,
         size_increment: Quantity,
+        multiplier: Option<Quantity>,
         lot_size: Option<Quantity>,
         max_quantity: Option<Quantity>,
         min_quantity: Option<Quantity>,
@@ -228,6 +242,7 @@ impl Cfd {
             size_precision,
             price_increment,
             size_increment,
+            multiplier,
             lot_size,
             max_quantity,
             min_quantity,
@@ -267,6 +282,7 @@ impl Cfd {
         size_precision: u8,
         price_increment: Price,
         size_increment: Quantity,
+        multiplier: Option<Quantity>,
         lot_size: Option<Quantity>,
         max_quantity: Option<Quantity>,
         min_quantity: Option<Quantity>,
@@ -293,6 +309,7 @@ impl Cfd {
             size_precision,
             price_increment,
             size_increment,
+            multiplier,
             lot_size,
             max_quantity,
             min_quantity,
@@ -411,7 +428,7 @@ impl Instrument for Cfd {
     }
 
     fn multiplier(&self) -> Quantity {
-        Quantity::from(1)
+        self.multiplier
     }
 
     fn lot_size(&self) -> Option<Quantity> {
@@ -515,6 +532,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0.into(),
             0.into(),
         );
@@ -522,7 +540,12 @@ mod tests {
     }
 
     #[rstest]
-    fn test_new_checked_rejects_non_positive_lot_size() {
+    #[case::zero_multiplier(Some(Quantity::from("0")), None)]
+    #[case::zero_lot_size(None, Some(Quantity::from("0")))]
+    fn test_new_checked_rejects_non_positive_sizing(
+        #[case] multiplier: Option<Quantity>,
+        #[case] lot_size: Option<Quantity>,
+    ) {
         let result = Cfd::new_checked(
             InstrumentId::from("TEST.SIM"),
             Symbol::from("TEST"),
@@ -533,7 +556,8 @@ mod tests {
             0,
             Price::from("0.01"),
             Quantity::from("1"),
-            Some(Quantity::from("0")),
+            multiplier,
+            lot_size,
             None,
             None,
             None,
@@ -561,6 +585,30 @@ mod tests {
     }
 
     #[rstest]
+    fn test_default_multiplier_is_one(cfd_gold: Cfd) {
+        assert_eq!(cfd_gold.multiplier(), Quantity::from(1));
+    }
+
+    #[rstest]
+    fn test_multiplier_survives_serialization(cfd_gold: Cfd) {
+        let cfd = Cfd {
+            multiplier: Quantity::from(100),
+            ..cfd_gold
+        };
+        let json = serde_json::to_string(&cfd).unwrap();
+        let deserialized: Cfd = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.multiplier(), Quantity::from(100));
+    }
+
+    #[rstest]
+    fn test_deserialization_without_multiplier_defaults_to_one(cfd_gold: Cfd) {
+        let mut value = serde_json::to_value(&cfd_gold).unwrap();
+        value.as_object_mut().unwrap().remove("multiplier").unwrap();
+        let deserialized: Cfd = serde_json::from_value(value).unwrap();
+        assert_eq!(deserialized.multiplier(), Quantity::from(1));
+    }
+
+    #[rstest]
     fn test_builder_matches_new_checked() {
         let positional = Cfd::new_checked(
             InstrumentId::from("EURUSD-CFD.SIM"),
@@ -572,6 +620,7 @@ mod tests {
             2,
             Price::from("0.00001"),
             Quantity::from("0.01"),
+            Some(Quantity::from("10")),
             Some(Quantity::from("100")),
             Some(Quantity::from("10000.00")),
             Some(Quantity::from("5.00")),
@@ -600,6 +649,7 @@ mod tests {
             .size_precision(2)
             .price_increment(Price::from("0.00001"))
             .size_increment(Quantity::from("0.01"))
+            .multiplier(Quantity::from("10"))
             .lot_size(Quantity::from("100"))
             .max_quantity(Quantity::from("10000.00"))
             .min_quantity(Quantity::from("5.00"))

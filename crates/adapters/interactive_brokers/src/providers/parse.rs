@@ -925,6 +925,7 @@ fn parse_cfd_contract(
         None,
         None,
         None,
+        None,
         Some(ib_contract_info(details)),
         timestamp,
         timestamp,

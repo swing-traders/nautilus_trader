@@ -854,6 +854,7 @@ pub fn cfd_gold() -> Cfd {
         0,
         Price::from("0.01"),
         Quantity::from("1"),
+        None,
         Some(Quantity::from("1")),
         None,
         None,

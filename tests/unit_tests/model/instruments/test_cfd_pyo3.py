@@ -60,6 +60,7 @@ def test_to_dict():
         "price_increment": "0.00001",
         "tick_scheme": None,
         "size_increment": "1",
+        "multiplier": "1",
         "lot_size": "1000",
         "max_quantity": None,
         "min_quantity": None,

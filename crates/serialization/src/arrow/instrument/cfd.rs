@@ -55,6 +55,7 @@ impl ArrowSchemaProvider for Cfd {
             Field::new("size_precision", DataType::UInt8, false),
             Field::new("price_increment", DataType::Utf8, false),
             Field::new("size_increment", DataType::Utf8, false),
+            Field::new("multiplier", DataType::Utf8, false),
             Field::new("lot_size", DataType::Utf8, true), // nullable
             Field::new("max_quantity", DataType::Utf8, true), // nullable
             Field::new("min_quantity", DataType::Utf8, true), // nullable
@@ -97,6 +98,7 @@ impl EncodeToRecordBatch for Cfd {
         let mut size_precision_builder = UInt8Array::builder(data.len());
         let mut price_increment_builder = StringBuilder::new();
         let mut size_increment_builder = StringBuilder::new();
+        let mut multiplier_builder = StringBuilder::new();
         let mut lot_size_builder = StringBuilder::new();
         let mut max_quantity_builder = StringBuilder::new();
         let mut min_quantity_builder = StringBuilder::new();
@@ -129,6 +131,7 @@ impl EncodeToRecordBatch for Cfd {
             size_precision_builder.append_value(cfd.size_precision);
             price_increment_builder.append_value(cfd.price_increment.to_string());
             size_increment_builder.append_value(cfd.size_increment.to_string());
+            multiplier_builder.append_value(cfd.multiplier.to_string());
 
             if let Some(lot_size) = cfd.lot_size {
                 lot_size_builder.append_value(lot_size.to_string());
@@ -218,6 +221,7 @@ impl EncodeToRecordBatch for Cfd {
                 Arc::new(size_precision_builder.finish()),
                 Arc::new(price_increment_builder.finish()),
                 Arc::new(size_increment_builder.finish()),
+                Arc::new(multiplier_builder.finish()),
                 Arc::new(lot_size_builder.finish()),
                 Arc::new(max_quantity_builder.finish()),
                 Arc::new(min_quantity_builder.finish()),
@@ -277,33 +281,34 @@ pub fn decode_cfd_batch(
         extract_column::<StringArray>(cols, "price_increment", 7, DataType::Utf8)?;
     let size_increment_values =
         extract_column::<StringArray>(cols, "size_increment", 8, DataType::Utf8)?;
+    let multiplier_values = extract_column::<StringArray>(cols, "multiplier", 9, DataType::Utf8)?;
     let lot_size_values = cols
-        .get(9)
-        .ok_or_else(|| EncodingError::MissingColumn("lot_size", 9))?;
-    let max_quantity_values = cols
         .get(10)
-        .ok_or_else(|| EncodingError::MissingColumn("max_quantity", 10))?;
-    let min_quantity_values = cols
+        .ok_or_else(|| EncodingError::MissingColumn("lot_size", 10))?;
+    let max_quantity_values = cols
         .get(11)
-        .ok_or_else(|| EncodingError::MissingColumn("min_quantity", 11))?;
-    let max_notional_values = cols
+        .ok_or_else(|| EncodingError::MissingColumn("max_quantity", 11))?;
+    let min_quantity_values = cols
         .get(12)
-        .ok_or_else(|| EncodingError::MissingColumn("max_notional", 12))?;
-    let min_notional_values = cols
+        .ok_or_else(|| EncodingError::MissingColumn("min_quantity", 12))?;
+    let max_notional_values = cols
         .get(13)
-        .ok_or_else(|| EncodingError::MissingColumn("min_notional", 13))?;
-    let max_price_values = cols
+        .ok_or_else(|| EncodingError::MissingColumn("max_notional", 13))?;
+    let min_notional_values = cols
         .get(14)
-        .ok_or_else(|| EncodingError::MissingColumn("max_price", 14))?;
-    let min_price_values = cols
+        .ok_or_else(|| EncodingError::MissingColumn("min_notional", 14))?;
+    let max_price_values = cols
         .get(15)
-        .ok_or_else(|| EncodingError::MissingColumn("min_price", 15))?;
+        .ok_or_else(|| EncodingError::MissingColumn("max_price", 15))?;
+    let min_price_values = cols
+        .get(16)
+        .ok_or_else(|| EncodingError::MissingColumn("min_price", 16))?;
     let margin_init_values =
-        extract_column::<StringArray>(cols, "margin_init", 16, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "margin_init", 17, DataType::Utf8)?;
     let margin_maint_values =
-        extract_column::<StringArray>(cols, "margin_maint", 17, DataType::Utf8)?;
-    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 18, DataType::Utf8)?;
-    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 19, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "margin_maint", 18, DataType::Utf8)?;
+    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 19, DataType::Utf8)?;
+    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 20, DataType::Utf8)?;
     let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
     let info_values =
         extract_column_by_name_or_index::<BinaryArray>(record_batch, "info", 20, DataType::Binary)?;
@@ -360,6 +365,8 @@ pub fn decode_cfd_batch(
             .map_err(|e| EncodingError::ParseError("price_increment", format!("row {i}: {e}")))?;
         let size_increment = Quantity::from_str(size_increment_values.value(i))
             .map_err(|e| EncodingError::ParseError("size_increment", format!("row {i}: {e}")))?;
+        let multiplier = Quantity::from_str(multiplier_values.value(i))
+            .map_err(|e| EncodingError::ParseError("multiplier", format!("row {i}: {e}")))?;
 
         let lot_size = if lot_size_values.is_null(i) {
             None
@@ -518,6 +525,7 @@ pub fn decode_cfd_batch(
             size_prec,
             price_increment,
             size_increment,
+            Some(multiplier),
             lot_size,
             max_quantity,
             min_quantity,

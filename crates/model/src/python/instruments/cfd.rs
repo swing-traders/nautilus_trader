@@ -40,7 +40,7 @@ impl Cfd {
     /// Can represent both Fiat FX and Cryptocurrency pairs.
     #[expect(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (instrument_id, raw_symbol, asset_class, quote_currency, price_precision, size_precision, price_increment, size_increment, ts_event, ts_init, base_currency=None, lot_size=None, max_quantity=None, min_quantity=None, max_notional=None, min_notional=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, maker_fee=None, taker_fee=None, tick_scheme=None, info=None))]
+    #[pyo3(signature = (instrument_id, raw_symbol, asset_class, quote_currency, price_precision, size_precision, price_increment, size_increment, ts_event, ts_init, base_currency=None, multiplier=None, lot_size=None, max_quantity=None, min_quantity=None, max_notional=None, min_notional=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, maker_fee=None, taker_fee=None, tick_scheme=None, info=None))]
     fn py_new(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -53,6 +53,7 @@ impl Cfd {
         ts_event: u64,
         ts_init: u64,
         base_currency: Option<Currency>,
+        multiplier: Option<Quantity>,
         lot_size: Option<Quantity>,
         max_quantity: Option<Quantity>,
         min_quantity: Option<Quantity>,
@@ -83,6 +84,7 @@ impl Cfd {
             size_precision,
             price_increment,
             size_increment,
+            multiplier,
             lot_size,
             max_quantity,
             min_quantity,
@@ -289,6 +291,7 @@ impl Cfd {
         dict.set_item("size_precision", self.size_precision)?;
         dict.set_item("price_increment", self.price_increment.to_string())?;
         dict.set_item("size_increment", self.size_increment.to_string())?;
+        dict.set_item("multiplier", self.multiplier.to_string())?;
         dict.set_item("ts_event", self.ts_event.as_u64())?;
         dict.set_item("ts_init", self.ts_init.as_u64())?;
 

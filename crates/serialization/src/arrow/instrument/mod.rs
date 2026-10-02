@@ -1301,8 +1301,25 @@ mod tests {
 
     #[rstest]
     fn test_roundtrip_cfd() {
-        use nautilus_model::instruments::stubs::cfd_gold;
-        roundtrip_case(&InstrumentAny::Cfd(cfd_gold()));
+        use nautilus_model::instruments::{Cfd, stubs::cfd_gold};
+
+        let inst = Cfd {
+            multiplier: Quantity::from(100),
+            ..cfd_gold()
+        };
+        let any = InstrumentAny::Cfd(inst.clone());
+        roundtrip_case(&any);
+        let metadata = any.metadata();
+        let batch = InstrumentAny::encode_batch(&metadata, std::slice::from_ref(&any)).unwrap();
+        let decoded = decode_instrument_any_batch(&metadata, &batch).unwrap();
+        let InstrumentAny::Cfd(decoded_inst) = &decoded[0] else {
+            panic!("decoded variant is not Cfd");
+        };
+        assert_eq!(decoded_inst.multiplier, Quantity::from(100));
+        assert_eq!(
+            serde_json::to_value(decoded_inst).unwrap(),
+            serde_json::to_value(&inst).unwrap(),
+        );
     }
 
     #[rstest]

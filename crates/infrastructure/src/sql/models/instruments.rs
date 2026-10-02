@@ -1309,6 +1309,7 @@ impl<'r> FromRow<'r, PgRow> for CfdModel {
             size_precision,
             price_increment,
             size_increment,
+            None,
             lot_size,
             max_quantity,
             min_quantity,
