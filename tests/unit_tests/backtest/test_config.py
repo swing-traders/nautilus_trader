@@ -694,6 +694,18 @@ class TestBacktestConfigParsing:
         # Assert
         assert engine
 
+    def test_backtest_venue_config_quote_execution_defaults_on(self) -> None:
+        # Arrange, Act
+        config = BacktestVenueConfig(
+            name="SIM",
+            oms_type="NETTING",
+            account_type="MARGIN",
+            starting_balances=["1_000_000 USD"],
+        )
+
+        # Assert
+        assert config.quote_execution is True
+
 
 class TestParseFiltersExpr:
     """

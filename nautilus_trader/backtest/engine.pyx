@@ -529,6 +529,7 @@ cdef class BacktestEngine:
         bar_execution: bool = True,
         bar_adaptive_high_low_ordering: bool = False,
         trade_execution: bool = True,
+        quote_execution: bool = True,
         liquidity_consumption: bool = False,
         queue_position: bool = False,
         allow_cash_borrowing: bool = False,
@@ -606,6 +607,8 @@ cdef class BacktestEngine:
             - If Low is closer to Open than High then the processing order is Open, Low, High, Close.
         trade_execution : bool, default True
             If trades should be processed by the matching engine(s) (and move the market).
+        quote_execution : bool, default True
+            If quotes should be processed by the matching engine(s) (and move the market).
         liquidity_consumption : bool, default False
             If liquidity consumption should be tracked per price level. When enabled, fills
             consume available liquidity which resets when fresh data arrives at that level.
@@ -689,6 +692,7 @@ cdef class BacktestEngine:
             bar_execution=bar_execution,
             bar_adaptive_high_low_ordering=bar_adaptive_high_low_ordering,
             trade_execution=trade_execution,
+            quote_execution=quote_execution,
             liquidity_consumption=liquidity_consumption,
             queue_position=queue_position,
             price_protection_points=price_protection_points,
@@ -2863,6 +2867,8 @@ cdef class SimulatedExchange:
         marketable orders from executing at excessively aggressive prices.
     trade_execution : bool, default True
         If trades should be processed by the matching engine(s) (and move the market).
+    quote_execution : bool, default True
+        If quotes should be processed by the matching engine(s) (and move the market).
     liquidity_consumption : bool, default False
         If liquidity consumption should be tracked per price level. When enabled, fills
         consume available liquidity which resets when fresh data arrives at that level.
@@ -2926,6 +2932,7 @@ cdef class SimulatedExchange:
         bint bar_execution = True,
         bint bar_adaptive_high_low_ordering = False,
         bint trade_execution = True,
+        bint quote_execution = True,
         bint liquidity_consumption = False,
         bint queue_position = False,
         price_protection_points=None,
@@ -2976,6 +2983,7 @@ cdef class SimulatedExchange:
         self.bar_execution = bar_execution
         self.bar_adaptive_high_low_ordering = bar_adaptive_high_low_ordering
         self.trade_execution = trade_execution
+        self.quote_execution = quote_execution
         self.liquidity_consumption = liquidity_consumption
         self.queue_position = queue_position
         self.price_protection_points = price_protection_points if price_protection_points is not None else 0
@@ -3142,6 +3150,7 @@ cdef class SimulatedExchange:
             bar_execution=self.bar_execution,
             bar_adaptive_high_low_ordering=self.bar_adaptive_high_low_ordering,
             trade_execution=self.trade_execution,
+            quote_execution=self.quote_execution,
             liquidity_consumption=self.liquidity_consumption,
             queue_position=self.queue_position,
             price_protection_points=self.price_protection_points,
@@ -4038,6 +4047,8 @@ cdef class OrderMatchingEngine:
         If bars should be processed by the matching engine (and move the market).
     trade_execution : bool, default True
         If trades should be processed by the matching engine (and move the market).
+    quote_execution : bool, default True
+        If quotes should be processed by the matching engine (and move the market).
     liquidity_consumption : bool, default False
         If liquidity consumption should be tracked per price level.
     reject_stop_orders : bool, default True
@@ -4091,6 +4102,7 @@ cdef class OrderMatchingEngine:
         bint bar_execution = True,
         bint bar_adaptive_high_low_ordering = False,
         bint trade_execution = True,
+        bint quote_execution = True,
         bint liquidity_consumption = False,
         bint queue_position = False,
         price_protection_points=None,
@@ -4124,6 +4136,7 @@ cdef class OrderMatchingEngine:
         self._bar_execution = bar_execution
         self._bar_adaptive_high_low_ordering = bar_adaptive_high_low_ordering
         self._trade_execution = trade_execution
+        self._quote_execution = quote_execution
         self._liquidity_consumption = liquidity_consumption
         self._queue_position = queue_position
         self._price_protection_points = price_protection_points if price_protection_points is not None else 0
@@ -4609,6 +4622,9 @@ cdef class OrderMatchingEngine:
 
         """
         Condition.not_none(tick, "tick")
+
+        if not self._quote_execution:
+            return
 
         if is_logging_initialized():
             self._log.debug(f"Processing {tick!r}")
