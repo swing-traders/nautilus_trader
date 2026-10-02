@@ -119,6 +119,10 @@ cdef class CacheDatabaseFacade:
         """Abstract method (implement in subclass)."""
         raise NotImplementedError("method `load_index_order_client` must be implemented in the subclass")  # pragma: no cover
 
+    cpdef dict load_index_venue_position(self):
+        """Abstract method (implement in subclass)."""
+        raise NotImplementedError("method `load_index_venue_position` must be implemented in the subclass")  # pragma: no cover
+
     cpdef Currency load_currency(self, str code):
         """Abstract method (implement in subclass)."""
         raise NotImplementedError("method `load_currency` must be implemented in the subclass")  # pragma: no cover
@@ -187,6 +191,10 @@ cdef class CacheDatabaseFacade:
         """Abstract method (implement in subclass)."""
         raise NotImplementedError("method `index_order_position` must be implemented in the subclass")  # pragma: no cover
 
+    cpdef void index_venue_position(self, PositionId venue_position_id, PositionId position_id):
+        """Abstract method (implement in subclass)."""
+        raise NotImplementedError("method `index_venue_position` must be implemented in the subclass")  # pragma: no cover
+
     cpdef void update_account(self, Account event):
         """Abstract method (implement in subclass)."""
         raise NotImplementedError("method `update_account` must be implemented in the subclass")  # pragma: no cover
@@ -222,6 +230,10 @@ cdef class CacheDatabaseFacade:
     cpdef void delete_position(self, PositionId position_id):
         """Abstract method (implement in subclass)."""
         raise NotImplementedError("method `delete_position` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void delete_venue_position(self, PositionId venue_position_id):
+        """Abstract method (implement in subclass)."""
+        raise NotImplementedError("method `delete_venue_position` must be implemented in the subclass")  # pragma: no cover
 
     cpdef void delete_account_event(self, AccountId account_id, str event_id):
         """Abstract method (implement in subclass)."""

@@ -92,6 +92,8 @@ cdef class Cache(CacheFacade):
     cdef dict _index_order_position
     cdef dict _index_order_strategy
     cdef dict _index_order_client
+    cdef dict _index_venue_position
+    cdef dict _index_position_venues
     cdef dict _index_position_strategy
     cdef dict _index_position_orders
     cdef dict _index_instrument_orders
@@ -196,6 +198,7 @@ cdef class Cache(CacheFacade):
     cpdef void add_order(self, Order order, PositionId position_id=*, ClientId client_id=*, bint overwrite=*)
     cpdef void add_order_list(self, OrderList order_list)
     cpdef void add_position_id(self, PositionId position_id, Venue venue, ClientOrderId client_order_id, StrategyId strategy_id)
+    cpdef void add_venue_position_id(self, PositionId venue_position_id, PositionId position_id)
     cpdef void add_position(self, Position position, OmsType oms_type)
 
     cpdef void snapshot_position(self, Position position)

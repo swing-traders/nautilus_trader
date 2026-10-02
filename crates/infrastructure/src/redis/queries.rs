@@ -64,6 +64,7 @@ const INDEX_ORDERS_INFLIGHT: &str = "index:orders_inflight";
 const INDEX_POSITIONS: &str = "index:positions";
 const INDEX_POSITIONS_OPEN: &str = "index:positions_open";
 const INDEX_POSITIONS_CLOSED: &str = "index:positions_closed";
+const INDEX_VENUE_POSITION: &str = "index:venue_position";
 
 #[derive(Debug)]
 pub struct DatabaseQueries;
@@ -946,7 +947,9 @@ impl DatabaseQueries {
             | INDEX_POSITIONS
             | INDEX_POSITIONS_OPEN
             | INDEX_POSITIONS_CLOSED => Self::read_set(conn, key).await,
-            INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT => Self::read_hset(conn, key).await,
+            INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT | INDEX_VENUE_POSITION => {
+                Self::read_hset(conn, key).await
+            }
             _ => anyhow::bail!("Index unknown '{index_key}' on read"),
         }
     }

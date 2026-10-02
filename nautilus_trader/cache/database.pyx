@@ -92,6 +92,7 @@ cdef str _INDEX_ORDERS_INFLIGHT = "index:orders_inflight"
 cdef str _INDEX_POSITIONS = "index:positions"
 cdef str _INDEX_POSITIONS_OPEN = "index:positions_open"
 cdef str _INDEX_POSITIONS_CLOSED = "index:positions_closed"
+cdef str _INDEX_VENUE_POSITION = "index:venue_position"
 
 cdef str _SNAPSHOTS_ORDERS = "snapshots:orders"
 cdef str _SNAPSHOTS_POSITIONS = "snapshots:positions"
@@ -531,6 +532,22 @@ cdef class CacheDatabaseAdapter(CacheDatabaseFacade):
         cdef dict raw_index = msgspec.json.decode(result[0])
         return {ClientOrderId(k): ClientId(v) for k, v in raw_index.items()}
 
+    cpdef dict load_index_venue_position(self):
+        """
+        Load the venue position to position index from the database.
+
+        Returns
+        -------
+        dict[PositionId, PositionId]
+
+        """
+        cdef dict raw_index = {}
+        cdef list result = self._backing.read(_INDEX_VENUE_POSITION)
+        if result:
+            raw_index = msgspec.json.decode(result[0])
+
+        return {PositionId(k): PositionId(v) for k, v in raw_index.items()}
+
     cpdef Currency load_currency(self, str code):
         """
         Load the currency associated with the given currency code (if found).
@@ -866,6 +883,22 @@ cdef class CacheDatabaseAdapter(CacheDatabaseFacade):
 
         self._log.debug(f"Deleted position {repr(position_id)}")
 
+    cpdef void delete_venue_position(self, PositionId venue_position_id):
+        """
+        Delete the index entry for the given venue position ID from the database.
+
+        Parameters
+        ----------
+        venue_position_id : PositionId
+            The venue position ID to delete.
+
+        """
+        Condition.not_none(venue_position_id, "venue_position_id")
+
+        self._backing.delete(_INDEX_VENUE_POSITION, [venue_position_id.to_str().encode()])
+
+        self._log.debug(f"Deleted venue position index entry {venue_position_id!r}")
+
     cpdef void delete_account_event(self, AccountId account_id, str event_id):
         """
         Delete the given account event from the database.
@@ -1089,6 +1122,26 @@ cdef class CacheDatabaseAdapter(CacheDatabaseFacade):
         self._backing.insert(_INDEX_ORDER_POSITION, payload)
 
         self._log.debug(f"Indexed {client_order_id!r} -> {position_id!r}")
+
+    cpdef void index_venue_position(self, PositionId venue_position_id, PositionId position_id):
+        """
+        Add an index entry for the given `venue_position_id` to `position_id`.
+
+        Parameters
+        ----------
+        venue_position_id : PositionId
+            The venue position ID to index.
+        position_id : PositionId
+            The position ID to index.
+
+        """
+        Condition.not_none(venue_position_id, "venue_position_id")
+        Condition.not_none(position_id, "position_id")
+
+        cdef list payload = [venue_position_id.to_str().encode(), position_id.to_str().encode()]
+        self._backing.insert(_INDEX_VENUE_POSITION, payload)
+
+        self._log.debug(f"Indexed venue {venue_position_id!r} -> {position_id!r}")
 
     cpdef void update_actor(self, Actor actor):
         """

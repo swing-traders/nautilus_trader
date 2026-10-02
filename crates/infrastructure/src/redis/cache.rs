@@ -118,6 +118,7 @@ const INDEX_ORDERS_INFLIGHT: &str = "index:orders_inflight";
 const INDEX_POSITIONS: &str = "index:positions";
 const INDEX_POSITIONS_OPEN: &str = "index:positions_open";
 const INDEX_POSITIONS_CLOSED: &str = "index:positions_closed";
+const INDEX_VENUE_POSITION: &str = "index:venue_position";
 
 /// Configuration for a Redis-backed cache database.
 ///
@@ -959,7 +960,7 @@ fn insert_index(pipe: &mut Pipeline, key: &str, value: &[Bytes]) -> anyhow::Resu
             insert_set(pipe, key, value[0].as_ref());
             Ok(())
         }
-        INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT => {
+        INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT | INDEX_VENUE_POSITION => {
             insert_hset(pipe, key, value[0].as_ref(), value[1].as_ref());
             Ok(())
         }
@@ -1065,7 +1066,7 @@ fn delete_from_index(
             remove_from_set(pipe, key, value[0].as_ref());
             Ok(())
         }
-        INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT => {
+        INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT | INDEX_VENUE_POSITION => {
             remove_from_hash(pipe, key, value[0].as_ref());
             Ok(())
         }
@@ -1994,5 +1995,34 @@ mod tests {
     fn test_get_collection_key_invalid() {
         let key = "no_delimiter";
         assert!(get_collection_key(key).is_err());
+    }
+
+    #[rstest]
+    fn test_insert_index_sets_a_venue_position_hash_field() {
+        let key = "trader-tester-123:index:venue_position";
+        let mut pipe = redis::pipe();
+
+        insert_index(
+            &mut pipe,
+            key,
+            &[Bytes::from("8133477"), Bytes::from("EURUSD.MT5-LONG-7")],
+        )
+        .unwrap();
+
+        let mut expected = redis::pipe();
+        expected.hset(key, "8133477".as_bytes(), "EURUSD.MT5-LONG-7".as_bytes());
+        assert_eq!(pipe.get_packed_pipeline(), expected.get_packed_pipeline());
+    }
+
+    #[rstest]
+    fn test_delete_from_index_removes_a_venue_position_hash_field() {
+        let key = "trader-tester-123:index:venue_position";
+        let mut pipe = redis::pipe();
+
+        delete_from_index(&mut pipe, key, Some(vec![Bytes::from("8133477")])).unwrap();
+
+        let mut expected = redis::pipe();
+        expected.hdel(key, "8133477".as_bytes());
+        assert_eq!(pipe.get_packed_pipeline(), expected.get_packed_pipeline());
     }
 }

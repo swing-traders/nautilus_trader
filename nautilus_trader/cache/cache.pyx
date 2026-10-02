@@ -152,6 +152,8 @@ cdef class Cache(CacheFacade):
         self._index_order_position: dict[ClientOrderId, PositionId] = {}
         self._index_order_strategy: dict[ClientOrderId, StrategyId] = {}
         self._index_order_client: dict[ClientOrderId, ClientId] = {}
+        self._index_venue_position: dict[PositionId, PositionId] = {}
+        self._index_position_venues: dict[PositionId, set[PositionId]] = {}
         self._index_position_strategy: dict[PositionId, StrategyId] = {}
         self._index_position_orders: dict[PositionId, set[ClientOrderId]] = {}
         self._index_instrument_orders: dict[InstrumentId, set[ClientOrderId]] = {}
@@ -394,6 +396,10 @@ cdef class Cache(CacheFacade):
             self._orders = self._database.load_orders()
             self._index_order_position = self._database.load_index_order_position()
             self._index_order_client = self._database.load_index_order_client()
+            self._index_venue_position = self._database.load_index_venue_position()
+            self._index_position_venues = {}
+            for venue_position_id, position_id in self._index_venue_position.items():
+                self._index_position_venues.setdefault(position_id, set()).add(venue_position_id)
         else:
             self._orders = {}
 
@@ -1085,6 +1091,10 @@ cdef class Cache(CacheFacade):
         self._index_positions_open.discard(position_id)
         self._index_positions_closed.discard(position_id)
 
+        cdef set venue_position_ids = self._index_position_venues.pop(position_id, set())
+        for venue_position_id in venue_position_ids:
+            self._index_venue_position.pop(venue_position_id, None)
+
         # Remove position snapshots and clean up index
         cdef set[PositionId] snapshot_position_ids
         cdef list[bytes] snapshots = self._position_snapshots.pop(position_id, None)
@@ -1100,6 +1110,8 @@ cdef class Cache(CacheFacade):
         # Delete from database if requested
         if purge_from_database and self._database is not None:
             self._database.delete_position(position_id)
+            for venue_position_id in venue_position_ids:
+                self._database.delete_venue_position(venue_position_id)
 
     cpdef void purge_instrument(self, InstrumentId instrument_id, bint purge_from_database = False):
         """
@@ -1250,6 +1262,8 @@ cdef class Cache(CacheFacade):
         self._index_order_position.clear()
         self._index_order_strategy.clear()
         self._index_order_client.clear()
+        self._index_venue_position.clear()
+        self._index_position_venues.clear()
         self._index_position_strategy.clear()
         self._index_position_orders.clear()
         self._index_instrument_orders.clear()
@@ -2348,6 +2362,48 @@ cdef class Cache(CacheFacade):
             f"client_order_id={client_order_id}, "
             f"strategy_id={strategy_id})",
         )
+
+    cpdef void add_venue_position_id(self, PositionId venue_position_id, PositionId position_id):
+        """
+        Bind the given venue position ID to the position ID its fills are booked under.
+
+        The first binding of a venue ID wins, as a venue reuses no position ID while one of ours is
+        open; a position re-entered at the venue is bound from each of its venue IDs.
+
+        Parameters
+        ----------
+        venue_position_id : PositionId
+            The position ID the venue attributes the fills to.
+        position_id : PositionId
+            The position ID the fills are booked under.
+
+        """
+        Condition.not_none(venue_position_id, "venue_position_id")
+        Condition.not_none(position_id, "position_id")
+
+        cdef PositionId bound_position_id = self._index_venue_position.get(venue_position_id)
+        cdef set venue_position_ids
+        if bound_position_id is None:
+            self._index_venue_position[venue_position_id] = position_id
+
+            if self._database is not None:
+                self._database.index_venue_position(venue_position_id, position_id)
+
+            venue_position_ids = self._index_position_venues.get(position_id)
+            if venue_position_ids is None:
+                self._index_position_venues[position_id] = {venue_position_id}
+                self._log.debug(f"Bound venue {venue_position_id!r} to {position_id!r}")
+            else:
+                self._log.info(
+                    f"Bound venue {venue_position_id!r} to {position_id!r}, "
+                    f"already bound from {sorted([v.value for v in venue_position_ids])}",
+                )
+                venue_position_ids.add(venue_position_id)
+        elif bound_position_id != position_id:
+            self._log.error(
+                f"Cannot bind venue {venue_position_id!r} to {position_id!r}: "
+                f"already bound to {bound_position_id!r}",
+            )
 
     cpdef void add_position(self, Position position, OmsType oms_type):
         """
@@ -5466,6 +5522,42 @@ cdef class Cache(CacheFacade):
         Condition.not_none(client_order_id, "client_order_id")
 
         return self._index_order_position.get(client_order_id)
+
+    cpdef PositionId position_id_for_venue(self, PositionId venue_position_id):
+        """
+        Return the position ID the given venue position ID is bound to (if bound).
+
+        Parameters
+        ----------
+        venue_position_id : PositionId
+            The position ID the venue attributes the position's fills to.
+
+        Returns
+        -------
+        PositionId or ``None``
+
+        """
+        Condition.not_none(venue_position_id, "venue_position_id")
+
+        return self._index_venue_position.get(venue_position_id)
+
+    cpdef frozenset venue_position_ids(self, PositionId position_id):
+        """
+        Return the venue position IDs bound to the given position ID.
+
+        Parameters
+        ----------
+        position_id : PositionId
+            The position ID the fills are booked under.
+
+        Returns
+        -------
+        frozenset[PositionId]
+
+        """
+        Condition.not_none(position_id, "position_id")
+
+        return frozenset(self._index_position_venues.get(position_id, ()))
 
     cpdef list position_snapshots(self, PositionId position_id = None, AccountId account_id = None):
         """

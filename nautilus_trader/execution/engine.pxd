@@ -175,6 +175,7 @@ cdef class ExecutionEngine(Component):
     cpdef bint _apply_event_to_order(self, Order order, OrderEvent event)
     cpdef void _handle_order_fill(self, Order order, OrderFilled fill, OmsType oms_type)
     cdef bint _is_leg_fill(self, OrderFilled fill)
+    cdef bint _is_cache_position_id(self, PositionId position_id)
     cdef void _send_fill_to_portfolio_before_position_update(self, OrderFilled fill)
     cdef void _handle_position_update(self, Instrument instrument, OrderFilled fill, OmsType oms_type)
     cdef bint _reject_reduce_only_netting_position_open(self, OrderFilled fill, OmsType oms_type)
