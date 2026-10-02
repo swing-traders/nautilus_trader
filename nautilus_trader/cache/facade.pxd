@@ -68,7 +68,6 @@ cdef class CacheDatabaseFacade:
     cpdef dict load_positions(self)
     cpdef dict load_index_order_position(self)
     cpdef dict load_index_order_client(self)
-    cpdef dict load_index_venue_position(self)
     cpdef Currency load_currency(self, str code)
     cpdef Instrument load_instrument(self, InstrumentId instrument_id)
     cpdef SyntheticInstrument load_synthetic(self, InstrumentId instrument_id)
@@ -88,7 +87,6 @@ cdef class CacheDatabaseFacade:
 
     cpdef void index_venue_order_id(self, ClientOrderId client_order_id, VenueOrderId venue_order_id)
     cpdef void index_order_position(self, ClientOrderId client_order_id, PositionId position_id)
-    cpdef void index_venue_position(self, PositionId venue_position_id, PositionId position_id)
 
     cpdef void update_account(self, Account account)
     cpdef void update_order(self, Order order)
@@ -101,7 +99,6 @@ cdef class CacheDatabaseFacade:
 
     cpdef void delete_order(self, ClientOrderId client_order_id)
     cpdef void delete_position(self, PositionId position_id)
-    cpdef void delete_venue_position(self, PositionId venue_position_id)
     cpdef void delete_account_event(self, AccountId account_id, str event_id)
     cpdef void delete_actor(self, ComponentId component_id)
     cpdef void delete_strategy(self, StrategyId strategy_id)

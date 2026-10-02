@@ -288,44 +288,6 @@ class TestExecutionEngineLegFills:
         assert position.quantity == Quantity.from_int(5)
         assert str(position.avg_px_open) == "52.95"
 
-    def test_hedging_leg_fill_under_venue_position_id_binds_it_to_the_leg_position(self):
-        # Arrange
-        self.exec_engine._oms_overrides[self.strategy_id] = OmsType.HEDGING
-        client_order_id = ClientOrderId("O-20260312-083715-000-000-1-LEG-E1AQ5 C6400")
-        first_fill = self.create_leg_fill(
-            instrument_id=self.call_option.id,
-            client_order_id=client_order_id,
-            venue_order_id=VenueOrderId("213-LEG-0"),
-            trade_id=TradeId("0000e1a7.6882c67b.03.01-0"),
-            side=OrderSide.BUY,
-            quantity=3,
-            price=52.75,
-        )
-        self.exec_engine._handle_leg_fill_without_order(first_fill)
-        leg_position_id = self.cache.positions()[0].id
-        venue_position_id = PositionId("8133477")
-
-        second_fill = self.create_leg_fill(
-            instrument_id=self.call_option.id,
-            client_order_id=client_order_id,
-            venue_order_id=VenueOrderId("214-LEG-0"),
-            trade_id=TradeId("0000e1a7.6882c67b.04.01-0"),
-            side=OrderSide.BUY,
-            quantity=2,
-            price=53.25,
-            position_id=venue_position_id,
-        )
-
-        # Act
-        self.exec_engine._handle_leg_fill_without_order(second_fill)
-
-        # Assert
-        assert second_fill.position_id == leg_position_id
-        assert [position.id for position in self.cache.positions()] == [leg_position_id]
-        assert self.cache.position(leg_position_id).quantity == Quantity.from_int(5)
-        assert self.cache.position_id_for_venue(venue_position_id) == leg_position_id
-        assert self.cache.venue_position_ids(leg_position_id) == frozenset({venue_position_id})
-
     def test_handle_leg_fill_without_order_missing_instrument(self):
         """
         Test handling of leg fill when instrument is not in cache.

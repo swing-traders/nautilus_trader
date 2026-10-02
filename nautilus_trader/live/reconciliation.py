@@ -856,10 +856,10 @@ def _side_deficit_opens(
     deficit: Decimal,
     size_precision: int,
 ) -> list[PositionRepairIntent]:
-    # What the side's cache exposure leaves uncovered is opened under the IDs which reported that
-    # side, each capped at what its own rows hold beyond the cache positions already carrying that
-    # ID, so a repair never grows an ID past its rows. A remainder no reported ID can carry is left
-    # unrepaired rather than fabricated unbound.
+    # What the side's cache exposure leaves uncovered is opened under the venue IDs which
+    # reported that side, each capped at what its own row holds beyond the cache positions
+    # already carrying that ID, so a repair never grows an ID past its row. A remainder no
+    # reported ID can carry is left unrepaired rather than fabricated unbound.
     cached_by_id: dict[PositionId, Decimal] = {}
 
     for position in targets:
@@ -920,12 +920,12 @@ def _diff_by_venue_position_id(
     positions_open: list[Position],
     size_precision: int,
 ) -> list[PositionRepairIntent]:
-    # An ID-bearing snapshot compares per side: the venue's exposure on a side is the sum of its
-    # rows there, and the cache's is the sum of its open positions on that side whatever ID they are
-    # held under, virtual IDs included. A report's ID names a cache position only once bound to it,
-    # and only directs where a deficit opens: counting the cache by label hides the exposure held
-    # elsewhere and fabricates against a side which is already covered, so the side's trim stays
-    # label-blind.
+    # An ID-bearing snapshot compares per side: the venue's exposure on a side is the sum
+    # of its rows there, and the cache's is the sum of its open positions on that side
+    # whatever ID they are held under, virtual IDs included. A venue position ID labels the
+    # venue's own rows and is never a handle on a cache position, so counting the cache by
+    # label hides the exposure held elsewhere and fabricates against a side which is
+    # already covered.
     trims: list[PositionRepairIntent] = []
     opens: list[PositionRepairIntent] = []
 
@@ -1028,7 +1028,7 @@ def diff_position_scope(
     size increment compares equal while a difference of one increment or more is a
     discrepancy. Repair quantities are placed at the same declared precision, rounded
     toward zero. A trim binds to the cache position it reduces; an opening binds to the
-    position ID of the report which carried the uncovered quantity, when it has one.
+    venue position ID which reported the uncovered quantity, when the venue gave one.
 
     Parameters
     ----------

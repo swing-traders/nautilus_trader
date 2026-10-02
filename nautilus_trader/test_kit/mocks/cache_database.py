@@ -54,7 +54,6 @@ class MockCacheDatabase(CacheDatabaseFacade):
         self.last_heartbeat: int = 0
         self._index_order_position: dict[ClientOrderId, PositionId] = {}
         self._index_order_client: dict[ClientOrderId, ClientId] = {}
-        self._index_venue_position: dict[PositionId, PositionId] = {}
 
     def flush(self) -> None:
         self.general.clear()
@@ -69,7 +68,6 @@ class MockCacheDatabase(CacheDatabaseFacade):
         self.last_heartbeat = 0
         self._index_order_position.clear()
         self._index_order_client.clear()
-        self._index_venue_position.clear()
 
     def load_all(self) -> dict:
         return {
@@ -123,9 +121,6 @@ class MockCacheDatabase(CacheDatabaseFacade):
     def load_index_order_client(self) -> dict[ClientOrderId, ClientId]:
         return self._index_order_client
 
-    def load_index_venue_position(self) -> dict[PositionId, PositionId]:
-        return self._index_venue_position.copy()
-
     def load_position(self, position_id: PositionId) -> Position | None:
         return self.positions.get(position_id)
 
@@ -162,15 +157,6 @@ class MockCacheDatabase(CacheDatabaseFacade):
 
     def index_order_position(self, client_order_id: ClientOrderId, position_id: PositionId) -> None:
         self._index_order_position[client_order_id] = position_id
-
-    def index_venue_position(self, venue_position_id: PositionId, position_id: PositionId) -> None:
-        self._index_venue_position[venue_position_id] = position_id
-
-    def delete_position(self, position_id: PositionId) -> None:
-        self.positions.pop(position_id, None)
-
-    def delete_venue_position(self, venue_position_id: PositionId) -> None:
-        self._index_venue_position.pop(venue_position_id, None)
 
     def update_account(self, event: Account) -> None:
         pass  # Would persist the event

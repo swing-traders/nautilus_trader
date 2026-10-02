@@ -198,8 +198,6 @@ cdef class CacheFacade:
     cpdef Position position(self, PositionId position_id)
     cpdef Position position_for_order(self, ClientOrderId client_order_id)
     cpdef PositionId position_id(self, ClientOrderId client_order_id)
-    cpdef PositionId position_id_for_venue(self, PositionId venue_position_id)
-    cpdef frozenset venue_position_ids(self, PositionId position_id)
     cpdef set[PositionId] position_snapshot_ids(self, InstrumentId instrument_id=*, AccountId account_id=*)
     cpdef list position_snapshots(self, PositionId position_id=*, AccountId account_id=*)
     cpdef list position_snapshot_bytes(self, PositionId position_id)

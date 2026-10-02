@@ -1305,12 +1305,11 @@ class LiveExecutionEngine(ExecutionEngine):
         reports: list[PositionStatusReport],
         size_precision: int,
     ) -> tuple[list[PositionStatusReport], str | None]:
-        # Reports keyed by venue position ID carry set semantics, so identical duplicates collapse
-        # while a conflicting duplicate makes the snapshot incomplete. The IDs compare as the
-        # venue's own and never through their bindings, since several of the venue's rows can be
-        # bound to one cache position. A scope mixing both granularities cannot be compared at
-        # either, so it is incomplete too. Pairing each ID-bearing report with its ID carries the
-        # partition's guarantee into the type, so the dedup below never re-tests for `None`.
+        # Reports keyed by venue position ID carry set semantics, so identical duplicates
+        # collapse while a conflicting duplicate makes the snapshot incomplete. A scope
+        # mixing both granularities cannot be compared at either, so it is incomplete too.
+        # Pairing each ID-bearing report with its ID carries the partition's guarantee
+        # into the type, so the dedup below never re-tests for `None`.
         id_bearing: list[tuple[PositionId, PositionStatusReport]] = [
             (r.venue_position_id, r) for r in reports if r.venue_position_id is not None
         ]
@@ -1480,37 +1479,10 @@ class LiveExecutionEngine(ExecutionEngine):
             )
 
         return diff_position_scope(
-            [self._bound_position_report(report) for report in scope.reports],
+            list(scope.reports),
             positions_open,
             instrument.size_precision,
         )
-
-    def _bound_position_report(self, report: PositionStatusReport) -> PositionStatusReport:
-        # The diff compares and opens per report ID, so a venue ID bound to a cache position is
-        # re-stamped with the position it names
-        if report.venue_position_id is not None:
-            position_id = self._cache.position_id_for_venue(report.venue_position_id)
-            if position_id is not None:
-                return PositionStatusReport(
-                    account_id=report.account_id,
-                    instrument_id=report.instrument_id,
-                    position_side=report.position_side,
-                    quantity=report.quantity,
-                    report_id=report.id,
-                    ts_last=report.ts_last,
-                    ts_init=report.ts_init,
-                    venue_position_id=position_id,
-                    avg_px_open=report.avg_px_open,
-                )
-
-        return report
-
-    def _reported_position_id(self, report: PositionStatusReport) -> PositionId:
-        position_id = self._cache.position_id_for_venue(report.venue_position_id)
-        if position_id is not None:
-            return position_id
-
-        return report.venue_position_id
 
     def _position_repair_deferral(
         self,
@@ -3284,19 +3256,6 @@ class LiveExecutionEngine(ExecutionEngine):
             self._log_skipping_reconciliation_on_instrument_id(report)
             return True  # Filtered
 
-        if report.venue_position_id is not None:
-            # A report is truth for its own venue row alone, so a position bound from several venue
-            # IDs is left to the convergence pass, which compares it with all of its rows
-            position_id = self._reported_position_id(report)
-            venue_position_ids = self._cache.venue_position_ids(position_id)
-            if len(venue_position_ids) > 1:
-                self._log.debug(
-                    f"Deferring {report.instrument_id} {report.venue_position_id!r} to the "
-                    f"convergence pass: {position_id!r} is bound from "
-                    f"{sorted(v.value for v in venue_position_ids)}",
-                )
-                return True  # Deferred to a complete snapshot
-
         if self._is_position_report_stale(report):
             return True  # Snapshot is stale on the cache's timestamp axis
 
@@ -3324,7 +3283,7 @@ class LiveExecutionEngine(ExecutionEngine):
         ts_last_applied: int | None
 
         if report.venue_position_id is not None:
-            position = self._cache.position(self._reported_position_id(report))
+            position = self._cache.position(report.venue_position_id)
             ts_last_applied = position.ts_last if position is not None else None
         else:
             positions_open = self._cache.positions_open(
@@ -3367,8 +3326,7 @@ class LiveExecutionEngine(ExecutionEngine):
             LogColor.BLUE,
         )
 
-        reported_position_id = self._reported_position_id(report)
-        position: Position | None = self._cache.position(reported_position_id)
+        position: Position | None = self._cache.position(report.venue_position_id)
 
         if position is not None and (
             position.instrument_id != report.instrument_id
@@ -3414,7 +3372,7 @@ class LiveExecutionEngine(ExecutionEngine):
             )
             position_id = self._resolve_position_repair_id(
                 scope,
-                reported_position_id,
+                report.venue_position_id,
                 strategy_id,
             )
 
@@ -3530,13 +3488,12 @@ class LiveExecutionEngine(ExecutionEngine):
         scope: PositionScopeSnapshot,
         report: PositionStatusReport,
     ) -> list[Position]:
-        # The reported side's exposure is what the report is truth for, so the comparison takes the
-        # position the reported ID names plus the side's exposure held under unbound virtual IDs,
-        # which carry no venue claim. A position under another venue ID is that ID's own business: a
-        # single report is never absence authority for it.
+        # The reported side's exposure is what the report is truth for, so the comparison
+        # takes the position under the reported ID plus the side's exposure held under
+        # virtual IDs, which carry no venue claim. A position under another venue ID is
+        # that ID's own business: a single report is never absence authority for it.
         targets: list[Position] = []
-        reported_position_id = self._reported_position_id(report)
-        labelled = self._cache.position(reported_position_id)
+        labelled = self._cache.position(report.venue_position_id)
 
         if (
             labelled is not None
@@ -3557,8 +3514,7 @@ class LiveExecutionEngine(ExecutionEngine):
             if (
                 position.side == report.position_side
                 and position.id.value.startswith(VIRTUAL_POSITION_ID_PREFIX)
-                and position.id != reported_position_id
-                and not self._cache.venue_position_ids(position.id)
+                and position.id != report.venue_position_id
             ):
                 targets.append(position)
 

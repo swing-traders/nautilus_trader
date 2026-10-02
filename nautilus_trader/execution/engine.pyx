@@ -1391,12 +1391,6 @@ cdef class ExecutionEngine(Component):
         if oms_type == OmsType.HEDGING:
             if position_id is None:
                 position_id = self._determine_hedging_position_id(fill)
-            elif (
-                fill.position_id is not None
-                and fill.position_id != position_id
-                and not self._is_cache_position_id(fill.position_id)
-            ):
-                self._cache.add_venue_position_id(fill.position_id, position_id)
         elif oms_type == OmsType.NETTING:
             # Assign netted position ID
             position_id = self._determine_netting_position_id(fill)
@@ -1467,15 +1461,11 @@ cdef class ExecutionEngine(Component):
 
         if position_id is not None:
             if fill.position_id is not None and fill.position_id != position_id:
-                # Any other ID is the venue's own for the position, bound before it is replaced
-                if self._is_cache_position_id(fill.position_id):
-                    self._log.warning(
-                        "Incorrect position ID assigned to fill: "
-                        f"cached={position_id!r}, assigned={fill.position_id!r}; "
-                        "re-assigning from cache",
-                    )
-                else:
-                    self._cache.add_venue_position_id(fill.position_id, position_id)
+                self._log.warning(
+                    "Incorrect position ID assigned to fill: "
+                    f"cached={position_id!r}, assigned={fill.position_id!r}; "
+                    "re-assigning from cache",
+                )
 
             # Assign position ID to fill
             fill.position_id = position_id
@@ -1523,16 +1513,6 @@ cdef class ExecutionEngine(Component):
     cpdef PositionId _determine_hedging_position_id(self, OrderFilled fill, Order order=None):
         cdef PositionId position_id
         if fill.position_id is not None:
-            position_id = self._cache.position_id_for_venue(fill.position_id)
-            if position_id is not None:
-                if self.debug:
-                    self._log.debug(
-                        f"Venue {fill.position_id!r} is bound to {position_id!r}",
-                        LogColor.MAGENTA,
-                    )
-
-                return position_id
-
             if self.debug:
                 self._log.debug(f"Already had a position ID of: {fill.position_id!r}", LogColor.MAGENTA)
 
@@ -1580,13 +1560,6 @@ cdef class ExecutionEngine(Component):
 
     cpdef PositionId _determine_netting_position_id(self, OrderFilled fill):
         return PositionId(f"{fill.instrument_id}-{fill.strategy_id}")
-
-    cdef bint _is_cache_position_id(self, PositionId position_id):
-        # An ID already assigned to orders is the cache's even before its position opens
-        return (
-            self._cache.position_exists(position_id)
-            or len(self._cache.orders_for_position(position_id)) > 0
-        )
 
     cdef bint _check_overfill(self, Order order, OrderFilled fill):
         cdef Quantity potential_overfill = order.calculate_overfill_c(fill.last_qty)
