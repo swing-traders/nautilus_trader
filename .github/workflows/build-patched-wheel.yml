@@ -12,6 +12,10 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
@@ -23,7 +27,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Build wheel (release)
         env:
@@ -44,7 +48,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel
+          name: wheel-${{ matrix.python-version }}
           path: dist/nautilus_trader-*
 
   release:
@@ -56,7 +60,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: wheel
+          pattern: wheel-*
+          merge-multiple: true
           path: dist
 
       - uses: softprops/action-gh-release@v2
