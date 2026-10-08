@@ -163,6 +163,7 @@ cdef class Portfolio(PortfolioFacade):
         self._bet_positions: dict[InstrumentId, object] = {}
         self._index_bet_positions: dict[InstrumentId, set[PositionId]] = defaultdict(set)
         self._pending_calcs: set[InstrumentId] = set()
+        self._pending_xrates: set[InstrumentId] = set()
         self._bar_close_prices: dict[InstrumentId, Price] = {}
         self._last_account_state_log_ts: dict[AccountId, uint64_t] = {}
         self._venues_missing_price: dict[Venue, set[InstrumentId]] = {}
@@ -287,7 +288,9 @@ cdef class Portfolio(PortfolioFacade):
                     ts_event=account.last_event_c().ts_event,
                 )
                 if not result:
-                    initialized = False
+                    # A rate missing at initialization is not yet known: the instrument stays
+                    # pending until an update supplies it
+                    self._add_pending_xrate(instrument.id)
 
             if not initialized:
                 break
@@ -374,7 +377,9 @@ cdef class Portfolio(PortfolioFacade):
                     ts_event=account.last_event_c().ts_event,
                 )
                 if not result:
-                    initialized = False
+                    # A rate missing at initialization is not yet known: the instrument stays
+                    # pending until an update supplies it
+                    self._add_pending_xrate(instrument_id)
 
         cdef int open_count = len(all_positions_open)
         self._log.info(
@@ -577,7 +582,7 @@ cdef class Portfolio(PortfolioFacade):
         )
         if not result:
             self._log.debug(f"Added pending calculation for {instrument.id}")
-            self._pending_calcs.add(instrument.id)
+            self._add_pending_xrate(instrument.id)
 
         # Always update account state for cash accounts on non-fill events, or when update_orders succeeded
         if account.is_cash_account or not isinstance(event, OrderFilled):
@@ -780,6 +785,7 @@ cdef class Portfolio(PortfolioFacade):
         self._realized_pnls.clear()
         self._unrealized_pnls.clear()
         self._pending_calcs.clear()
+        self._pending_xrates.clear()
         self._snapshot_sum_per_position.clear()
         self._snapshot_last_per_position.clear()
         self._snapshot_processed_counts.clear()
@@ -1969,20 +1975,44 @@ cdef class Portfolio(PortfolioFacade):
         # Invalidate cached PnLs for this instrument (all accounts)
         self._unrealized_pnls.pop(instrument_id, None)
 
-        if self.initialized:
-            return
+        if not self._pending_calcs:
+            return  # Nothing pending
 
-        if instrument_id not in self._pending_calcs:
-            return
+        # Every pending instrument is retried, since one instrument's update can supply the rate
+        # another instrument's calculations wait for
+        cdef InstrumentId pending_id
+        for pending_id in list(self._pending_calcs):
+            self._update_pending_instrument(pending_id)
 
+    cdef void _update_pending_instrument(self, InstrumentId instrument_id):
         cdef list orders_open = self._cache.orders_open(
             venue=None,  # Faster query filtering
             instrument_id=instrument_id,
         )
         cdef dict orders_by_account = self._group_by_account_id(orders_open)
 
+        # An account holding positions or position snapshots without open orders still has
+        # calculations pending
+        cdef list positions = self._cache.positions(
+            venue=None,  # Faster query filtering
+            instrument_id=instrument_id,
+        )
+        cdef AccountId account_id
+        for account_id in self._group_by_account_id(positions):
+            orders_by_account.setdefault(account_id, [])
+
+        self._ensure_snapshot_pnls_cached_for(instrument_id)
+        cdef PositionId snapshot_id
+        for snapshot_id in self._cache.position_snapshot_ids(instrument_id):
+            account_id = self._snapshot_account_ids.get(snapshot_id)
+            if account_id is not None:
+                orders_by_account.setdefault(account_id, [])
+
+        # Only a missing rate fails a margin calculation, so an instrument waiting on a price alone
+        # keeps the margins its last order or position event computed
+        cdef bint awaits_xrate = instrument_id in self._pending_xrates
+
         cdef:
-            AccountId account_id
             list account_orders
             Account account
             Instrument instrument
@@ -1991,8 +2021,8 @@ cdef class Portfolio(PortfolioFacade):
             bint result_maint
             list positions_open
             Money result_unrealized_pnl
-            bint account_initialized
-            list accounts_initialized = []
+            Money result_realized_pnl
+            list accounts_complete = []
         for account_id, account_orders in orders_by_account.items():
             account = self._cache.account(account_id)
             if account is None:
@@ -2008,47 +2038,63 @@ cdef class Portfolio(PortfolioFacade):
                 )
                 return  # No instrument found
 
-            # Initialize initial (order) margin
-            result_init = self._accounts.update_orders(
-                account=account,
-                instrument=instrument,
-                orders_open=[o for o in account_orders if o.is_passive_c()],
-                ts_event=account.last_event_c().ts_event,
-            )
+            result_init = True
+            result_maint = True
+            if awaits_xrate:
+                if account_orders:
+                    # Initialize initial (order) margin
+                    result_init = self._accounts.update_orders(
+                        account=account,
+                        instrument=instrument,
+                        orders_open=[o for o in account_orders if o.is_passive_c()],
+                        ts_event=account.last_event_c().ts_event,
+                    )
 
-            result_maint = False
-            if account.is_margin_account:
-                positions_open = self._cache.positions_open(
-                    venue=None,  # Faster query filtering
-                    instrument_id=instrument_id,
-                    strategy_id=None,
-                    side=PositionSide.NO_POSITION_SIDE,
-                    account_id=account_id,
-                )
+                if account.is_margin_account:
+                    positions_open = self._cache.positions_open(
+                        venue=None,  # Faster query filtering
+                        instrument_id=instrument_id,
+                        strategy_id=None,
+                        side=PositionSide.NO_POSITION_SIDE,
+                        account_id=account_id,
+                    )
 
-                # Initialize maintenance (position) margin
-                result_maint = self._accounts.update_positions(
-                    account=account,
-                    instrument=instrument,
-                    positions_open=positions_open,
-                    ts_event=account.last_event_c().ts_event,
-                )
+                    # Initialize maintenance (position) margin
+                    result_maint = self._accounts.update_positions(
+                        account=account,
+                        instrument=instrument,
+                        positions_open=positions_open,
+                        ts_event=account.last_event_c().ts_event,
+                    )
 
-            # Calculate unrealized PnL
             result_unrealized_pnl = self._calculate_unrealized_pnl(
                 instrument_id=instrument_id,
                 price=None,
                 account_id=account_id
             )
+            result_realized_pnl = self._calculate_realized_pnl(instrument_id, account_id)
 
-            # Check portfolio initialization
-            account_initialized = result_init and (account.is_cash_account or (result_maint and result_unrealized_pnl is not None))
-            accounts_initialized.append(account_initialized)
+            accounts_complete.append(
+                result_init
+                and result_maint
+                and result_unrealized_pnl is not None
+                and result_realized_pnl is not None
+            )
 
-        if all(accounts_initialized):
+        if all(accounts_complete):
             self._pending_calcs.discard(instrument_id)
+            if awaits_xrate:
+                # PnL aggregated while this instrument's contribution was unknown is recomputed
+                self._pending_xrates.discard(instrument_id)
+                self._realized_pnls.pop(instrument_id, None)
+                self._unrealized_pnls.pop(instrument_id, None)
+
             if not self._pending_calcs:
                 self.initialized = True
+
+    cdef void _add_pending_xrate(self, InstrumentId instrument_id):
+        self._pending_calcs.add(instrument_id)
+        self._pending_xrates.add(instrument_id)
 
     cdef dict _group_by_account_id(self, list items):
         # Note: could be a generic function in rust
@@ -2158,6 +2204,7 @@ cdef class Portfolio(PortfolioFacade):
         cdef bint attempted_calculation = False
         cdef bint any_conversion_failed = False
         cdef Money native_pnl
+        cdef dict native_pnls = {}
         for account_id in account_ids:
             # Calculate in native currency for caching
             if is_realized:
@@ -2167,10 +2214,8 @@ cdef class Portfolio(PortfolioFacade):
 
             attempted_calculation = True
 
-            # Cache the native currency PnL (only if using current market price, not a specific price)
             if native_pnl is not None:
-                if should_cache:
-                    pnl_cache.setdefault(instrument_id, {})[account_id] = native_pnl
+                native_pnls[account_id] = native_pnl
 
                 # Convert to target_currency if needed for aggregation
                 if target_currency is not None:
@@ -2186,6 +2231,12 @@ cdef class Portfolio(PortfolioFacade):
 
                 if account_pnl is not None:
                     total_pnl = self._add_pnl_to_total(total_pnl, account_pnl, "unrealized" if not is_realized else "realized", venue=instrument_id.venue, target_currency=target_currency)
+
+        # Cache the native currency PnLs (only if using current market price, not a specific price);
+        # while a contribution waits on a missing rate none is cached, as their sum would omit it
+        if should_cache and instrument_id not in self._pending_xrates:
+            for account_id, native_pnl in native_pnls.items():
+                pnl_cache.setdefault(instrument_id, {})[account_id] = native_pnl
 
         # Return None if any conversion failed (prevents partial totals)
         if any_conversion_failed:
@@ -2462,6 +2513,7 @@ cdef class Portfolio(PortfolioFacade):
             double contribution
             AccountId snapshot_account_id
             Position position
+            object xrate_result
             double xrate
             PriceType conv_price_type
             Instrument instrument
@@ -2495,7 +2547,7 @@ cdef class Portfolio(PortfolioFacade):
                 # Respect use_mark_xrates config for snapshot conversions
                 instrument = self._cache.instrument(instrument_id)
                 conv_price_type = PriceType.MARK if self._use_mark_xrates else PriceType.MID
-                xrate = self._cache.get_xrate(
+                xrate_result = self._cache.get_xrate(
                     venue=instrument.id.venue,
                     from_currency=sum_pnl.currency,
                     to_currency=currency,
@@ -2503,17 +2555,25 @@ cdef class Portfolio(PortfolioFacade):
                 )
 
                 # Fallback to MID if MARK not available
-                if xrate is None and conv_price_type == PriceType.MARK:
-                    xrate = self._cache.get_xrate(
+                if xrate_result is None and conv_price_type == PriceType.MARK:
+                    xrate_result = self._cache.get_xrate(
                         venue=instrument.id.venue,
                         from_currency=sum_pnl.currency,
                         to_currency=currency,
                         price_type=PriceType.MID,
                     )
 
-                if xrate is None or xrate <= 0.0:
+                if xrate_result is None or xrate_result <= 0.0:
+                    # A missing rate is not yet known: the instrument stays pending until an
+                    # update supplies it
+                    self._log.debug(
+                        f"Cannot calculate realized PnL: "
+                        f"no {self._log_xrate} exchange rate yet for {sum_pnl.currency}/{currency}",
+                    )
+                    self._add_pending_xrate(instrument_id)
                     return None  # Cannot convert currency
 
+                xrate = <double>xrate_result
                 total_pnl += contribution * xrate
 
         return (round(total_pnl, currency.get_precision()), processed_ids)
@@ -2631,7 +2691,7 @@ cdef class Portfolio(PortfolioFacade):
                         f"Cannot calculate realized PnL: "
                         f"no {self._log_xrate} exchange rate yet for {instrument.get_cost_currency()}/{account.base_currency}",
                     )
-                    self._pending_calcs.add(instrument.id)
+                    self._add_pending_xrate(instrument.id)
                     return None  # Cannot calculate
 
                 xrate = <double>xrate_result
@@ -2806,7 +2866,7 @@ cdef class Portfolio(PortfolioFacade):
                     f"Cannot calculate unrealized PnL: "
                     f"no {self._log_xrate} exchange rate for {instrument.get_cost_currency()}/{account.base_currency}",
                 )
-                self._pending_calcs.add(instrument.id)
+                self._add_pending_xrate(instrument.id)
                 return None  # Cannot calculate
 
             xrate = <double>xrate_result

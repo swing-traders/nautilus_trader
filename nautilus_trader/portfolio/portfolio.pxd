@@ -65,6 +65,7 @@ cdef class Portfolio(PortfolioFacade):
     cdef dict[PositionId, object] _bet_positions
     cdef object _index_bet_positions
     cdef set[InstrumentId] _pending_calcs
+    cdef set[InstrumentId] _pending_xrates
     cdef dict[InstrumentId, Price] _bar_close_prices
     cdef dict[AccountId, uint64_t] _last_account_state_log_ts
     cdef dict[Venue, set] _venues_missing_price
@@ -92,6 +93,8 @@ cdef class Portfolio(PortfolioFacade):
     cdef void _update_missing_price_state(self, Venue venue, set unpriced)
     cdef void _update_mark_xrate(self, Instrument instrument, double xrate, InstrumentId instrument_id)
     cdef void _update_instrument_id(self, InstrumentId instrument_id)
+    cdef void _update_pending_instrument(self, InstrumentId instrument_id)
+    cdef void _add_pending_xrate(self, InstrumentId instrument_id)
     cdef void _update_net_position(self, InstrumentId instrument_id, list positions_open)
     cdef object _net_position(self, InstrumentId instrument_id, AccountId account_id=*)
     cdef void _ensure_snapshot_pnls_cached_for(self, InstrumentId instrument_id)

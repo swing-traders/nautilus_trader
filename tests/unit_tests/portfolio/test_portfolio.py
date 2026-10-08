@@ -24,6 +24,7 @@ from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.engine import ExecutionEngine
+from nautilus_trader.model.currencies import AUD
 from nautilus_trader.model.currencies import BTC
 from nautilus_trader.model.currencies import ETH
 from nautilus_trader.model.currencies import EUR
@@ -71,6 +72,36 @@ BTCUSDT_PERP_BINANCE = TestInstrumentProvider.btcusdt_perp_binance()
 BTCUSD_BITMEX = TestInstrumentProvider.xbtusd_bitmex()
 ETHUSD_BITMEX = TestInstrumentProvider.ethusd_bitmex()
 BETTING_INSTRUMENT = TestInstrumentProvider.betting_instrument()
+
+
+def _deliver_quote_tick(portfolio: Portfolio, quote: QuoteTick) -> None:
+    portfolio.update_quote_tick(quote)
+
+
+def _deliver_mark_price(portfolio: Portfolio, quote: QuoteTick) -> None:
+    portfolio.update_mark_price(
+        MarkPriceUpdate(
+            instrument_id=quote.instrument_id,
+            value=quote.bid_price,
+            ts_event=quote.ts_event,
+            ts_init=quote.ts_init,
+        ),
+    )
+
+
+def _deliver_bar(portfolio: Portfolio, quote: QuoteTick) -> None:
+    portfolio.update_bar(
+        Bar(
+            bar_type=BarType.from_str(f"{quote.instrument_id}-1-MINUTE-BID-EXTERNAL"),
+            open=quote.bid_price,
+            high=quote.bid_price,
+            low=quote.bid_price,
+            close=quote.bid_price,
+            volume=Quantity.from_int(1),
+            ts_event=quote.ts_event,
+            ts_init=quote.ts_init,
+        ),
+    )
 
 
 class TestPortfolio:
@@ -1323,6 +1354,353 @@ class TestPortfolio:
 
         # # Assert
         assert result == {}
+
+    def _aud_margin_account(self, account_type: AccountType = AccountType.MARGIN) -> AccountId:
+        AccountFactory.register_calculated_account("SIM")
+
+        account_id = AccountId("SIM-01234")
+        state = AccountState(
+            account_id=account_id,
+            account_type=account_type,
+            base_currency=AUD,
+            reported=True,
+            balances=[
+                AccountBalance(
+                    Money(1_000_000.00, AUD),
+                    Money(0.00, AUD),
+                    Money(1_000_000.00, AUD),
+                ),
+            ],
+            margins=[],
+            info={},
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        self.portfolio.update_account(state)
+
+        return account_id
+
+    def _hold_snapshotted_gbpusd_position(self, account_id: AccountId) -> Position:
+        # A GBP/USD position closed for 96.00 USD (100.00 PnL less 4.00 commission) and snapshotted,
+        # then reopened long 100,000 at 1.30200 for 2.00 USD commission; no USD/AUD rate exists
+        open_order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        close_order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+        )
+        reopen_order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        open_fill = TestEventStubs.order_filled(
+            open_order,
+            instrument=GBPUSD_SIM,
+            account_id=account_id,
+            position_id=PositionId("P-1"),
+            last_px=Price.from_str("1.30000"),
+            commission=Money(2.00, USD),
+        )
+        close_fill = TestEventStubs.order_filled(
+            close_order,
+            instrument=GBPUSD_SIM,
+            account_id=account_id,
+            position_id=PositionId("P-1"),
+            last_px=Price.from_str("1.30100"),
+            commission=Money(2.00, USD),
+        )
+        reopen_fill = TestEventStubs.order_filled(
+            reopen_order,
+            instrument=GBPUSD_SIM,
+            account_id=account_id,
+            position_id=PositionId("P-1"),
+            last_px=Price.from_str("1.30200"),
+            commission=Money(2.00, USD),
+        )
+
+        closed = Position(instrument=GBPUSD_SIM, fill=open_fill)
+        closed.apply(close_fill)
+        self.cache.snapshot_position(closed)
+
+        reopened = Position(instrument=GBPUSD_SIM, fill=reopen_fill)
+        self.cache.add_position(reopened, OmsType.NETTING)
+
+        return reopened
+
+    def _usd_account_holding_gbpusd_position(self) -> AccountId:
+        # A USD-base margin account long 100,000 GBP/USD at 1.30200 for 2.00 USD commission
+        account_id = AccountId("SIM-56789")
+        self.portfolio.update_account(
+            AccountState(
+                account_id=account_id,
+                account_type=AccountType.MARGIN,
+                base_currency=USD,
+                reported=True,
+                balances=[
+                    AccountBalance(
+                        Money(1_000_000.00, USD),
+                        Money(0.00, USD),
+                        Money(1_000_000.00, USD),
+                    ),
+                ],
+                margins=[],
+                info={},
+                event_id=UUID4(),
+                ts_event=0,
+                ts_init=0,
+            ),
+        )
+
+        order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=GBPUSD_SIM,
+            account_id=account_id,
+            position_id=PositionId("P-2"),
+            last_px=Price.from_str("1.30200"),
+            commission=Money(2.00, USD),
+        )
+        self.cache.add_position(Position(instrument=GBPUSD_SIM, fill=fill), OmsType.NETTING)
+
+        return account_id
+
+    @staticmethod
+    def _gbpusd_quote() -> QuoteTick:
+        return QuoteTick(
+            instrument_id=GBPUSD_SIM.id,
+            bid_price=Price.from_str("1.30300"),
+            ask_price=Price.from_str("1.30310"),
+            bid_size=Quantity.from_int(1),
+            ask_size=Quantity.from_int(1),
+            ts_event=0,
+            ts_init=0,
+        )
+
+    @staticmethod
+    def _audusd_rate_quote(rate: str = "0.80000") -> QuoteTick:
+        return QuoteTick(
+            instrument_id=AUDUSD_SIM.id,
+            bid_price=Price.from_str(rate),
+            ask_price=Price.from_str(rate),
+            bid_size=Quantity.from_int(1),
+            ask_size=Quantity.from_int(1),
+            ts_event=0,
+            ts_init=0,
+        )
+
+    def test_initialize_positions_when_no_xrate_to_account_base_initializes_with_pnl_unknown(self):
+        # Arrange
+        account_id = self._aud_margin_account()
+        self._hold_snapshotted_gbpusd_position(account_id)
+        self.cache.add_quote_tick(self._gbpusd_quote())
+
+        # Act
+        self.portfolio.initialize_positions()
+
+        # Assert
+        assert self.portfolio.initialized
+        assert self.portfolio.realized_pnl(GBPUSD_SIM.id, account_id=account_id) is None
+        assert self.portfolio.unrealized_pnl(GBPUSD_SIM.id, account_id=account_id) is None
+        assert self.cache.account(account_id).margin_maint(GBPUSD_SIM.id) is None
+
+    @pytest.mark.parametrize(
+        "deliver",
+        [_deliver_quote_tick, _deliver_mark_price, _deliver_bar],
+    )
+    def test_pending_position_calculations_complete_on_first_update_after_rate_quote_cached(
+        self,
+        deliver,
+    ):
+        # Arrange
+        account_id = self._aud_margin_account()
+        self._hold_snapshotted_gbpusd_position(account_id)
+        self.cache.add_quote_tick(self._gbpusd_quote())
+        self.portfolio.initialize_positions()
+
+        rate = self._audusd_rate_quote()
+        self.cache.add_quote_tick(rate)
+
+        # Act
+        deliver(self.portfolio, rate)
+
+        # Assert: USD converts to AUD at 1 / 0.80000 = 1.25
+        margin_maint = self.cache.account(account_id).margin_maint(GBPUSD_SIM.id)
+        realized = self.portfolio.realized_pnl(GBPUSD_SIM.id, account_id=account_id)
+        unrealized = self.portfolio.unrealized_pnl(GBPUSD_SIM.id, account_id=account_id)
+        # 100,000 x 1.30200 x 0.03 maintenance margin rate = 3,906.00 USD
+        assert margin_maint == Money(4_882.50, AUD)
+        # 96.00 USD snapshotted + -2.00 USD reopen commission = 94.00 USD
+        assert realized == Money(117.50, AUD)
+        # (1.30300 bid - 1.30200) x 100,000 = 100.00 USD
+        assert unrealized == Money(125.00, AUD)
+        assert self.portfolio.initialized
+
+    @pytest.mark.parametrize("account_type", [AccountType.MARGIN, AccountType.CASH])
+    def test_aggregate_pnls_include_pending_account_once_xrate_arrives(self, account_type):
+        # Arrange
+        self._hold_snapshotted_gbpusd_position(self._aud_margin_account(account_type))
+        self._usd_account_holding_gbpusd_position()
+        self.cache.add_quote_tick(self._gbpusd_quote())
+        self.portfolio.initialize_positions()
+        self.portfolio.update_quote_tick(self._gbpusd_quote())
+
+        # Aggregates read while the AUD account's contribution is unknown
+        self.portfolio.realized_pnl(GBPUSD_SIM.id, target_currency=USD)
+        self.portfolio.unrealized_pnl(GBPUSD_SIM.id, target_currency=USD)
+
+        rate = self._audusd_rate_quote()
+        self.cache.add_quote_tick(rate)
+
+        # Act
+        self.portfolio.update_quote_tick(rate)
+
+        # Assert: AUD converts to USD at 0.80000
+        realized = self.portfolio.realized_pnl(GBPUSD_SIM.id, target_currency=USD)
+        unrealized = self.portfolio.unrealized_pnl(GBPUSD_SIM.id, target_currency=USD)
+        # AUD account 96.00 - 2.00 = 94.00 USD, USD account -2.00 USD commission
+        assert realized == Money(92.00, USD)
+        # Each account (1.30300 bid - 1.30200) x 100,000 = 100.00 USD
+        assert unrealized == Money(200.00, USD)
+
+    @pytest.mark.parametrize("account_type", [AccountType.MARGIN, AccountType.CASH])
+    def test_aggregate_realized_pnl_includes_pending_account_once_xrate_arrives_while_unpriced(
+        self,
+        account_type,
+    ):
+        # Arrange: GBP/USD has no price, so unrealized PnL stays unknown throughout
+        self._hold_snapshotted_gbpusd_position(self._aud_margin_account(account_type))
+        self._usd_account_holding_gbpusd_position()
+        self.portfolio.initialize_positions()
+
+        # Aggregate read while the AUD account's contribution is unknown
+        self.portfolio.realized_pnl(GBPUSD_SIM.id, target_currency=USD)
+
+        rate = self._audusd_rate_quote()
+        self.cache.add_quote_tick(rate)
+
+        # Act
+        self.portfolio.update_quote_tick(rate)
+
+        # Assert: AUD account 96.00 - 2.00 = 94.00 USD, USD account -2.00 USD commission
+        realized = self.portfolio.realized_pnl(GBPUSD_SIM.id, target_currency=USD)
+        assert realized == Money(92.00, USD)
+
+    def test_aggregate_realized_pnl_includes_position_closed_before_xrate_arrives(self):
+        # Arrange
+        aud_account_id = self._aud_margin_account()
+        reopened = self._hold_snapshotted_gbpusd_position(aud_account_id)
+        self._usd_account_holding_gbpusd_position()
+        self.cache.add_quote_tick(self._gbpusd_quote())
+        self.portfolio.initialize_positions()
+
+        close_order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+        )
+        close_fill = TestEventStubs.order_filled(
+            close_order,
+            instrument=GBPUSD_SIM,
+            account_id=aud_account_id,
+            position_id=PositionId("P-1"),
+            last_px=Price.from_str("1.30400"),
+            commission=Money(2.00, USD),
+        )
+        reopened.apply(close_fill)
+        self.cache.update_position(reopened)
+        self.portfolio.update_position(TestEventStubs.position_closed(reopened))
+        self.portfolio.update_quote_tick(self._gbpusd_quote())
+
+        # Aggregate read while the AUD account's contribution is unknown
+        self.portfolio.realized_pnl(GBPUSD_SIM.id, target_currency=USD)
+
+        # The rate reaches the cache only, as for a portfolio fed mark prices rather than quotes
+        self.cache.add_quote_tick(self._audusd_rate_quote())
+
+        # Act
+        realized = self.portfolio.realized_pnl(GBPUSD_SIM.id, target_currency=USD)
+
+        # Assert: AUD converts to USD at 0.80000
+        # AUD account 96.00 USD snapshotted + (1.30400 - 1.30200) x 100,000 - 4.00 = 292.00 USD,
+        # USD account -2.00 USD commission
+        assert realized == Money(290.00, USD)
+
+    def test_pending_unrealized_pnl_with_every_rate_present_leaves_margin_as_computed(self):
+        # Arrange: the USD/AUD rate is quoted, GBP/USD has no price
+        account_id = self._aud_margin_account()
+        self.cache.add_quote_tick(self._audusd_rate_quote())
+
+        order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=GBPUSD_SIM,
+            account_id=account_id,
+            position_id=PositionId("P-1"),
+            last_px=Price.from_str("1.30200"),
+            commission=Money(2.00, USD),
+        )
+        self.cache.add_position(Position(instrument=GBPUSD_SIM, fill=fill), OmsType.NETTING)
+
+        self.portfolio.initialize_positions()
+
+        # 100,000 x 1.30200 x 0.03 maintenance margin rate = 3,906.00 USD, at 1 / 0.80000 USD/AUD
+        assert self.cache.account(account_id).margin_maint(GBPUSD_SIM.id) == Money(4_882.50, AUD)
+        assert self.portfolio.unrealized_pnl(GBPUSD_SIM.id, account_id=account_id) is None
+
+        moved = self._audusd_rate_quote("0.50000")
+        self.cache.add_quote_tick(moved)
+
+        # Act
+        self.portfolio.update_quote_tick(moved)
+
+        # Assert: margins follow order and position events, not rate updates
+        assert self.cache.account(account_id).margin_maint(GBPUSD_SIM.id) == Money(4_882.50, AUD)
+
+    def test_initialize_orders_when_no_xrate_to_account_base_initializes_with_margin_pending(self):
+        # Arrange
+        account_id = self._aud_margin_account()
+
+        order = self.order_factory.limit(
+            GBPUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            Price.from_str("1.30000"),
+        )
+        self.cache.add_order(order, position_id=None)
+        order.apply(TestEventStubs.order_submitted(order, account_id=account_id))
+        self.cache.update_order(order)
+        order.apply(TestEventStubs.order_accepted(order, account_id=account_id))
+        self.cache.update_order(order)
+
+        self.portfolio.initialize_orders()
+
+        assert self.portfolio.initialized
+        assert self.cache.account(account_id).margin_init(GBPUSD_SIM.id) is None
+
+        rate = self._audusd_rate_quote()
+        self.cache.add_quote_tick(rate)
+
+        # Act
+        self.portfolio.update_quote_tick(rate)
+
+        # Assert: 100,000 x 1.30000 x 0.03 initial margin rate = 3,900.00 USD, at 1 / 0.80000 USD/AUD
+        assert self.cache.account(account_id).margin_init(GBPUSD_SIM.id) == Money(4_875.00, AUD)
 
     def test_total_pnl_for_instrument_when_both_pnls_exist(self):
         # Arrange
