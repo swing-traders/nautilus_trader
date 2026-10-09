@@ -164,6 +164,7 @@ cdef class Portfolio(PortfolioFacade):
         self._index_bet_positions: dict[InstrumentId, set[PositionId]] = defaultdict(set)
         self._pending_calcs: set[InstrumentId] = set()
         self._pending_xrates: set[InstrumentId] = set()
+        self._pending_realized_trades: dict[InstrumentId, list] = {}
         self._bar_close_prices: dict[InstrumentId, Price] = {}
         self._last_account_state_log_ts: dict[AccountId, uint64_t] = {}
         self._venues_missing_price: dict[Venue, set[InstrumentId]] = {}
@@ -667,7 +668,6 @@ cdef class Portfolio(PortfolioFacade):
         if account is None or instrument is None:
             return
 
-        cdef Money converted_pnl
         if updated_position is not None and updated_position.is_closed_c() and updated_position.realized_pnl is not None:
             self.analyzer.record_trade(
                 updated_position.id,
@@ -679,23 +679,29 @@ cdef class Portfolio(PortfolioFacade):
                 account.base_currency is not None
                 and updated_position.realized_pnl.currency != account.base_currency
             ):
-                converted_pnl = self._convert_money_if_needed(
+                if not self._record_converted_trade(
+                    updated_position.id,
                     updated_position.realized_pnl,
+                    updated_position.ts_last,
                     account.base_currency,
-                    venue=event.instrument_id.venue,
-                )
-                if converted_pnl is not None:
-                    self.analyzer.record_trade(
-                        updated_position.id,
-                        converted_pnl,
-                        updated_position.ts_last,
+                    event.instrument_id.venue,
+                ):
+                    # A rate missing at the close is not yet known: the trade waits for an update
+                    # to supply it
+                    self._log.debug(
+                        f"Account-currency realized PnL for {updated_position.id} pending: "
+                        f"no {self._log_xrate} exchange rate yet for "
+                        f"{updated_position.realized_pnl.currency}/{account.base_currency}",
                     )
-                else:
-                    self._log.warning(
-                        f"Cannot record account-currency realized PnL for {updated_position.id}: "
-                        f"conversion failed from {updated_position.realized_pnl.currency} "
-                        f"to {account.base_currency}",
+                    self._pending_realized_trades.setdefault(event.instrument_id, []).append(
+                        (
+                            updated_position.id,
+                            updated_position.realized_pnl,
+                            updated_position.ts_last,
+                            account.base_currency,
+                        ),
                     )
+                    self._add_pending_xrate(event.instrument_id)
 
         if account.type != AccountType.MARGIN or not account.calculate_account_state:
             return  # Nothing to calculate
@@ -786,6 +792,7 @@ cdef class Portfolio(PortfolioFacade):
         self._unrealized_pnls.clear()
         self._pending_calcs.clear()
         self._pending_xrates.clear()
+        self._pending_realized_trades.clear()
         self._snapshot_sum_per_position.clear()
         self._snapshot_last_per_position.clear()
         self._snapshot_processed_counts.clear()
@@ -1985,6 +1992,9 @@ cdef class Portfolio(PortfolioFacade):
             self._update_pending_instrument(pending_id)
 
     cdef void _update_pending_instrument(self, InstrumentId instrument_id):
+        # Recorded first, as the account loop below can return early
+        cdef bint trades_recorded = self._record_pending_trades(instrument_id)
+
         cdef list orders_open = self._cache.orders_open(
             venue=None,  # Faster query filtering
             instrument_id=instrument_id,
@@ -2081,7 +2091,7 @@ cdef class Portfolio(PortfolioFacade):
                 and result_realized_pnl is not None
             )
 
-        if all(accounts_complete):
+        if all(accounts_complete) and trades_recorded:
             self._pending_calcs.discard(instrument_id)
             if awaits_xrate:
                 # PnL aggregated while this instrument's contribution was unknown is recomputed
@@ -2095,6 +2105,72 @@ cdef class Portfolio(PortfolioFacade):
     cdef void _add_pending_xrate(self, InstrumentId instrument_id):
         self._pending_calcs.add(instrument_id)
         self._pending_xrates.add(instrument_id)
+
+    cdef bint _record_pending_trades(self, InstrumentId instrument_id):
+        # Records each of the instrument's realized trades whose rate is now known, returning
+        # whether every one is recorded
+        cdef list trades = self._pending_realized_trades.pop(instrument_id, None)
+        if trades is None:
+            return True
+
+        cdef:
+            list waiting = []
+            tuple trade
+            PositionId position_id
+            Money realized_pnl
+            uint64_t ts_last
+            Currency currency
+        for trade in trades:
+            position_id, realized_pnl, ts_last, currency = trade
+            if not self._record_converted_trade(
+                position_id,
+                realized_pnl,
+                ts_last,
+                currency,
+                instrument_id.venue,
+            ):
+                waiting.append(trade)
+
+        if waiting:
+            self._pending_realized_trades[instrument_id] = waiting
+
+        return not waiting
+
+    cdef bint _record_converted_trade(
+        self,
+        PositionId position_id,
+        Money realized_pnl,
+        uint64_t ts_last,
+        Currency currency,
+        Venue venue,
+    ):
+        # Records the realized PnL converted into `currency`, returning False while no rate is
+        # known; unlike `_convert_money`, a missing rate logs nothing as it is not yet known
+        cdef PriceType price_type = PriceType.MARK if self._use_mark_xrates else PriceType.MID
+        cdef object xrate = self._cache.get_xrate(
+            venue=venue,
+            from_currency=realized_pnl.currency,
+            to_currency=currency,
+            price_type=price_type,
+        )
+
+        if xrate is None and price_type == PriceType.MARK:
+            xrate = self._cache.get_xrate(
+                venue=venue,
+                from_currency=realized_pnl.currency,
+                to_currency=currency,
+                price_type=PriceType.MID,
+            )
+
+        if xrate is None or xrate <= 0.0:
+            return False
+
+        cdef Money converted_pnl = Money(
+            round(realized_pnl.as_f64_c() * (<double>xrate), currency.get_precision()),
+            currency,
+        )
+        self.analyzer.record_trade(position_id, converted_pnl, ts_last)
+        return True
 
     cdef dict _group_by_account_id(self, list items):
         # Note: could be a generic function in rust

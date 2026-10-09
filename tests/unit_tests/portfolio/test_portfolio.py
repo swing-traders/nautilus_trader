@@ -13,7 +13,11 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import subprocess
+import sys
 from decimal import Decimal
+from unittest.mock import call
+from unittest.mock import patch
 
 import pytest
 
@@ -45,6 +49,7 @@ from nautilus_trader.model.identifiers import StrategyId
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import AccountBalance
+from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import MarginBalance
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
@@ -102,6 +107,109 @@ def _deliver_bar(portfolio: Portfolio, quote: QuoteTick) -> None:
             ts_init=quote.ts_init,
         ),
     )
+
+
+def _recorded_trades(portfolio: Portfolio, currency: Currency) -> list[tuple[str, float]]:
+    pnls = portfolio.analyzer.realized_pnls(currency)
+    return [] if pnls is None else list(pnls.items())
+
+
+_CLOSE_BEFORE_RATE_LOG_CHILD = """
+from nautilus_trader.accounting.factory import AccountFactory
+from nautilus_trader.common.component import MessageBus
+from nautilus_trader.common.component import TestClock
+from nautilus_trader.common.component import flush_logger
+from nautilus_trader.common.component import init_logging
+from nautilus_trader.common.enums import LogLevel
+from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.currencies import AUD
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.enums import AccountType
+from nautilus_trader.model.enums import OmsType
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.events import AccountState
+from nautilus_trader.model.identifiers import AccountId
+from nautilus_trader.model.identifiers import PositionId
+from nautilus_trader.model.identifiers import StrategyId
+from nautilus_trader.model.objects import AccountBalance
+from nautilus_trader.model.objects import Money
+from nautilus_trader.model.objects import Price
+from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.position import Position
+from nautilus_trader.portfolio.portfolio import Portfolio
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
+
+
+def quote(instrument, bid, ask):
+    return QuoteTick(
+        instrument_id=instrument.id,
+        bid_price=Price.from_str(bid),
+        ask_price=Price.from_str(ask),
+        bid_size=Quantity.from_int(1),
+        ask_size=Quantity.from_int(1),
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+_guard = init_logging(level_stdout=LogLevel.WARNING, colors=False, bypass=False)
+
+audusd = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+gbpusd = TestInstrumentProvider.default_fx_ccy("GBP/USD")
+clock = TestClock()
+trader_id = TestIdStubs.trader_id()
+msgbus = MessageBus(trader_id=trader_id, clock=clock)
+cache = TestComponentStubs.cache()
+cache.add_instrument(audusd)
+cache.add_instrument(gbpusd)
+cache.add_quote_tick(quote(gbpusd, "1.30300", "1.30310"))
+portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=clock)
+
+AccountFactory.register_calculated_account("SIM")
+account_id = AccountId("SIM-01234")
+portfolio.update_account(
+    AccountState(
+        account_id=account_id,
+        account_type=AccountType.MARGIN,
+        base_currency=AUD,
+        reported=True,
+        balances=[AccountBalance(Money(1_000_000, AUD), Money(0, AUD), Money(1_000_000, AUD))],
+        margins=[],
+        info={},
+        event_id=UUID4(),
+        ts_event=0,
+        ts_init=0,
+    ),
+)
+
+order_factory = OrderFactory(trader_id=trader_id, strategy_id=StrategyId("S-001"), clock=clock)
+fills = [
+    TestEventStubs.order_filled(
+        order_factory.market(gbpusd.id, side, Quantity.from_int(100_000)),
+        instrument=gbpusd,
+        account_id=account_id,
+        position_id=PositionId("P-1"),
+        last_px=Price.from_str(px),
+        commission=Money(2.00, USD),
+    )
+    for side, px in [(OrderSide.BUY, "1.30000"), (OrderSide.SELL, "1.30100")]
+]
+position = Position(instrument=gbpusd, fill=fills[0])
+cache.add_position(position, OmsType.NETTING)
+position.apply(fills[1])
+cache.update_position(position)
+portfolio.update_position(TestEventStubs.position_closed(position))
+
+rate = quote(audusd, "0.80000", "0.80000")
+cache.add_quote_tick(rate)
+portfolio.update_quote_tick(rate)
+flush_logger()
+"""
 
 
 class TestPortfolio:
@@ -1701,6 +1809,286 @@ class TestPortfolio:
 
         # Assert: 100,000 x 1.30000 x 0.03 initial margin rate = 3,900.00 USD, at 1 / 0.80000 USD/AUD
         assert self.cache.account(account_id).margin_init(GBPUSD_SIM.id) == Money(4_875.00, AUD)
+
+    def _close_gbpusd_position(self, account_id: AccountId) -> Position:
+        # Long 100,000 GBP/USD at 1.30000, closed at 1.30100, each fill charged 2.00 USD commission:
+        # 100.00 USD PnL less 4.00 = 96.00 USD realized, last fill at 2,000 ns
+        open_order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        close_order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+        )
+        position = Position(
+            instrument=GBPUSD_SIM,
+            fill=TestEventStubs.order_filled(
+                open_order,
+                instrument=GBPUSD_SIM,
+                account_id=account_id,
+                position_id=PositionId("P-1"),
+                last_px=Price.from_str("1.30000"),
+                commission=Money(2.00, USD),
+                ts_event=1_000,
+            ),
+        )
+        self.cache.add_position(position, OmsType.NETTING)
+        position.apply(
+            TestEventStubs.order_filled(
+                close_order,
+                instrument=GBPUSD_SIM,
+                account_id=account_id,
+                position_id=PositionId("P-1"),
+                last_px=Price.from_str("1.30100"),
+                commission=Money(2.00, USD),
+                ts_event=2_000,
+            ),
+        )
+        self.cache.update_position(position)
+        self.portfolio.update_position(TestEventStubs.position_closed(position))
+
+        return position
+
+    def test_position_closed_before_rate_known_logs_nothing_at_warning_or_above(self):
+        """
+        A position closed while no rate converts its realized PnL into the account currency
+        logs nothing at WARNING or above, at the close or when the rate arrives.
+
+        Runs in a child process: the suite initializes the logging subsystem once with
+        `bypass=True`, and it cannot be re-initialized to write real output.
+
+        """
+        # Arrange, Act
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", _CLOSE_BEFORE_RATE_LOG_CHILD],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        # Assert
+        assert result.returncode == 0, result.stderr
+        logged = (result.stdout + result.stderr).splitlines()
+        assert [line for line in logged if "[WARN]" in line or "[ERROR]" in line] == []
+
+    @pytest.mark.parametrize(
+        "deliver",
+        [_deliver_quote_tick, _deliver_mark_price, _deliver_bar],
+    )
+    def test_position_closed_before_rate_known_records_account_currency_trade_once_rate_arrives(
+        self,
+        deliver,
+    ):
+        # Arrange: the venue quotes GBP/USD, and no USD/AUD rate exists at the close
+        account_id = self._aud_margin_account()
+        self.cache.add_quote_tick(self._gbpusd_quote())
+        self._close_gbpusd_position(account_id)
+
+        assert _recorded_trades(self.portfolio, USD) == [("P-1", 96.00)]
+        assert _recorded_trades(self.portfolio, AUD) == []
+
+        rate = self._audusd_rate_quote()
+        self.cache.add_quote_tick(rate)
+
+        # Act
+        with patch.object(
+            self.portfolio.analyzer,
+            "record_trade",
+            wraps=self.portfolio.analyzer.record_trade,
+        ) as record_trade:
+            deliver(self.portfolio, rate)
+
+        # Assert: 96.00 USD at 1 / 0.80000 USD/AUD = 120.00 AUD, stamped at the close
+        assert record_trade.call_args_list == [call(PositionId("P-1"), Money(120.00, AUD), 2_000)]
+        assert _recorded_trades(self.portfolio, USD) == [("P-1", 96.00)]
+        assert _recorded_trades(self.portfolio, AUD) == [("P-1", 120.00)]
+
+    def test_position_closed_before_initialization_records_account_currency_trade_once_rate_arrives(
+        self,
+    ):
+        # Arrange: the close is booked before the portfolio initializes, as start-up reconciliation
+        # books recent fills, and no USD/AUD rate exists until after initialization
+        account_id = self._aud_margin_account()
+        self.cache.add_quote_tick(self._gbpusd_quote())
+        self._close_gbpusd_position(account_id)
+
+        self.portfolio.initialize_orders()
+        self.portfolio.initialize_positions()
+
+        assert self.portfolio.initialized
+
+        rate = self._audusd_rate_quote()
+        self.cache.add_quote_tick(rate)
+
+        # Act
+        self.portfolio.update_quote_tick(rate)
+
+        # Assert: 96.00 USD at 1 / 0.80000 USD/AUD = 120.00 AUD
+        assert _recorded_trades(self.portfolio, AUD) == [("P-1", 120.00)]
+        assert self.portfolio.initialized
+
+    def test_position_closed_before_rate_known_records_account_currency_trade_only_once(self):
+        # Arrange
+        account_id = self._aud_margin_account()
+        self.cache.add_quote_tick(self._gbpusd_quote())
+        self._close_gbpusd_position(account_id)
+
+        rate = self._audusd_rate_quote()
+        self.cache.add_quote_tick(rate)
+        self.portfolio.update_quote_tick(rate)
+
+        moved = self._audusd_rate_quote("0.50000")
+        self.cache.add_quote_tick(moved)
+
+        # Act
+        self.portfolio.update_quote_tick(moved)
+
+        # Assert: the trade stays recorded at the first rate, 96.00 USD x 1.25 = 120.00 AUD
+        assert _recorded_trades(self.portfolio, USD) == [("P-1", 96.00)]
+        assert _recorded_trades(self.portfolio, AUD) == [("P-1", 120.00)]
+
+    def test_position_cycles_closed_before_rate_known_each_record_account_currency_trade(self):
+        # Arrange: P-1 closes for 96.00 USD, is snapshotted, then reopens long 100,000 at 1.30200
+        # and closes at 1.30400 for 200.00 USD less 4.00 commission = 196.00 USD, at 4,000 ns
+        account_id = self._aud_margin_account()
+        self.cache.add_quote_tick(self._gbpusd_quote())
+        first = self._close_gbpusd_position(account_id)
+        self.cache.snapshot_position(first)
+
+        reopen_order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        close_order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+        )
+        second = Position(
+            instrument=GBPUSD_SIM,
+            fill=TestEventStubs.order_filled(
+                reopen_order,
+                instrument=GBPUSD_SIM,
+                account_id=account_id,
+                position_id=PositionId("P-1"),
+                last_px=Price.from_str("1.30200"),
+                commission=Money(2.00, USD),
+                ts_event=3_000,
+            ),
+        )
+        self.cache.add_position(second, OmsType.NETTING)
+        second.apply(
+            TestEventStubs.order_filled(
+                close_order,
+                instrument=GBPUSD_SIM,
+                account_id=account_id,
+                position_id=PositionId("P-1"),
+                last_px=Price.from_str("1.30400"),
+                commission=Money(2.00, USD),
+                ts_event=4_000,
+            ),
+        )
+        self.cache.update_position(second)
+        self.portfolio.update_position(TestEventStubs.position_closed(second))
+
+        rate = self._audusd_rate_quote()
+        self.cache.add_quote_tick(rate)
+
+        # Act
+        with patch.object(
+            self.portfolio.analyzer,
+            "record_trade",
+            wraps=self.portfolio.analyzer.record_trade,
+        ) as record_trade:
+            self.portfolio.update_quote_tick(rate)
+
+        # Assert: each close at 1 / 0.80000 USD/AUD, 96.00 USD = 120.00 AUD, 196.00 USD = 245.00 AUD
+        assert record_trade.call_args_list == [
+            call(PositionId("P-1"), Money(120.00, AUD), 2_000),
+            call(PositionId("P-1"), Money(245.00, AUD), 4_000),
+        ]
+
+    def test_reset_forgets_account_currency_trade_waiting_on_rate(self):
+        # Arrange: P-1 closes before any rate, the portfolio resets, then P-2 closes before any rate
+        # for 96.00 USD
+        account_id = self._aud_margin_account()
+        self.cache.add_quote_tick(self._gbpusd_quote())
+        self._close_gbpusd_position(account_id)
+        self.portfolio.reset()
+
+        open_order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        close_order = self.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+        )
+        position = Position(
+            instrument=GBPUSD_SIM,
+            fill=TestEventStubs.order_filled(
+                open_order,
+                instrument=GBPUSD_SIM,
+                account_id=account_id,
+                position_id=PositionId("P-2"),
+                last_px=Price.from_str("1.30000"),
+                commission=Money(2.00, USD),
+                ts_event=3_000,
+            ),
+        )
+        self.cache.add_position(position, OmsType.NETTING)
+        position.apply(
+            TestEventStubs.order_filled(
+                close_order,
+                instrument=GBPUSD_SIM,
+                account_id=account_id,
+                position_id=PositionId("P-2"),
+                last_px=Price.from_str("1.30100"),
+                commission=Money(2.00, USD),
+                ts_event=4_000,
+            ),
+        )
+        self.cache.update_position(position)
+        self.portfolio.update_position(TestEventStubs.position_closed(position))
+
+        rate = self._audusd_rate_quote()
+        self.cache.add_quote_tick(rate)
+
+        # Act
+        self.portfolio.update_quote_tick(rate)
+
+        # Assert: only P-2 is recorded, 96.00 USD at 1 / 0.80000 USD/AUD = 120.00 AUD
+        assert _recorded_trades(self.portfolio, AUD) == [("P-2", 120.00)]
+
+    def test_position_closed_with_rate_known_records_account_currency_trade_at_close(self):
+        # Arrange
+        account_id = self._aud_margin_account()
+        self.cache.add_quote_tick(self._gbpusd_quote())
+        rate = self._audusd_rate_quote()
+        self.cache.add_quote_tick(rate)
+
+        # Act
+        with patch.object(
+            self.portfolio.analyzer,
+            "record_trade",
+            wraps=self.portfolio.analyzer.record_trade,
+        ) as record_trade:
+            self._close_gbpusd_position(account_id)
+            self.portfolio.update_quote_tick(rate)
+
+        # Assert: the native trade, then 96.00 USD at 1 / 0.80000 USD/AUD = 120.00 AUD, both at close
+        assert record_trade.call_args_list == [
+            call(PositionId("P-1"), Money(96.00, USD), 2_000),
+            call(PositionId("P-1"), Money(120.00, AUD), 2_000),
+        ]
+        assert _recorded_trades(self.portfolio, AUD) == [("P-1", 120.00)]
 
     def test_total_pnl_for_instrument_when_both_pnls_exist(self):
         # Arrange
