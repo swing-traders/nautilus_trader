@@ -1085,7 +1085,8 @@ pub fn parse_ws_account_state(
     for coin_data in &wallet.coin {
         let currency = get_currency(coin_data.coin.as_str());
         let total_dec = coin_data.wallet_balance - coin_data.spot_borrow;
-        let locked_dec = coin_data.total_order_im + coin_data.total_position_im;
+        // Spot orders lock `locked`; derivatives orders and positions reserve initial margin
+        let locked_dec = coin_data.locked + coin_data.total_order_im + coin_data.total_position_im;
 
         balances.push(AccountBalance::from_total_and_locked(
             total_dec, locked_dec, currency,
@@ -1131,6 +1132,7 @@ mod tests {
             AggregationSource, BarAggregation, OrderType, PositionSide, PriceType, TriggerType,
         },
         identifiers::PositionId,
+        types::Currency,
     };
     use rstest::rstest;
     use rust_decimal_macros::dec;
@@ -2087,6 +2089,38 @@ mod tests {
         // Locked is capped at total to prevent negative free balance
         assert!((usdt_balance.locked.as_f64() - 100.0).abs() < 1e-6);
         assert_eq!(usdt_balance.free.as_f64(), 0.0);
+    }
+
+    #[rstest]
+    fn parse_rest_and_ws_wallet_lock_spot_orders_and_initial_margin_alike() {
+        // One USDT coin with 1000 wallet balance, 150 locked by spot orders, 50 order IM and
+        // 200 position IM, delivered once by REST and once by WebSocket
+        let rest_json = load_test_json("http_get_wallet_balance_spot_locked_and_margin.json");
+        let rest_response: crate::http::models::BybitWalletBalanceResponse =
+            serde_json::from_str(&rest_json).unwrap();
+        let ws_json = load_test_json("ws_account_wallet_spot_locked_and_margin.json");
+        let ws_msg: crate::websocket::messages::BybitWsAccountWalletMsg =
+            serde_json::from_str(&ws_json).unwrap();
+        let account_id = AccountId::new("BYBIT-UNIFIED");
+
+        let rest_state = crate::common::parse::parse_account_state(
+            &rest_response.result.list[0],
+            account_id,
+            TS,
+        )
+        .unwrap();
+        let ws_state = parse_ws_account_state(&ws_msg.data[0], account_id, TS, TS).unwrap();
+
+        let usdt = Currency::USDT();
+        let expected = AccountBalance::new(
+            Money::new(1000.0, usdt),
+            Money::new(400.0, usdt),
+            Money::new(600.0, usdt),
+        );
+        assert_eq!(
+            (rest_state.balances, ws_state.balances),
+            (vec![expected], vec![expected]),
+        );
     }
 
     #[rstest]

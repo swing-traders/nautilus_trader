@@ -970,6 +970,8 @@ pub struct BybitWsAccountWalletCoin {
     pub total_position_mm: Option<String>,
     pub equity: String,
     #[serde(default, deserialize_with = "deserialize_optional_decimal_or_zero")]
+    pub locked: Decimal,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_or_zero")]
     pub spot_borrow: Decimal,
 }
 

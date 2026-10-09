@@ -1,0 +1,35 @@
+{
+  "id": "test-spot-locked-and-margin",
+  "topic": "wallet",
+  "creationTime": 1762960669000,
+  "data": [
+    {
+      "accountIMRate": "0.25",
+      "accountMMRate": "0.02",
+      "accountLTV": "0",
+      "totalEquity": "1000.00",
+      "totalWalletBalance": "1000.00",
+      "totalMarginBalance": "1000.00",
+      "totalAvailableBalance": "600.00",
+      "totalPerpUpl": "0",
+      "totalInitialMargin": "250.00",
+      "totalMaintenanceMargin": "20.00",
+      "coin": [
+        {
+          "coin": "USDT",
+          "equity": "1000.00",
+          "walletBalance": "1000.00",
+          "availableToWithdraw": "600.00",
+          "availableToBorrow": "",
+          "borrowAmount": "0",
+          "accruedInterest": "0",
+          "totalOrderIM": "50.00",
+          "totalPositionIM": "200.00",
+          "totalPositionMM": "20.00",
+          "locked": "150.00",
+          "spotBorrow": "0"
+        }
+      ]
+    }
+  ]
+}

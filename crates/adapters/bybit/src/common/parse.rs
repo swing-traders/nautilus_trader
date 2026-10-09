@@ -1183,7 +1183,16 @@ pub fn parse_account_state(
 
     for coin in &wallet_balance.coin {
         let total_dec = coin.wallet_balance - coin.spot_borrow;
-        let locked_dec = coin.locked;
+        let order_im_dec = match &coin.total_order_im {
+            Some(im) if !im.is_empty() => parse_decimal(im, "totalOrderIM")?,
+            _ => Decimal::ZERO,
+        };
+        let position_im_dec = match &coin.total_position_im {
+            Some(im) if !im.is_empty() => parse_decimal(im, "totalPositionIM")?,
+            _ => Decimal::ZERO,
+        };
+        // Spot orders lock `locked`; derivatives orders and positions reserve initial margin
+        let locked_dec = coin.locked + order_im_dec + position_im_dec;
 
         let currency = get_currency(&coin.coin);
         balances.push(AccountBalance::from_total_and_locked(
