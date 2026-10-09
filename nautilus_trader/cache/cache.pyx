@@ -3784,6 +3784,10 @@ cdef class Cache(CacheFacade):
             return self.get_mark_xrate(from_currency, to_currency)
 
         cdef tuple quotes = self._build_quote_table(venue)
+        if not quotes[0] and not quotes[1]:
+            # A rate asked before the venue quotes any pair is not yet known, not an error
+            return None
+
         try:
             # `get_exchange_rate` returns a `Decimal`; the Cython path uses floats, so cast here
             xrate = nautilus_pyo3.get_exchange_rate(

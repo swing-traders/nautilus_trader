@@ -13,6 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import subprocess
+import sys
 from decimal import Decimal
 
 import pytest
@@ -50,6 +52,71 @@ SIM = Venue("SIM")
 USDJPY_SIM = TestInstrumentProvider.default_fx_ccy("USD/JPY")
 AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
 ETHUSDT_BINANCE = TestInstrumentProvider.ethusdt_binance()
+
+
+_XRATE_LOG_CHILD = """
+import sys
+
+from nautilus_trader.common.component import flush_logger
+from nautilus_trader.common.component import init_logging
+from nautilus_trader.common.enums import LogLevel
+from nautilus_trader.model.currencies import AUD
+from nautilus_trader.model.currencies import GBP
+from nautilus_trader.model.currencies import JPY
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.enums import PriceType
+from nautilus_trader.model.identifiers import Venue
+from nautilus_trader.model.objects import Price
+from nautilus_trader.model.objects import Quantity
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+
+_guard = init_logging(level_stdout=LogLevel.WARNING, colors=False, bypass=False)
+
+audusd = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+cache = TestComponentStubs.cache()
+cache.add_instrument(audusd)
+
+scenario = sys.argv[1]
+if scenario == "unquoted":
+    xrate = cache.get_xrate(Venue("SIM"), USD, AUD)
+else:
+    cache.add_quote_tick(
+        QuoteTick(
+            instrument_id=audusd.id,
+            bid_price=Price.from_str("0.80000"),
+            ask_price=Price.from_str("0.80010"),
+            bid_size=Quantity.from_int(1),
+            ask_size=Quantity.from_int(1),
+            ts_event=0,
+            ts_init=0,
+        ),
+    )
+    if scenario == "no_route":
+        xrate = cache.get_xrate(Venue("SIM"), GBP, JPY)
+    else:
+        xrate = cache.get_xrate(Venue("SIM"), USD, AUD, PriceType.LAST)
+
+flush_logger()
+print(f"XRATE {xrate!r}")
+"""
+
+
+def _get_xrate_logging_to_output(scenario: str) -> tuple[str, list[str]]:
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", _XRATE_LOG_CHILD, scenario],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = (result.stdout + result.stderr).splitlines()
+    xrate_lines = [line for line in lines if line.startswith("XRATE ")]
+    assert len(xrate_lines) == 1, lines
+    logged = [line for line in lines if "[WARN]" in line or "[ERROR]" in line]
+    return xrate_lines[0], logged
 
 
 class TestCache:
@@ -1208,6 +1275,55 @@ class TestCache:
 
         # Assert
         assert result == 0.009025266685348969
+
+    def test_get_xrate_when_venue_quotes_nothing_returns_none_and_logs_nothing(self):
+        """
+        A rate asked of a venue holding no quote and no bid/ask bar is not yet known: the
+        answer is ``None`` and nothing is logged at WARNING or above.
+
+        Runs in a child process: the suite initializes the logging subsystem once with
+        `bypass=True`, and it cannot be re-initialized to write real output.
+
+        """
+        # Arrange, Act
+        xrate, logged = _get_xrate_logging_to_output("unquoted")
+
+        # Assert
+        assert xrate == "XRATE None"
+        assert logged == []
+
+    def test_get_xrate_when_quotes_hold_no_route_returns_none_and_logs_nothing(self):
+        """
+        A rate between two currencies no quoted pair connects is ``None``, and nothing is
+        logged at WARNING or above.
+
+        Runs in a child process for the same reason as the unquoted case.
+
+        """
+        # Arrange, Act
+        xrate, logged = _get_xrate_logging_to_output("no_route")
+
+        # Assert
+        assert xrate == "XRATE None"
+        assert logged == []
+
+    def test_get_xrate_when_calculation_fails_over_quotes_returns_none_and_logs_error(self):
+        """
+        A calculation that fails over a venue holding quotes is an error: a LAST rate cannot
+        be calculated from quotes.
+
+        Runs in a child process for the same reason as the unquoted case.
+
+        """
+        # Arrange, Act
+        xrate, logged = _get_xrate_logging_to_output("last_price_type")
+
+        # Assert
+        assert xrate == "XRATE None"
+        assert len(logged) == 1
+        assert "[ERROR]" in logged[0]
+        assert "Cannot calculate exchange rate" in logged[0]
+        assert "Invalid `price_type`, was 'LAST'" in logged[0]
 
     def test_get_xrate_with_no_conversion_returns_one(self):
         # Arrange, Act
