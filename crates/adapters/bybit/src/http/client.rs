@@ -4031,6 +4031,8 @@ impl BybitHttpClient {
         )?;
 
         let start_ms = start.map(|dt| dt.timestamp_millis());
+        // A zero limit caps nothing: paging runs back to `start` and returns the whole window
+        let limit = limit.filter(|&n| n > 0);
         let mut seen_timestamps: AHashSet<i64> = AHashSet::new();
         let current_time_ms = get_atomic_clock_realtime().get_time_ms() as i64;
 

@@ -35,7 +35,7 @@ use nautilus_bybit::{
     },
 };
 use nautilus_model::{
-    data::{BarSpecification, BarType},
+    data::{Bar, BarSpecification, BarType},
     enums::{AggregationSource, BarAggregation, PriceType},
     identifiers::{InstrumentId, Symbol},
 };
@@ -133,6 +133,62 @@ async fn mock_instruments_info(Query(_params): Query<HashMap<String, String>>) -
 async fn start_pagination_test_server() -> Result<SocketAddr, anyhow::Error> {
     let app = Router::new()
         .route("/v5/market/kline", get(mock_klines_paginated))
+        .route("/v5/market/instruments-info", get(mock_instruments_info));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Give server time to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    Ok(addr)
+}
+
+// Mock endpoint honouring the request window like the venue: the bars whose start lies in
+// `[start, end]`, newest first, at most `limit` of them
+async fn mock_klines_windowed(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+    let start_ms = params
+        .get("start")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let end_ms = params
+        .get("end")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(200);
+
+    let mut klines = Vec::new();
+    let mut bar_time = end_ms - end_ms.rem_euclid(60_000);
+
+    while bar_time >= start_ms && klines.len() < limit {
+        klines.push(generate_kline(
+            bar_time, "50000.0", "50100.0", "49900.0", "50050.0",
+        ));
+        bar_time -= 60_000;
+    }
+
+    Json(json!({
+        "retCode": 0,
+        "retMsg": "OK",
+        "result": {
+            "category": "linear",
+            "symbol": "ETHUSDT",
+            "list": klines
+        },
+        "time": Utc::now().timestamp_millis()
+    }))
+}
+
+async fn start_windowed_test_server() -> Result<SocketAddr, anyhow::Error> {
+    let app = Router::new()
+        .route("/v5/market/kline", get(mock_klines_windowed))
         .route("/v5/market/instruments-info", get(mock_instruments_info));
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -319,6 +375,78 @@ async fn test_bars_limit_returns_most_recent() {
 }
 
 /// Test that BybitOpenOrdersResponse properly deserializes with cursor
+const WINDOW_START_MS: i64 = 1_704_067_200_000; // 2024-01-01T00:00:00Z
+const MINUTE_MS: i64 = 60_000;
+
+async fn request_windowed_bars(bar_count: i64, limit: Option<u32>) -> Vec<Bar> {
+    let addr = start_windowed_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BybitHttpClient::new(Some(base_url), 60, 3, 1000, 10_000, 5_000, None).unwrap();
+    init_instrument_cache(&client).await;
+
+    let instrument_id = InstrumentId::new(Symbol::from("ETHUSDT-LINEAR"), *BYBIT_VENUE);
+    let bar_spec = BarSpecification {
+        step: std::num::NonZero::new(1).unwrap(),
+        aggregation: BarAggregation::Minute,
+        price_type: PriceType::Last,
+    };
+    let bar_type = BarType::new(instrument_id, bar_spec, AggregationSource::External);
+
+    let start = DateTime::from_timestamp_millis(WINDOW_START_MS).unwrap();
+    let end =
+        DateTime::from_timestamp_millis(WINDOW_START_MS + (bar_count - 1) * MINUTE_MS).unwrap();
+
+    client
+        .request_bars(
+            BybitProductType::Linear,
+            bar_type,
+            Some(start),
+            Some(end),
+            limit,
+            false,
+        )
+        .await
+        .unwrap()
+}
+
+fn bar_open_times_ms(bars: &[Bar]) -> Vec<i64> {
+    bars.iter()
+        .map(|bar| bar.ts_event.as_i64() / 1_000_000)
+        .collect()
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_bars_zero_limit_returns_whole_window_across_pages() {
+    let bars = request_windowed_bars(2_300, Some(0)).await;
+
+    let expected: Vec<i64> = (0..2_300)
+        .map(|i| WINDOW_START_MS + i * MINUTE_MS)
+        .collect();
+    assert_eq!(bar_open_times_ms(&bars), expected);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_bars_positive_limit_returns_most_recent_of_window() {
+    let bars = request_windowed_bars(2_300, Some(300)).await;
+
+    let expected: Vec<i64> = (2_000..2_300)
+        .map(|i| WINDOW_START_MS + i * MINUTE_MS)
+        .collect();
+    assert_eq!(bar_open_times_ms(&bars), expected);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_bars_zero_limit_returns_window_narrower_than_page() {
+    let bars = request_windowed_bars(120, Some(0)).await;
+
+    let expected: Vec<i64> = (0..120).map(|i| WINDOW_START_MS + i * MINUTE_MS).collect();
+    assert_eq!(bar_open_times_ms(&bars), expected);
+}
+
 #[rstest]
 fn test_open_orders_response_with_cursor() {
     let json = r#"{

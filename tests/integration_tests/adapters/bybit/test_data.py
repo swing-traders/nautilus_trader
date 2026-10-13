@@ -14,16 +14,21 @@
 # -------------------------------------------------------------------------------------------------
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
 from nautilus_trader.adapters.bybit.config import BybitDataClientConfig
 from nautilus_trader.adapters.bybit.constants import BYBIT_VENUE
 from nautilus_trader.adapters.bybit.data import BybitDataClient
 from nautilus_trader.core import nautilus_pyo3
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import BookType
+from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 from tests.integration_tests.adapters.bybit.conftest import _create_ws_mock
@@ -263,3 +268,33 @@ async def test_unsubscribe_order_book_deltas(data_client_builder, monkeypatch):
         ws_client.unsubscribe_orderbook.assert_awaited_once_with(expected_id, 50)
     finally:
         await client._disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 300])
+async def test_request_bars_passes_limit_through(data_client_builder, monkeypatch, limit):
+    # Arrange
+    client, ws_client, http_client, instrument_provider = data_client_builder(
+        monkeypatch,
+    )
+    http_client.request_bars = AsyncMock(return_value=[])
+
+    request = RequestBars(
+        bar_type=BarType.from_str("BTCUSDT-LINEAR.BYBIT-5-MINUTE-LAST-EXTERNAL"),
+        start=pd.Timestamp("2024-01-01", tz="UTC"),
+        end=pd.Timestamp("2024-01-17", tz="UTC"),
+        limit=limit,
+        client_id=ClientId("BYBIT"),
+        venue=BYBIT_VENUE,
+        callback=None,
+        request_id=UUID4(),
+        ts_init=0,
+        params=None,
+    )
+
+    # Act
+    await client._request_bars(request)
+
+    # Assert
+    http_client.request_bars.assert_awaited_once()
+    assert http_client.request_bars.call_args.kwargs["limit"] == limit

@@ -841,7 +841,7 @@ class BybitDataClient(LiveMarketDataClient):
             bar_type=pyo3_bar_type,
             start=ensure_pydatetime_utc(request.start),
             end=ensure_pydatetime_utc(request.end),
-            limit=request.limit or 200,
+            limit=request.limit,
             timestamp_on_close=self._bars_timestamp_on_close,
         )
         bars = Bar.from_pyo3_list(pyo3_bars)
