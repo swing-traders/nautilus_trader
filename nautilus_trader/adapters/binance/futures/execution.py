@@ -58,6 +58,7 @@ from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
+from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.model.enums import OrderType
@@ -168,9 +169,13 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
             self._log.info("TRADE_LITE events will be used", LogColor.BLUE)
 
         self._leverages = config.futures_leverages
-        # Dedupe warnings: `_update_account_state` reruns on every account query
+        # Dedupe warnings: `_update_account_state` reruns on every connect
         self._set_leverage_warned: set[str] = set()
         self._margin_types = config.futures_margin_types
+
+        # One account query in flight at a time, and at most one more behind it
+        self._account_query_task: asyncio.Task | None = None
+        self._account_query_requested = False
 
         self._decoder_futures_user_msg = msgspec.json.Decoder(BinanceFuturesUserMsgData)
         self._decoder_futures_order_update = msgspec.json.Decoder(BinanceFuturesOrderUpdateMsg)
@@ -188,23 +193,7 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
             self._log.info(f"API key {self._http_client.api_key_masked} has trading permissions")
         else:
             self._log.error("Binance API key does not have trading permissions")
-        self.generate_account_state(
-            balances=account_info.parse_to_account_balances(),
-            margins=account_info.parse_to_margin_balances(),
-            reported=True,
-            ts_event=millis_to_nanos(account_info.updateTime),
-            info={
-                "total_wallet_balance": account_info.totalWalletBalance,
-                "total_margin_balance": account_info.totalMarginBalance,
-                "total_initial_margin": account_info.totalInitialMargin,
-                "total_maint_margin": account_info.totalMaintMargin,
-                "total_unrealized_profit": account_info.totalUnrealizedProfit,
-                "total_cross_wallet_balance": account_info.totalCrossWalletBalance,
-                "total_cross_unpnl": account_info.totalCrossUnPnl,
-                "available_balance": account_info.availableBalance,
-                "max_withdraw_amount": account_info.maxWithdrawAmount,
-            },
-        )
+        self._generate_queried_account_state(account_info)
 
         await self._await_account_registered(log_registered=False)
 
@@ -261,6 +250,59 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
             except KeyError:
                 # Symbol not loaded in instrument provider, skip
                 continue
+
+    def _generate_queried_account_state(self, account_info: BinanceFuturesAccountInfo) -> None:
+        self.generate_account_state(
+            balances=account_info.parse_to_account_balances(),
+            margins=account_info.parse_to_margin_balances(),
+            reported=True,
+            ts_event=millis_to_nanos(account_info.updateTime),
+            info={
+                "total_wallet_balance": account_info.totalWalletBalance,
+                "total_margin_balance": account_info.totalMarginBalance,
+                "total_initial_margin": account_info.totalInitialMargin,
+                "total_maint_margin": account_info.totalMaintMargin,
+                "total_unrealized_profit": account_info.totalUnrealizedProfit,
+                "total_cross_wallet_balance": account_info.totalCrossWalletBalance,
+                "total_cross_unpnl": account_info.totalCrossUnPnl,
+                "available_balance": account_info.availableBalance,
+                "max_withdraw_amount": account_info.maxWithdrawAmount,
+            },
+        )
+
+    async def _query_account(self, _command: QueryAccount) -> None:
+        self._request_account_query()
+
+    def _request_account_query(self) -> None:
+        # A request while a query is in flight is served by one more query after it
+        self._account_query_requested = True
+        if self._account_query_task is None:
+            self._account_query_task = self.create_task(
+                self._query_account_while_requested(),
+                log_msg="query_account_state",
+            )
+            self._account_query_task.add_done_callback(self._release_account_query_task)
+
+    def _release_account_query_task(self, task: asyncio.Task) -> None:
+        # A task cancelled before it starts never reaches its own `finally`
+        if self._account_query_task is task:
+            self._account_query_task = None
+
+    async def _query_account_while_requested(self) -> None:
+        try:
+            while self._account_query_requested:
+                self._account_query_requested = False
+                try:
+                    account_info: BinanceFuturesAccountInfo = (
+                        await self._futures_http_account.query_futures_account_info(
+                            recv_window=str(5000),
+                        )
+                    )
+                    self._generate_queried_account_state(account_info)
+                except Exception as e:
+                    self._log.exception("Cannot query account state", e)
+        finally:
+            self._account_query_task = None
 
     async def _init_dual_side_position(self) -> None:
         binance_futures_dual_side_position: BinanceFuturesDualSidePosition = (
@@ -731,6 +773,9 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
     def _handle_account_update(self, raw: bytes) -> None:
         account_update = self._decoder_futures_account_update.decode(raw)
         account_update.handle_account_update(self)
+
+        # The push states no margins: the account query reports them
+        self._request_account_query()
 
     def _handle_order_trade_update(self, raw: bytes) -> None:
         order_update = self._decoder_futures_order_update.decode(raw)

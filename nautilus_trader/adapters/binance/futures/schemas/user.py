@@ -17,6 +17,7 @@ from decimal import Decimal
 
 import msgspec
 
+from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.adapters.binance.common.enums import BinanceEnumParser
 from nautilus_trader.adapters.binance.common.enums import BinanceExecutionType
 from nautilus_trader.adapters.binance.common.enums import BinanceFuturesPositionSide
@@ -159,10 +160,15 @@ class BinanceFuturesAccountUpdateMsg(msgspec.Struct, frozen=True):
     def handle_account_update(self, exec_client: BinanceCommonExecutionClient):
         """
         Handle BinanceFuturesAccountUpdateMsg as payload of ACCOUNT_UPDATE.
+
+        The push states no margins and an event's margins replace the account's, so the
+        account's venue-stated margins are carried until the account query answers.
+
         """
+        account: MarginAccount = exec_client.get_account()
         exec_client.generate_account_state(
             balances=self.a.parse_to_account_balances(),
-            margins=[],
+            margins=list(account.account_margins().values()),
             reported=True,
             ts_event=millis_to_nanos(self.T),
         )

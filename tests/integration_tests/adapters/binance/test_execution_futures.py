@@ -19,6 +19,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
+import msgspec
 import pytest
 
 from nautilus_trader.adapters.binance.common.constants import BINANCE_VENUE
@@ -29,8 +30,10 @@ from nautilus_trader.adapters.binance.futures.execution import BinanceFuturesExe
 from nautilus_trader.adapters.binance.futures.providers import BinanceFuturesInstrumentProvider
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesAccountInfo
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesAlgoOrder
+from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesDualSidePosition
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesSymbolConfig
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
+from nautilus_trader.adapters.binance.http.error import BinanceServerError
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
@@ -44,8 +47,10 @@ from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
+from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
+from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TrailingOffsetType
@@ -53,6 +58,8 @@ from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.objects import MarginBalance
+from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
@@ -66,6 +73,80 @@ from nautilus_trader.trading.strategy import Strategy
 
 
 ETHUSDT_PERP_BINANCE = TestInstrumentProvider.ethusdt_perp_binance()
+
+
+def _account_update_raw(wallet_balance: str) -> bytes:
+    # The venue's ACCOUNT_UPDATE shape: balances and changed positions, no margin field
+    return json.dumps(
+        {
+            "e": "ACCOUNT_UPDATE",
+            "E": 1700000000100,
+            "T": 1700000000099,
+            "a": {
+                "m": "ORDER",
+                "B": [
+                    {"a": "USDT", "wb": wallet_balance, "cw": wallet_balance, "bc": "0"},
+                ],
+                "P": [
+                    {
+                        "s": "ETHUSDT",
+                        "pa": "2.000",
+                        "ep": "2000.00",
+                        "bep": "2000.80",
+                        "cr": "0",
+                        "up": "0",
+                        "mt": "cross",
+                        "iw": "0",
+                        "ps": "BOTH",
+                    },
+                ],
+            },
+        },
+    ).encode()
+
+
+def _account_info(
+    wallet_balance: str,
+    initial_margin: str,
+    maint_margin: str,
+) -> BinanceFuturesAccountInfo:
+    # The venue's GET /fapi/v2/account reply, one USDT asset
+    available = str(Decimal(wallet_balance) - Decimal(initial_margin))
+    payload = {
+        "feeTier": 0,
+        "canTrade": True,
+        "canDeposit": True,
+        "canWithdraw": True,
+        "updateTime": 1700000000200,
+        "totalInitialMargin": initial_margin,
+        "totalMaintMargin": maint_margin,
+        "totalWalletBalance": wallet_balance,
+        "totalUnrealizedProfit": "0",
+        "totalMarginBalance": wallet_balance,
+        "totalCrossWalletBalance": wallet_balance,
+        "totalCrossUnPnl": "0",
+        "availableBalance": available,
+        "maxWithdrawAmount": available,
+        "assets": [
+            {
+                "asset": "USDT",
+                "walletBalance": wallet_balance,
+                "unrealizedProfit": "0",
+                "marginBalance": wallet_balance,
+                "maintMargin": maint_margin,
+                "initialMargin": initial_margin,
+                "positionInitialMargin": initial_margin,
+                "openOrderInitialMargin": "0",
+                "crossWalletBalance": wallet_balance,
+                "crossUnPnl": "0",
+                "availableBalance": available,
+                "maxWithdrawAmount": available,
+                "marginAvailable": True,
+                "updateTime": 1700000000200,
+            },
+        ],
+    }
+    return msgspec.json.decode(json.dumps(payload), type=BinanceFuturesAccountInfo)
 
 
 class TestBinanceFuturesExecutionClient:
@@ -3173,6 +3254,220 @@ class TestBinanceFuturesExecutionClient:
         # Assert - should NOT generate cancel rejected for "Unknown order sent"
         mock_generate_cancel_rejected.assert_not_called()
 
+    # -------------------------------------------------------------------------
+    # ACCOUNT_UPDATE margins
+    # -------------------------------------------------------------------------
+
+    def _seed_account(self, account_info: BinanceFuturesAccountInfo) -> None:
+        # The connect-time account state, built as the account query builds it
+        self.exec_client.generate_account_state(
+            balances=account_info.parse_to_account_balances(),
+            margins=account_info.parse_to_margin_balances(),
+            reported=True,
+            ts_event=0,
+        )
+
+    async def _settle(self) -> None:
+        await asyncio.gather(*[task for task in self.exec_client._tasks if not task.done()])
+
+    @pytest.mark.asyncio
+    async def test_account_update_margins_come_from_the_account_query(self, mocker):
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        query = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            return_value=_account_info("9999.50", "400.00", "20.00"),
+        )
+
+        # Act
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await self._settle()
+
+        # Assert
+        account = self.cache.account(self.exec_client.account_id)
+        assert account.account_margins() == {
+            USDT: MarginBalance(initial=Money(400, USDT), maintenance=Money(20, USDT)),
+        }
+        query.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_account_update_keeps_the_last_margins_until_the_account_answers(self, mocker):
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        answer = asyncio.Event()
+
+        async def query_account_info(*args, **kwargs):
+            await answer.wait()
+            return _account_info("9999.50", "400.00", "20.00")
+
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            side_effect=query_account_info,
+        )
+
+        # Act
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await asyncio.sleep(0)
+
+        # Assert
+        account = self.cache.account(self.exec_client.account_id)
+        assert account.balance_total(USDT) == Money(9999.5, USDT)
+        assert account.account_margins() == {
+            USDT: MarginBalance(initial=Money(200, USDT), maintenance=Money(10, USDT)),
+        }
+        answer.set()
+        await self._settle()
+
+    @pytest.mark.asyncio
+    async def test_account_updates_during_a_query_coalesce_into_one_follow_up(self, mocker):
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        answer = asyncio.Event()
+
+        async def query_account_info(*args, **kwargs):
+            await answer.wait()
+            return _account_info("9999.50", "400.00", "20.00")
+
+        query = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            side_effect=query_account_info,
+        )
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await asyncio.sleep(0)
+        assert query.await_count == 1
+
+        # Act
+        for _ in range(3):
+            self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        answer.set()
+        await self._settle()
+
+        # Assert
+        assert query.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_account_query_is_retried_by_the_next_account_update(self, mocker):
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        query = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            side_effect=[
+                BinanceServerError(503, {"code": -1001, "msg": "Internal error"}, {}),
+                _account_info("9999.50", "400.00", "20.00"),
+            ],
+        )
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await self._settle()
+        assert query.await_count == 1
+
+        # Act
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await self._settle()
+
+        # Assert
+        assert query.await_count == 2
+        account = self.cache.account(self.exec_client.account_id)
+        assert account.account_margins() == {
+            USDT: MarginBalance(initial=Money(400, USDT), maintenance=Money(20, USDT)),
+        }
+
+    @pytest.mark.asyncio
+    async def test_query_account_during_an_account_query_is_served_after_it(self, mocker):
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        answer = asyncio.Event()
+
+        async def query_account_info(*args, **kwargs):
+            if query.await_count == 1:
+                await answer.wait()
+                return _account_info("9999.50", "300.00", "15.00")
+            return _account_info("9999.50", "400.00", "20.00")
+
+        query = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            side_effect=query_account_info,
+        )
+        symbol_config = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_symbol_config",
+            return_value=[],
+        )
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await asyncio.sleep(0)
+
+        # Act
+        self.exec_client.query_account(
+            QueryAccount(
+                trader_id=self.exec_client.trader_id,
+                account_id=self.exec_client.account_id,
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+        await asyncio.sleep(0)
+        answer.set()
+        await self._settle()
+
+        # Assert
+        assert query.await_count == 2
+        account = self.cache.account(self.exec_client.account_id)
+        assert account.account_margins() == {
+            USDT: MarginBalance(initial=Money(400, USDT), maintenance=Money(20, USDT)),
+        }
+        symbol_config.assert_not_awaited()
+
+    def _stub_connect_venue_calls(self, mocker) -> None:
+        # Every venue call `_connect` makes besides the account query
+        mocker.patch.object(self.provider, "initialize")
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_symbol_config",
+            return_value=[],
+        )
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_hedge_mode",
+            return_value=BinanceFuturesDualSidePosition(dualSidePosition=False),
+        )
+        mocker.patch.object(
+            self.exec_client._http_market,
+            "request_server_time",
+            return_value=1700000000000,
+        )
+        mocker.patch.object(self.exec_client._ws_client, "connect")
+        mocker.patch.object(self.exec_client._ws_client, "session_logon")
+        mocker.patch.object(self.exec_client._ws_client, "subscribe_user_data_stream")
+
+    @pytest.mark.asyncio
+    async def test_account_query_cancelled_before_it_starts_leaves_the_next_push_querying(
+        self,
+        mocker,
+    ):
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        query = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            return_value=_account_info("9999.50", "400.00", "20.00"),
+        )
+        self._stub_connect_venue_calls(mocker)
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await self.exec_client.cancel_pending_tasks()
+        await self.exec_client._connect()
+        assert query.await_count == 1
+
+        # Act
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await self._settle()
+
+        # Assert
+        assert query.await_count == 2
+
 
 # Best-effort leverage initialization in `_update_account_state`: a `set_leverage`
 # venue reject or a symbolConfig entry with leverage=0 (Binance testnet/demo
@@ -3194,6 +3489,8 @@ class _UpdateAccountStateStub:
     """
     Minimal stand-in exposing only what `_update_account_state` touches.
     """
+
+    _generate_queried_account_state = BinanceFuturesExecutionClient._generate_queried_account_state
 
     def __init__(self, *, leverages, set_leverage, symbol_configs):
         self._log = MagicMock()
