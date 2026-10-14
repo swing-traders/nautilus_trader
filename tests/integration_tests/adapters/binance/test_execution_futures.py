@@ -25,7 +25,9 @@ import pytest
 from nautilus_trader.adapters.binance.common.constants import BINANCE_VENUE
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
+from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
 from nautilus_trader.adapters.binance.config import BinanceExecClientConfig
+from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesMarginType
 from nautilus_trader.adapters.binance.futures.execution import BinanceFuturesExecutionClient
 from nautilus_trader.adapters.binance.futures.providers import BinanceFuturesInstrumentProvider
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesAccountInfo
@@ -3270,6 +3272,14 @@ class TestBinanceFuturesExecutionClient:
     async def _settle(self) -> None:
         await asyncio.gather(*[task for task in self.exec_client._tasks if not task.done()])
 
+    def _query_account_command(self) -> QueryAccount:
+        return QueryAccount(
+            trader_id=self.exec_client.trader_id,
+            account_id=self.exec_client.account_id,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
     @pytest.mark.asyncio
     async def test_account_update_margins_come_from_the_account_query(self, mocker):
         # Arrange
@@ -3278,6 +3288,11 @@ class TestBinanceFuturesExecutionClient:
             self.exec_client._futures_http_account,
             "query_futures_account_info",
             return_value=_account_info("9999.50", "400.00", "20.00"),
+        )
+        symbol_config = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_symbol_config",
+            return_value=[],
         )
 
         # Act
@@ -3290,6 +3305,7 @@ class TestBinanceFuturesExecutionClient:
             USDT: MarginBalance(initial=Money(400, USDT), maintenance=Money(20, USDT)),
         }
         query.assert_awaited_once()
+        symbol_config.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_account_update_keeps_the_last_margins_until_the_account_answers(self, mocker):
@@ -3401,14 +3417,7 @@ class TestBinanceFuturesExecutionClient:
         await asyncio.sleep(0)
 
         # Act
-        self.exec_client.query_account(
-            QueryAccount(
-                trader_id=self.exec_client.trader_id,
-                account_id=self.exec_client.account_id,
-                command_id=UUID4(),
-                ts_init=0,
-            ),
-        )
+        self.exec_client.query_account(self._query_account_command())
         await asyncio.sleep(0)
         answer.set()
         await self._settle()
@@ -3419,7 +3428,59 @@ class TestBinanceFuturesExecutionClient:
         assert account.account_margins() == {
             USDT: MarginBalance(initial=Money(400, USDT), maintenance=Money(20, USDT)),
         }
-        symbol_config.assert_not_awaited()
+        symbol_config.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_query_account_reads_a_leverage_changed_at_the_venue_and_writes_nothing(
+        self,
+        mocker,
+    ):
+        # Arrange
+        mocker.patch.object(self.exec_client, "_leverages", {BinanceSymbol("ETHUSDT"): 10})
+        mocker.patch.object(
+            self.exec_client,
+            "_margin_types",
+            {BinanceSymbol("ETHUSDT"): BinanceFuturesMarginType.CROSS},
+        )
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        account = self.cache.account(self.exec_client.account_id)
+        account.set_leverage(ETHUSDT_PERP_BINANCE.id, Decimal(10))
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            return_value=_account_info("10000.00", "200.00", "10.00"),
+        )
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_symbol_config",
+            return_value=[
+                BinanceFuturesSymbolConfig(
+                    symbol="ETHUSDT",
+                    marginType="CROSSED",
+                    isAutoAddMargin=False,
+                    leverage=20,
+                    maxNotionalValue="1000000",
+                ),
+            ],
+        )
+        set_leverage = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "set_leverage",
+        )
+        set_margin_type = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "set_margin_type",
+        )
+
+        # Act
+        self.exec_client.query_account(self._query_account_command())
+        await asyncio.sleep(0)
+        await self._settle()
+
+        # Assert
+        assert account.leverage(ETHUSDT_PERP_BINANCE.id) == Decimal(20)
+        set_leverage.assert_not_called()
+        set_margin_type.assert_not_called()
 
     def _stub_connect_venue_calls(self, mocker) -> None:
         # Every venue call `_connect` makes besides the account query
@@ -3468,6 +3529,70 @@ class TestBinanceFuturesExecutionClient:
         # Assert
         assert query.await_count == 2
 
+    @pytest.mark.asyncio
+    async def test_query_account_cancelled_before_start_leaves_the_next_push_reading_no_leverage(
+        self,
+        mocker,
+    ):
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            return_value=_account_info("9999.50", "400.00", "20.00"),
+        )
+        self._stub_connect_venue_calls(mocker)
+        symbol_config = self.exec_client._futures_http_account.query_futures_symbol_config
+        self.exec_client.query_account(self._query_account_command())
+        await asyncio.sleep(0)
+        await self.exec_client.cancel_pending_tasks()
+        await self.exec_client._connect()
+        assert symbol_config.await_count == 1
+
+        # Act
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await self._settle()
+
+        # Assert
+        assert symbol_config.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_query_account_behind_a_cancelled_query_leaves_the_next_push_reading_no_leverage(
+        self,
+        mocker,
+    ):
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        never_answered = asyncio.Event()
+
+        async def query_account_info(*args, **kwargs):
+            if query.await_count == 1:
+                await never_answered.wait()
+            return _account_info("9999.50", "400.00", "20.00")
+
+        query = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            side_effect=query_account_info,
+        )
+        self._stub_connect_venue_calls(mocker)
+        symbol_config = self.exec_client._futures_http_account.query_futures_symbol_config
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await asyncio.sleep(0)
+        self.exec_client.query_account(self._query_account_command())
+        await asyncio.sleep(0)
+        await self.exec_client.cancel_pending_tasks()
+        await self.exec_client._connect()
+        assert symbol_config.await_count == 1
+
+        # Act
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await self._settle()
+
+        # Assert
+        assert query.await_count == 3
+        assert symbol_config.await_count == 1
+
 
 # Best-effort leverage initialization in `_update_account_state`: a `set_leverage`
 # venue reject or a symbolConfig entry with leverage=0 (Binance testnet/demo
@@ -3491,6 +3616,7 @@ class _UpdateAccountStateStub:
     """
 
     _generate_queried_account_state = BinanceFuturesExecutionClient._generate_queried_account_state
+    _update_account_leverages = BinanceFuturesExecutionClient._update_account_leverages
 
     def __init__(self, *, leverages, set_leverage, symbol_configs):
         self._log = MagicMock()

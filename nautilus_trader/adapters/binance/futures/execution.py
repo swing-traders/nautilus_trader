@@ -176,6 +176,7 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
         # One account query in flight at a time, and at most one more behind it
         self._account_query_task: asyncio.Task | None = None
         self._account_query_requested = False
+        self._account_leverages_requested = False
 
         self._decoder_futures_user_msg = msgspec.json.Decoder(BinanceFuturesUserMsgData)
         self._decoder_futures_order_update = msgspec.json.Decoder(BinanceFuturesOrderUpdateMsg)
@@ -183,7 +184,7 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
         self._decoder_futures_trade_lite = msgspec.json.Decoder(BinanceFuturesTradeLiteMsg)
         self._decoder_futures_algo_update = msgspec.json.Decoder(BinanceFuturesAlgoUpdateMsg)
 
-    async def _update_account_state(self) -> None:  # noqa: C901 (too complex)
+    async def _update_account_state(self) -> None:
         account_info: BinanceFuturesAccountInfo = (
             await self._futures_http_account.query_futures_account_info(recv_window=str(5000))
         )
@@ -233,8 +234,10 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
             for _, symbol, type_ in margin_tasks:
                 self._log.info(f"Set {symbol} margin type to {type_.value}")
 
-        # Initialize leverage for all symbols using symbolConfig endpoint
-        # This ensures leverage is set correctly even for symbols without active positions
+        await self._update_account_leverages()
+
+    async def _update_account_leverages(self) -> None:
+        # The symbolConfig endpoint states every symbol's leverage, with or without a position
         account: MarginAccount = self.get_account()
         symbol_configs = await self._futures_http_account.query_futures_symbol_config()
         for config in symbol_configs:
@@ -271,11 +274,15 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
         )
 
     async def _query_account(self, _command: QueryAccount) -> None:
-        self._request_account_query()
+        self._request_account_query(read_leverages=True)
 
-    def _request_account_query(self) -> None:
+    def _request_account_query(self, read_leverages: bool) -> None:
         # A request while a query is in flight is served by one more query after it
         self._account_query_requested = True
+
+        if read_leverages:
+            self._account_leverages_requested = True
+
         if self._account_query_task is None:
             self._account_query_task = self.create_task(
                 self._query_account_while_requested(),
@@ -286,12 +293,14 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
     def _release_account_query_task(self, task: asyncio.Task) -> None:
         # A task cancelled before it starts never reaches its own `finally`
         if self._account_query_task is task:
-            self._account_query_task = None
+            self._end_account_query()
 
     async def _query_account_while_requested(self) -> None:
         try:
             while self._account_query_requested:
+                read_leverages = self._account_leverages_requested
                 self._account_query_requested = False
+                self._account_leverages_requested = False
                 try:
                     account_info: BinanceFuturesAccountInfo = (
                         await self._futures_http_account.query_futures_account_info(
@@ -299,10 +308,19 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
                         )
                     )
                     self._generate_queried_account_state(account_info)
+
+                    if read_leverages:
+                        await self._update_account_leverages()
                 except Exception as e:
                     self._log.exception("Cannot query account state", e)
         finally:
-            self._account_query_task = None
+            self._end_account_query()
+
+    def _end_account_query(self) -> None:
+        # Requests pending when a query is cancelled are dropped: connect re-reads the account
+        self._account_query_task = None
+        self._account_query_requested = False
+        self._account_leverages_requested = False
 
     async def _init_dual_side_position(self) -> None:
         binance_futures_dual_side_position: BinanceFuturesDualSidePosition = (
@@ -775,7 +793,7 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
         account_update.handle_account_update(self)
 
         # The push states no margins: the account query reports them
-        self._request_account_query()
+        self._request_account_query(read_leverages=False)
 
     def _handle_order_trade_update(self, raw: bytes) -> None:
         order_update = self._decoder_futures_order_update.decode(raw)
