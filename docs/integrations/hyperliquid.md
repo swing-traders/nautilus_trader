@@ -1058,12 +1058,17 @@ There is a limitation of one order book per instrument per trader instance.
 
 ## Account and position management
 
-`AccountState` merges perp margin and spot balances. Perp margin and cross-margin
-usage come from `clearinghouseState`; non-zero spot tokens (USDC, USDH, HYPE,
-vault tokens, HIP-4 outcome side tokens, etc.) come from `spotClearinghouseState`.
-USDC comes from the perp summary when it reflects non-zero collateral, margin, or
-withdrawable balance; when the perp summary is absent or zeroed, spot USDC is used
-instead.
+`AccountState` merges perp margin and spot balances. Perp margin and the account's
+margin used, cross and isolated, come from `clearinghouseState`; non-zero spot tokens
+(USDC, USDH, HYPE, vault tokens, HIP-4 outcome side tokens, etc.) come from
+`spotClearinghouseState`. USDC comes from the account-wide perp summary when it reflects
+non-zero collateral, margin, or withdrawable balance; when the perp summary is absent or
+zeroed, spot USDC is used instead.
+
+Both are read on connect and on an account query. Once the connect-time state is applied,
+the execution client subscribes the `clearinghouseState` WebSocket channel and applies
+each push: a push carries no spot balances, so it updates USDC only where the perp summary
+reflects it and leaves every other currency as last reported.
 
 Standard perps default to cross margin; HIP-3 perps default to isolated. On
 connect, the execution client reconciles orders, fills, and positions against

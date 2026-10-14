@@ -53,9 +53,10 @@ use super::{
         WsUserEventData,
     },
     parse::{
-        parse_ws_asset_context, parse_ws_candle, parse_ws_fill_report, parse_ws_open_interest,
-        parse_ws_order_book_deltas, parse_ws_order_book_depth10, parse_ws_order_status_report,
-        parse_ws_public_trade, parse_ws_quote_tick, parse_ws_trade_tick,
+        parse_ws_account_state, parse_ws_asset_context, parse_ws_candle, parse_ws_fill_report,
+        parse_ws_open_interest, parse_ws_order_book_deltas, parse_ws_order_book_depth10,
+        parse_ws_order_status_report, parse_ws_public_trade, parse_ws_quote_tick,
+        parse_ws_trade_tick,
     },
     post::PostRouter,
     trades::TradeStreamUses,
@@ -542,6 +543,18 @@ impl FeedHandler {
                     }
                     _ => {
                         log::debug!("Received non-fill user event: {data:?}");
+                    }
+                }
+            }
+            HyperliquidWsMessage::ClearinghouseState { data } => {
+                if let Some(account_id) = account_id {
+                    match parse_ws_account_state(&data, account_id, ts_init) {
+                        Ok(account_state) => {
+                            result.push(NautilusWsMessage::AccountState(account_state));
+                        }
+                        Err(e) => {
+                            log::error!("Error parsing clearinghouse state: {e}");
+                        }
                     }
                 }
             }
@@ -1204,6 +1217,12 @@ pub(crate) fn subscription_to_key(sub: &SubscriptionRequest) -> String {
         }
         SubscriptionRequest::WebData2 { user } => {
             format!("{}:{user}", HyperliquidWsChannel::WebData2.as_str())
+        }
+        SubscriptionRequest::ClearinghouseState { user, dex } => {
+            format!(
+                "{}:{user}:{dex}",
+                HyperliquidWsChannel::ClearinghouseState.as_str()
+            )
         }
         SubscriptionRequest::Candle { coin, interval } => {
             format!(

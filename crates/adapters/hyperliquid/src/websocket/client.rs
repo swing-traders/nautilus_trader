@@ -1541,6 +1541,39 @@ impl HyperliquidWebSocketClient {
         Ok(())
     }
 
+    /// Subscribes to the clearinghouse state (positions and margin summaries) for a specific
+    /// user address on the first perp dex, the one the HTTP clearinghouse state reports.
+    pub async fn subscribe_clearinghouse_state(&self, user: &str) -> anyhow::Result<()> {
+        let subscription = SubscriptionRequest::ClearinghouseState {
+            user: user.to_string(),
+            dex: String::new(),
+        };
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Subscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {e}"))?;
+        Ok(())
+    }
+
+    /// Unsubscribes from the clearinghouse state for a specific user address.
+    pub async fn unsubscribe_clearinghouse_state(&self, user: &str) -> anyhow::Result<()> {
+        let subscription = SubscriptionRequest::ClearinghouseState {
+            user: user.to_string(),
+            dex: String::new(),
+        };
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::Unsubscribe {
+                subscriptions: vec![subscription],
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send unsubscribe command: {e}"))?;
+        Ok(())
+    }
+
     /// Subscribe to user fills for a specific user address.
     ///
     /// Note: This channel is redundant with `userEvents` which already includes fills.
@@ -2161,6 +2194,15 @@ fn subscription_from_topic(topic: &str) -> anyhow::Result<SubscriptionRequest> {
         HyperliquidWsChannel::WebData2 => Ok(SubscriptionRequest::WebData2 {
             user: rest.context("Missing user")?.to_string(),
         }),
+        HyperliquidWsChannel::ClearinghouseState => {
+            // Format: clearinghouseState:{user}:{dex} - user is eth addr (no colons)
+            let rest = rest.context("Missing params")?;
+            let (user, dex) = rest.split_once(':').context("Missing dex")?;
+            Ok(SubscriptionRequest::ClearinghouseState {
+                user: user.to_string(),
+                dex: dex.to_string(),
+            })
+        }
         HyperliquidWsChannel::Candle => {
             // Format: candle:{coin}:{interval} - interval is last segment
             let rest = rest.context("Missing candle params")?;
@@ -2253,6 +2295,10 @@ mod tests {
     #[case(SubscriptionRequest::Bbo { coin: "BTC".into() }, "bbo:BTC")]
     #[case(SubscriptionRequest::OrderUpdates { user: "0x123".to_string() }, "orderUpdates:0x123")]
     #[case(SubscriptionRequest::UserEvents { user: "0xabc".to_string() }, "userEvents:0xabc")]
+    #[case(
+        SubscriptionRequest::ClearinghouseState { user: "0xabc".to_string(), dex: String::new() },
+        "clearinghouseState:0xabc:"
+    )]
     fn test_subscription_topic_generation(
         #[case] subscription: SubscriptionRequest,
         #[case] expected_topic: &str,
@@ -2283,6 +2329,21 @@ mod tests {
         let topic = subscription_topic(&subscription);
         let reconstructed = subscription_from_topic(&topic).expect("Failed to reconstruct");
         assert_eq!(subscription_topic(&reconstructed), topic);
+    }
+
+    #[rstest]
+    #[case(String::new())]
+    #[case("xyz".to_string())]
+    fn test_clearinghouse_state_subscription_reconstructs_exactly(#[case] dex: String) {
+        let subscription = SubscriptionRequest::ClearinghouseState {
+            user: "0xabc".to_string(),
+            dex,
+        };
+
+        let reconstructed = subscription_from_topic(&subscription_topic(&subscription))
+            .expect("Failed to reconstruct");
+
+        assert_eq!(reconstructed, subscription);
     }
 
     #[rstest]

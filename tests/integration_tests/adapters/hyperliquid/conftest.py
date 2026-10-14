@@ -252,6 +252,7 @@ def _create_ws_mock() -> MagicMock:
     mock.cache_instruments = MagicMock()
     mock.subscribe_order_updates = AsyncMock()
     mock.subscribe_user_events = AsyncMock()
+    mock.subscribe_clearinghouse_state = AsyncMock()
     mock.subscribe_user_fills = AsyncMock()
     mock.next_event = AsyncMock(return_value=None)
     return mock

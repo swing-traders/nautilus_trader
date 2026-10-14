@@ -23,6 +23,7 @@ use nautilus_model::{
         Bar, Data, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas,
         OrderBookDepth10, QuoteTick, TradeTick,
     },
+    events::AccountState,
     reports::{FillReport, OrderStatusReport},
 };
 use rust_decimal::Decimal;
@@ -35,7 +36,7 @@ use crate::{
         HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidSide,
         HyperliquidTimeInForce, HyperliquidTpSl, HyperliquidTwapStatus,
     },
-    http::models::{HyperliquidExchangeRequest, HyperliquidExecAction},
+    http::models::{ClearinghouseState, HyperliquidExchangeRequest, HyperliquidExecAction},
 };
 
 /// Represents an outbound WebSocket message from client to Hyperliquid.
@@ -80,6 +81,10 @@ pub enum SubscriptionRequest {
     Notification { user: String },
     /// Web data for frontend.
     WebData2 { user: String },
+
+    /// Clearinghouse state (positions and margin summaries) for a user on one perp dex.
+    ClearinghouseState { user: String, dex: String },
+
     /// Candlestick data.
     Candle {
         coin: Ustr,
@@ -346,6 +351,10 @@ pub enum HyperliquidWsMessage {
     Notification { data: NotificationData },
     /// Web data.
     WebData2 { data: serde_json::Value },
+
+    /// Clearinghouse state.
+    ClearinghouseState { data: WsClearinghouseStateData },
+
     /// Candlestick data.
     Candle { data: CandleData },
     /// Level 2 order book.
@@ -416,6 +425,15 @@ pub struct WsAllDexsAssetCtxsData {
 #[derive(Debug, Clone, Deserialize)]
 pub struct NotificationData {
     pub notification: String,
+}
+
+/// Clearinghouse state pushed for a user on one perp dex.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WsClearinghouseStateData {
+    pub dex: String,
+    pub user: String,
+    #[serde(rename = "clearinghouseState")]
+    pub clearinghouse_state: ClearinghouseState,
 }
 
 /// Candlestick data.
@@ -1192,6 +1210,10 @@ mod tests {
 pub enum NautilusWsMessage {
     /// Execution reports (order status and fills).
     ExecutionReports(Vec<ExecutionReport>),
+
+    /// Account state from a clearinghouse state push.
+    AccountState(AccountState),
+
     /// Parsed trade ticks.
     Trades(Vec<TradeTick>),
     /// Parsed quote tick (from BBO).

@@ -17,6 +17,11 @@ This directory contains real API response samples for testing.
 - `ws_l2_book_sample.json` - Order book update message sample
 - `ws_book_data.json` - Existing book data test sample
 
+### WebSocket private data
+
+- `ws_clearinghouse_state.json` - `clearinghouseState` push: the info endpoint's documented
+  example response inside the channel's documented envelope (isolated margin, zero cross margin)
+
 ## Capturing New Test Data
 
 ### HTTP Data

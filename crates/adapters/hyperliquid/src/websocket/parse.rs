@@ -24,9 +24,10 @@ use nautilus_model::{
         depth::DEPTH10_LEN,
     },
     enums::{
-        AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus, OrderType, RecordFlag,
-        TimeInForce,
+        AccountType, AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus, OrderType,
+        RecordFlag, TimeInForce,
     },
+    events::AccountState,
     identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport},
@@ -35,17 +36,19 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 
 use super::messages::{
-    CandleData, WsActiveAssetCtxData, WsBboData, WsBookData, WsFillData, WsOrderData, WsTradeData,
+    CandleData, WsActiveAssetCtxData, WsBboData, WsBookData, WsClearinghouseStateData, WsFillData,
+    WsOrderData, WsTradeData,
 };
 use crate::{
     common::{
         enums::{HyperliquidFillDirection, HyperliquidTimeInForce},
         parse::{
             is_conditional_order_data, make_fill_trade_id, millis_to_nanos,
-            parse_trigger_order_type,
+            parse_combined_account_balances_and_margins, parse_trigger_order_type,
         },
     },
     data_types::{HyperliquidOpenInterest, HyperliquidPublicTrade},
+    http::models::SpotClearinghouseState,
 };
 
 fn parse_price(
@@ -536,11 +539,44 @@ pub fn parse_ws_open_interest(
     ))
 }
 
+/// Parses a pushed clearinghouse state into a reported [`AccountState`].
+///
+/// The channel carries no spot balances, so USDC is stated only where the perp summary
+/// reflects it and every other currency keeps the balance the account last reported.
+///
+/// # Errors
+///
+/// Returns an error if the state's balances or margins cannot be parsed.
+pub fn parse_ws_account_state(
+    data: &WsClearinghouseStateData,
+    account_id: AccountId,
+    ts_init: UnixNanos,
+) -> anyhow::Result<AccountState> {
+    let (balances, margins) = parse_combined_account_balances_and_margins(
+        &data.clearinghouse_state,
+        &SpotClearinghouseState::default(),
+    )?;
+
+    Ok(AccountState::new(
+        account_id,
+        AccountType::Margin,
+        balances,
+        margins,
+        true, // reported
+        UUID4::new(),
+        ts_init,
+        ts_init,
+        None,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
     use nautilus_model::{
+        accounts::{Account, MarginAccount},
+        enums::AccountType,
         identifiers::{InstrumentId, Symbol},
         instruments::CryptoPerpetual,
         types::currency::Currency,
@@ -560,8 +596,8 @@ mod tests {
             },
         },
         websocket::messages::{
-            FillLiquidationData, PerpsAssetCtx, SharedAssetCtx, SpotAssetCtx, WsBasicOrderData,
-            WsBookData, WsLevelData,
+            FillLiquidationData, HyperliquidWsMessage, PerpsAssetCtx, SharedAssetCtx, SpotAssetCtx,
+            WsBasicOrderData, WsBookData, WsClearinghouseStateData, WsLevelData,
         },
     };
 
@@ -1125,5 +1161,134 @@ mod tests {
         .unwrap();
 
         assert_eq!(open_interest.open_interest, expected);
+    }
+
+    fn clearinghouse_state_frame() -> WsClearinghouseStateData {
+        let frame: HyperliquidWsMessage =
+            serde_json::from_str(include_str!("../../test_data/ws_clearinghouse_state.json"))
+                .unwrap();
+        let HyperliquidWsMessage::ClearinghouseState { data } = frame else {
+            panic!("expected a clearinghouseState frame");
+        };
+        data
+    }
+
+    #[rstest]
+    fn test_parse_ws_account_state_reads_the_account_wide_margin() {
+        let data = clearinghouse_state_frame();
+        let account_id = AccountId::from("HYPERLIQUID-001");
+
+        let account_state =
+            parse_ws_account_state(&data, account_id, UnixNanos::from(1_000)).unwrap();
+
+        assert_eq!(account_state.account_id, account_id);
+        assert_eq!(account_state.account_type, AccountType::Margin);
+        assert!(account_state.is_reported);
+        assert_eq!(account_state.ts_event, UnixNanos::from(1_000));
+        assert_eq!(account_state.margins.len(), 1);
+        let margin = &account_state.margins[0];
+        assert!(margin.instrument_id.is_none());
+        assert_eq!(margin.currency.code.as_str(), "USDC");
+        assert_eq!(margin.initial.as_decimal(), dec!(4.967826));
+        assert_eq!(margin.maintenance.as_decimal(), dec!(4.967826));
+        assert_eq!(account_state.balances.len(), 1);
+        let balance = &account_state.balances[0];
+        assert_eq!(balance.currency.code.as_str(), "USDC");
+        assert_eq!(balance.total.as_decimal(), dec!(13109.495728));
+        assert_eq!(balance.free.as_decimal(), dec!(13104.514502));
+        assert_eq!(balance.locked.as_decimal(), dec!(4.981226));
+    }
+
+    #[rstest]
+    fn test_pushed_zero_margin_used_replaces_a_standing_margin() {
+        // A flat summary leaves USDC to the spot side and pushes no balance, so only its
+        // stated zero margin used clears the margin the account held.
+        let account_id = AccountId::from("HYPERLIQUID-001");
+        let standing =
+            parse_ws_account_state(&clearinghouse_state_frame(), account_id, UnixNanos::from(1))
+                .unwrap();
+        let mut account = MarginAccount::new(standing, false);
+        let flat: WsClearinghouseStateData = serde_json::from_value(serde_json::json!({
+            "dex": "",
+            "user": "0x1234567890abcdef1234567890abcdef12345678",
+            "clearinghouseState": {
+                "assetPositions": [],
+                "marginSummary": {
+                    "accountValue": "0",
+                    "totalNtlPos": "0",
+                    "totalRawUsd": "0",
+                    "totalMarginUsed": "0"
+                },
+                "crossMarginSummary": {
+                    "accountValue": "0",
+                    "totalNtlPos": "0",
+                    "totalRawUsd": "0",
+                    "totalMarginUsed": "0"
+                },
+                "crossMaintenanceMarginUsed": "0",
+                "withdrawable": "0"
+            }
+        }))
+        .unwrap();
+
+        account
+            .apply(parse_ws_account_state(&flat, account_id, UnixNanos::from(2)).unwrap())
+            .unwrap();
+
+        let margin = account.account_margin(&Currency::USDC()).unwrap();
+        assert_eq!(margin.initial.as_decimal(), dec!(0));
+        assert_eq!(margin.maintenance.as_decimal(), dec!(0));
+    }
+
+    #[rstest]
+    fn test_pushed_isolated_only_state_restates_the_usdc_balance() {
+        // The cross collateral withdrawn and the isolated ETH position standing, only the
+        // account-wide summary still values the account's USDC.
+        let account_id = AccountId::from("HYPERLIQUID-001");
+        let spot: SpotClearinghouseState = serde_json::from_value(serde_json::json!({
+            "balances": [{"coin": "PURR", "token": 1, "total": "10", "hold": "0", "entryNtl": "5"}]
+        }))
+        .unwrap();
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &clearinghouse_state_frame().clearinghouse_state,
+            &spot,
+        )
+        .unwrap();
+        let connected = AccountState::new(
+            account_id,
+            AccountType::Margin,
+            balances,
+            margins,
+            true,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        );
+        let mut account = MarginAccount::new(connected, false);
+        let mut withdrawn = clearinghouse_state_frame();
+        let state = &mut withdrawn.clearinghouse_state;
+        let cross = state.cross_margin_summary.as_mut().unwrap();
+        cross.account_value = dec!(0);
+        cross.total_raw_usd = dec!(0);
+        let account_wide = state.margin_summary.as_mut().unwrap();
+        account_wide.account_value = dec!(4.967826);
+        account_wide.total_raw_usd = dec!(-95.059824);
+        state.withdrawable = Some(dec!(0));
+
+        account
+            .apply(parse_ws_account_state(&withdrawn, account_id, UnixNanos::from(2)).unwrap())
+            .unwrap();
+
+        let usdc = account.balance(Some(Currency::USDC())).unwrap();
+        assert_eq!(usdc.total.as_decimal(), dec!(4.981226));
+        assert_eq!(usdc.free.as_decimal(), dec!(0));
+        assert_eq!(usdc.locked.as_decimal(), dec!(4.981226));
+        let purr = account.balance(Some(Currency::from("PURR"))).unwrap();
+        assert_eq!(purr.total.as_decimal(), dec!(10));
+        assert_eq!(purr.free.as_decimal(), dec!(10));
+        let margin = account.account_margin(&Currency::USDC()).unwrap();
+        assert_eq!(margin.initial.as_decimal(), dec!(4.967826));
+        assert_eq!(margin.maintenance.as_decimal(), dec!(4.967826));
     }
 }

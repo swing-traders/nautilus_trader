@@ -1553,11 +1553,40 @@ async fn test_request_account_state_preserves_parsed_margins() {
     let margin = &account_state.margins[0];
     assert!(
         margin.instrument_id.is_none(),
-        "Hyperliquid emits account-wide (cross margin) entries, not per-instrument",
+        "Hyperliquid emits account-wide entries, not per-instrument",
     );
     assert_eq!(margin.currency.code.as_str(), "USDC");
     assert_eq!(margin.initial.as_f64(), 1250.0);
     assert_eq!(margin.maintenance.as_f64(), 1250.0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_account_state_reads_margin_used_from_the_account_wide_summary() {
+    // An isolated position's margin is in the account-wide summary alone
+    let state = TestServerState::default();
+    let frame = load_json("ws_clearinghouse_state.json");
+    *state.clearinghouse_response.lock().await = Some(frame["data"]["clearinghouseState"].clone());
+    let addr = start_mock_server(state.clone()).await;
+
+    let client = create_domain_client(&addr);
+    let account_state = client
+        .request_account_state("0x1234567890abcdef1234567890abcdef12345678")
+        .await
+        .expect("request_account_state should succeed");
+
+    assert_eq!(account_state.margins.len(), 1);
+    let margin = &account_state.margins[0];
+    assert!(margin.instrument_id.is_none());
+    assert_eq!(margin.currency.code.as_str(), "USDC");
+    assert_eq!(
+        margin.initial.as_decimal(),
+        rust_decimal_macros::dec!(4.967826)
+    );
+    assert_eq!(
+        margin.maintenance.as_decimal(),
+        rust_decimal_macros::dec!(4.967826)
+    );
 }
 
 fn create_test_client(addr: &SocketAddr) -> TestHttpClient {

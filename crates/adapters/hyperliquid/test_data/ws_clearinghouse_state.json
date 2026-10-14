@@ -1,0 +1,49 @@
+{
+  "channel": "clearinghouseState",
+  "data": {
+    "dex": "",
+    "user": "0x1234567890abcdef1234567890abcdef12345678",
+    "clearinghouseState": {
+      "assetPositions": [
+        {
+          "position": {
+            "coin": "ETH",
+            "cumFunding": {
+              "allTime": "514.085417",
+              "sinceChange": "0.0",
+              "sinceOpen": "0.0"
+            },
+            "entryPx": "2986.3",
+            "leverage": {
+              "rawUsd": "-95.059824",
+              "type": "isolated",
+              "value": 20
+            },
+            "liquidationPx": "2866.26936529",
+            "marginUsed": "4.967826",
+            "maxLeverage": 50,
+            "positionValue": "100.02765",
+            "returnOnEquity": "-0.0026789",
+            "szi": "0.0335",
+            "unrealizedPnl": "-0.0134"
+          },
+          "type": "oneWay"
+        }
+      ],
+      "crossMaintenanceMarginUsed": "0.0",
+      "crossMarginSummary": {
+        "accountValue": "13104.514502",
+        "totalMarginUsed": "0.0",
+        "totalNtlPos": "0.0",
+        "totalRawUsd": "13104.514502"
+      },
+      "marginSummary": {
+        "accountValue": "13109.482328",
+        "totalMarginUsed": "4.967826",
+        "totalNtlPos": "100.02765",
+        "totalRawUsd": "13009.454678"
+      },
+      "withdrawable": "13104.514502"
+    }
+  }
+}

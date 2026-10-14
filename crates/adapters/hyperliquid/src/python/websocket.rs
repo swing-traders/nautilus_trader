@@ -474,6 +474,16 @@ impl HyperliquidWebSocketClient {
                                         }
                                     });
                                 }
+                                NautilusWsMessage::AccountState(account_state) => {
+                                    Python::attach(|py| match Py::new(py, account_state) {
+                                        Ok(py_obj) => {
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj.into_any());
+                                        }
+                                        Err(e) => {
+                                            log::error!("Error converting AccountState to Python: {e}");
+                                        }
+                                    });
+                                }
                                 NautilusWsMessage::ExecutionReports(reports) => {
                                     Python::attach(|py| {
                                         for report in reports {
@@ -955,6 +965,43 @@ impl HyperliquidWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
                 .subscribe_user_events(&user)
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Subscribes to the clearinghouse state (positions and margin summaries) for a specific
+    /// user address on the first perp dex, the one the HTTP clearinghouse state reports.
+    #[pyo3(name = "subscribe_clearinghouse_state")]
+    fn py_subscribe_clearinghouse_state<'py>(
+        &self,
+        py: Python<'py>,
+        user: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_clearinghouse_state(&user)
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Unsubscribes from the clearinghouse state for a specific user address.
+    #[pyo3(name = "unsubscribe_clearinghouse_state")]
+    fn py_unsubscribe_clearinghouse_state<'py>(
+        &self,
+        py: Python<'py>,
+        user: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_clearinghouse_state(&user)
                 .await
                 .map_err(to_pyruntime_err)?;
             Ok(())

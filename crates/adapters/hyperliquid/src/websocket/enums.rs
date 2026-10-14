@@ -69,6 +69,8 @@ pub enum HyperliquidWsChannel {
     UserTwapHistory,
     #[serde(rename = "webData2")]
     WebData2,
+    #[serde(rename = "clearinghouseState")]
+    ClearinghouseState,
     /// Generic user channel - Hyperliquid sends fills/events on this channel.
     #[serde(rename = "user")]
     User,
@@ -103,6 +105,7 @@ impl HyperliquidWsChannel {
             Self::UserTwapSliceFills => "userTwapSliceFills",
             Self::UserTwapHistory => "userTwapHistory",
             Self::WebData2 => "webData2",
+            Self::ClearinghouseState => "clearinghouseState",
             Self::User => "user",
             Self::Post => "post",
             Self::Pong => "pong",
@@ -185,6 +188,7 @@ mod tests {
         "userNonFundingLedgerUpdates"
     )]
     #[case(HyperliquidWsChannel::Bbo, "bbo")]
+    #[case(HyperliquidWsChannel::ClearinghouseState, "clearinghouseState")]
     fn test_as_str_method(#[case] channel: HyperliquidWsChannel, #[case] expected: &str) {
         assert_eq!(channel.as_str(), expected);
     }
@@ -224,12 +228,13 @@ mod tests {
         assert!(HyperliquidWsChannel::UserFundings.is_private());
         assert!(HyperliquidWsChannel::UserNonFundingLedgerUpdates.is_private());
         assert!(HyperliquidWsChannel::Post.is_private());
+        assert!(HyperliquidWsChannel::ClearinghouseState.is_private());
     }
 
     #[rstest]
     fn test_enum_iter() {
         let channels: Vec<HyperliquidWsChannel> = HyperliquidWsChannel::iter().collect();
-        assert_eq!(channels.len(), 23);
+        assert_eq!(channels.len(), 24);
         assert!(channels.contains(&HyperliquidWsChannel::Trades));
         assert!(channels.contains(&HyperliquidWsChannel::L2Book));
         assert!(channels.contains(&HyperliquidWsChannel::UserFills));

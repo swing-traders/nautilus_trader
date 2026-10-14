@@ -261,6 +261,14 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 LogColor.BLUE,
             )
 
+            # Subscribed after the account snapshot is applied, so every push is newer than the
+            # state it replaces.
+            await self._ws_client.subscribe_clearinghouse_state(self._account_address)
+            self._log.info(
+                f"Subscribed to clearinghouse state for {self._account_address}",
+                LogColor.BLUE,
+            )
+
     def _sync_cloid_cache(self) -> None:
         orders = self._cache.orders(venue=self.venue)
         if not orders:

@@ -471,7 +471,8 @@ impl HyperliquidDataClient {
                                 NautilusWsMessage::Error(e) => {
                                     log::warn!("WebSocket error: {e}");
                                 }
-                                NautilusWsMessage::ExecutionReports(_) => {
+                                NautilusWsMessage::ExecutionReports(_)
+                                | NautilusWsMessage::AccountState(_) => {
                                     // Handled by execution client
                                 }
                             }

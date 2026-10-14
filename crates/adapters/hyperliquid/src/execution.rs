@@ -1681,6 +1681,12 @@ impl ExecutionClient for HyperliquidExecutionClient {
             self.refresh_account_state().await?;
             self.await_account_registered(30.0).await?;
 
+            // Subscribed once the snapshot is applied, so every push is newer than the state it
+            // replaces.
+            self.ws_client
+                .subscribe_clearinghouse_state(&self.get_account_address()?)
+                .await?;
+
             Ok::<(), anyhow::Error>(())
         };
 
@@ -2209,6 +2215,14 @@ impl HyperliquidExecutionClient {
                                     }
                                 }
                             }
+                        }
+                        NautilusWsMessage::AccountState(account_state) => {
+                            emitter.emit_account_state(
+                                account_state.balances,
+                                account_state.margins,
+                                account_state.is_reported,
+                                account_state.ts_event,
+                            );
                         }
                         // Reconnected is handled by WS client internally
                         // (resubscribe_all) and never forwarded here

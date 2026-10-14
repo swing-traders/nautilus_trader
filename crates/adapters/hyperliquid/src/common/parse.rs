@@ -916,7 +916,8 @@ pub fn parse_trigger_price(trigger_px: &str) -> anyhow::Result<Decimal> {
 ///
 /// Total is the realized collateral: the account value less the unrealized PnL of every
 /// position, since Hyperliquid's `totalRawUsd` moves with the open cost basis and its
-/// `withdrawable` with marks. Free is the withdrawable balance, capped at that total.
+/// `withdrawable` with marks. Free is the withdrawable balance, capped at that total. The
+/// margin is the account's margin used, cross and isolated, stated even at zero.
 ///
 /// # Errors
 ///
@@ -936,10 +937,14 @@ pub fn parse_account_balances_and_margins(
         None => return Ok((balances, margins)),
     };
 
-    // Isolated margin is the account's collateral too, and only the account-wide summary
-    // carries it: the cross summary values cross positions alone.
-    let (account_value, total_ntl_pos) = match &state.margin_summary {
-        Some(margin_summary) => (margin_summary.account_value, margin_summary.total_ntl_pos),
+    // Isolated collateral and margin are the account's too, and only the account-wide summary
+    // carries them: the cross summary values cross positions alone.
+    let (account_value, total_ntl_pos, margin_used) = match &state.margin_summary {
+        Some(margin_summary) => (
+            margin_summary.account_value,
+            margin_summary.total_ntl_pos,
+            margin_summary.total_margin_used,
+        ),
         None => {
             let all_cross = state.asset_positions.iter().all(|asset_position| {
                 asset_position.position.leverage.leverage_type == HyperliquidLeverageType::Cross
@@ -954,6 +959,7 @@ pub fn parse_account_balances_and_margins(
             (
                 cross_margin_summary.account_value,
                 cross_margin_summary.total_ntl_pos,
+                cross_margin_summary.total_margin_used,
             )
         }
     };
@@ -982,25 +988,22 @@ pub fn parse_account_balances_and_margins(
         currency,
     )?);
 
-    let margin_used = cross_margin_summary.total_margin_used;
-
-    if margin_used > Decimal::ZERO {
-        // Hyperliquid perps use a single-collateral (USDC) cross-margin model, so the
-        // reserved margin is emitted as an account-wide entry keyed by USDC.
-        let initial_margin = Money::from_decimal(margin_used, currency)?;
-        let maintenance_margin = Money::from_decimal(margin_used, currency)?;
-        margins.push(MarginBalance::new(initial_margin, maintenance_margin, None));
-    }
+    // Hyperliquid perps are collateralized in USDC, so the margin used is one account-wide
+    // entry keyed by USDC, stated even at zero: a push may carry no balance, and an account
+    // state carrying neither leaves the account's margin standing.
+    let margin = Money::from_decimal(margin_used, currency)?;
+    margins.push(MarginBalance::new(margin, margin, None));
 
     Ok((balances, margins))
 }
 
 /// Merges perp clearinghouse balances with spot balances into a unified set.
 ///
-/// The perp parser already reflects combined USDC when its cross-margin summary
-/// carries collateral or margin state, so this helper appends only non-USDC spot
-/// tokens in that case. If the perp state has no margin summary, or the summary
-/// is present but zeroed, spot USDC is used verbatim.
+/// The perp parser already reflects combined USDC when the summary it values the
+/// account from (the account-wide summary, else the cross-margin summary) carries
+/// collateral or margin state, so this helper appends only non-USDC spot tokens in
+/// that case. If the perp state has no cross-margin summary, or the summary is
+/// zeroed, spot USDC is used verbatim.
 ///
 /// # Errors
 ///
@@ -1014,9 +1017,13 @@ pub fn parse_combined_account_balances_and_margins(
     let perp_reflects_usdc = perp_state
         .cross_margin_summary
         .as_ref()
-        .is_some_and(|summary| {
-            summary.total_raw_usd != Decimal::ZERO
-                || summary.total_margin_used > Decimal::ZERO
+        .is_some_and(|cross| {
+            let (total_raw_usd, total_margin_used) = match &perp_state.margin_summary {
+                Some(summary) => (summary.total_raw_usd, summary.total_margin_used),
+                None => (cross.total_raw_usd, cross.total_margin_used),
+            };
+            total_raw_usd != Decimal::ZERO
+                || total_margin_used > Decimal::ZERO
                 || perp_state.withdrawable.unwrap_or(Decimal::ZERO) > Decimal::ZERO
         });
 
@@ -2079,6 +2086,14 @@ mod tests {
         assert!(wide > tight);
     }
 
+    fn assert_usdc_margin(margins: &[MarginBalance], margin_used: Decimal) {
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].initial.as_decimal(), margin_used);
+        assert_eq!(margins[0].maintenance.as_decimal(), margin_used);
+        assert_eq!(margins[0].currency.code.as_str(), "USDC");
+        assert!(margins[0].instrument_id.is_none());
+    }
+
     // Total is the realized collateral in every position regime, moving only when
     // collateral does and never with marks or open notional.
     #[rstest]
@@ -2110,7 +2125,7 @@ mod tests {
         assert_eq!(balance.free.as_decimal(), dec!(10000));
         assert_eq!(balance.locked.as_decimal(), dec!(0));
         assert_eq!(balance.currency.code.as_str(), "USDC");
-        assert!(margins.is_empty());
+        assert_usdc_margin(&margins, dec!(0));
     }
 
     #[rstest]
@@ -2400,8 +2415,8 @@ mod tests {
         // 10,000 collateral with 100 allocated to an isolated long of 1,000 entry
         // notional, mark +2%: the cross summary sees only the 9,900 left behind while
         // the account summary sees 9,900 + 100 + 20 = 10,020, so total is
-        // 10,020 - 20 = 10,000 and the 100 in isolated margin is locked. The margin
-        // balance stays the cross summary's own margin used.
+        // 10,020 - 20 = 10,000 and the 100 in isolated margin is locked. The margin is
+        // the account summary's margin used, the isolated 100 included.
         let json = r#"{
             "assetPositions": [{
                 "position": {
@@ -2444,7 +2459,28 @@ mod tests {
         assert_eq!(balance.free.as_decimal(), dec!(9900));
         assert_eq!(balance.locked.as_decimal(), dec!(100));
         assert_eq!(balance.currency.code.as_str(), "USDC");
-        assert!(margins.is_empty());
+        assert_usdc_margin(&margins, dec!(100));
+    }
+
+    #[rstest]
+    fn test_parse_account_balances_reads_margin_used_from_the_account_wide_summary() {
+        // Hyperliquid's own example: an isolated ETH position holds 4.967826 of margin,
+        // which the cross summary's zero leaves out and the account-wide summary counts.
+        let frame: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/ws_clearinghouse_state.json"))
+                .unwrap();
+        let state: ClearinghouseState =
+            serde_json::from_value(frame["data"]["clearinghouseState"].clone()).unwrap();
+
+        let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
+
+        assert_usdc_margin(&margins, dec!(4.967826));
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_decimal(), dec!(13109.495728));
+        assert_eq!(balance.free.as_decimal(), dec!(13104.514502));
+        assert_eq!(balance.locked.as_decimal(), dec!(4.981226));
+        assert_eq!(balance.currency.code.as_str(), "USDC");
     }
 
     #[rstest]
@@ -2470,7 +2506,7 @@ mod tests {
         assert_eq!(balance.free.as_decimal(), dec!(10000));
         assert_eq!(balance.locked.as_decimal(), dec!(0));
         assert_eq!(balance.currency.code.as_str(), "USDC");
-        assert!(margins.is_empty());
+        assert_usdc_margin(&margins, dec!(0));
     }
 
     #[rstest]
@@ -2553,7 +2589,7 @@ mod tests {
         let state: ClearinghouseState = serde_json::from_str(json).unwrap();
         let (balances, margins) = parse_account_balances_and_margins(&state).unwrap();
 
-        assert!(margins.is_empty());
+        assert_usdc_margin(&margins, dec!(0));
         assert_eq!(balances.len(), 1);
         let balance = &balances[0];
         assert_eq!(balance.total.as_decimal(), dec!(-10));
@@ -2660,7 +2696,7 @@ mod tests {
         let (balances, margins) =
             parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
 
-        assert!(margins.is_empty());
+        assert_usdc_margin(&margins, dec!(0));
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].currency.code.as_str(), "USDC");
         assert_eq!(balances[0].total.as_decimal(), dec!(500));
@@ -2694,7 +2730,7 @@ mod tests {
         let (balances, margins) =
             parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
 
-        assert!(margins.is_empty());
+        assert_usdc_margin(&margins, dec!(0));
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].currency.code.as_str(), "USDC");
         assert_eq!(balances[0].total.as_decimal(), dec!(75));
@@ -2729,7 +2765,7 @@ mod tests {
         let (balances, margins) =
             parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
 
-        assert!(margins.is_empty());
+        assert_usdc_margin(&margins, dec!(0));
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].currency.code.as_str(), "USDC");
         assert_eq!(balances[0].total.as_decimal(), dec!(50));
@@ -2763,7 +2799,7 @@ mod tests {
         let (balances, margins) =
             parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
 
-        assert!(margins.is_empty());
+        assert_usdc_margin(&margins, dec!(0));
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].currency.code.as_str(), "USDC");
         assert_eq!(balances[0].total.as_decimal(), dec!(-50));
@@ -2797,7 +2833,7 @@ mod tests {
         let (balances, margins) =
             parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
 
-        assert_eq!(margins.len(), 1);
+        assert_usdc_margin(&margins, dec!(25));
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].currency.code.as_str(), "USDC");
         assert_eq!(balances[0].total.as_decimal(), dec!(0));
@@ -2833,7 +2869,7 @@ mod tests {
         let (balances, margins) =
             parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
 
-        assert!(margins.is_empty());
+        assert_usdc_margin(&margins, dec!(0));
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].currency.code.as_str(), "USDC");
         assert_eq!(balances[0].total.as_decimal(), dec!(0));
@@ -2860,5 +2896,38 @@ mod tests {
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].currency.code.as_str(), "USDC");
         assert_eq!(balances[0].total.as_decimal(), dec!(50));
+    }
+
+    #[rstest]
+    fn test_parse_combined_states_zero_margin_used_without_a_balance() {
+        // A flat summary leaves USDC to the spot side, so with no spot balances the state
+        // carries the zero margin used alone, which still replaces a margin held before.
+        let perp_json = r#"{
+            "assetPositions": [],
+            "marginSummary": {
+                "accountValue": "0",
+                "totalNtlPos": "0",
+                "totalRawUsd": "0",
+                "totalMarginUsed": "0"
+            },
+            "crossMarginSummary": {
+                "accountValue": "0",
+                "totalNtlPos": "0",
+                "totalRawUsd": "0",
+                "totalMarginUsed": "0"
+            },
+            "crossMaintenanceMarginUsed": "0",
+            "withdrawable": "0"
+        }"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            &SpotClearinghouseState::default(),
+        )
+        .unwrap();
+
+        assert!(balances.is_empty());
+        assert_usdc_margin(&margins, dec!(0));
     }
 }

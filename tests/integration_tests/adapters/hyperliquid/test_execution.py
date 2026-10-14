@@ -14,11 +14,16 @@
 # -------------------------------------------------------------------------------------------------
 
 import asyncio
+import json
 from decimal import Decimal
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import pytest
+import pytest_asyncio
+from aiohttp import WSMsgType
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from nautilus_trader.adapters.hyperliquid.config import HyperliquidExecClientConfig
 from nautilus_trader.adapters.hyperliquid.constants import HYPERLIQUID_VENUE
@@ -46,6 +51,9 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import OrderListId
 from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.objects import AccountBalance
+from nautilus_trader.model.objects import MarginBalance
+from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import LimitOrder
@@ -73,14 +81,16 @@ def exec_client_builder(
         config_kwargs: dict | None = None,
         account_address: str | None = None,
         resolved_account_address: str | None = "0x1234567890abcdef1234567890abcdef12345678",
+        real_ws: bool = False,
     ):
-        ws_client = _create_ws_mock()
+        ws_client: MagicMock | nautilus_pyo3.HyperliquidWebSocketClient = _create_ws_mock()
         ws_iter = iter([ws_client])
 
-        monkeypatch.setattr(
-            "nautilus_trader.adapters.hyperliquid.execution.nautilus_pyo3.HyperliquidWebSocketClient",
-            lambda *args, **kwargs: next(ws_iter),
-        )
+        if not real_ws:
+            monkeypatch.setattr(
+                "nautilus_trader.adapters.hyperliquid.execution.nautilus_pyo3.HyperliquidWebSocketClient",
+                lambda *args, **kwargs: next(ws_iter),
+            )
 
         # Skip account registration wait in tests
         monkeypatch.setattr(
@@ -120,9 +130,104 @@ def exec_client_builder(
             account_address=account_address,
         )
 
+        if real_ws:
+            ws_client = client._ws_client
+
         return client, ws_client, mock_http_client, mock_instrument_provider
 
     return builder
+
+
+# Hyperliquid's own example: an isolated ETH position holds 4.967826 of margin, which the
+# cross summary's zero leaves out and the account-wide summary counts.
+_CLEARINGHOUSE_STATE = {
+    "assetPositions": [
+        {
+            "position": {
+                "coin": "ETH",
+                "cumFunding": {"allTime": "514.085417", "sinceChange": "0.0", "sinceOpen": "0.0"},
+                "entryPx": "2986.3",
+                "leverage": {"rawUsd": "-95.059824", "type": "isolated", "value": 20},
+                "liquidationPx": "2866.26936529",
+                "marginUsed": "4.967826",
+                "maxLeverage": 50,
+                "positionValue": "100.02765",
+                "returnOnEquity": "-0.0026789",
+                "szi": "0.0335",
+                "unrealizedPnl": "-0.0134",
+            },
+            "type": "oneWay",
+        },
+    ],
+    "crossMaintenanceMarginUsed": "0.0",
+    "crossMarginSummary": {
+        "accountValue": "13104.514502",
+        "totalMarginUsed": "0.0",
+        "totalNtlPos": "0.0",
+        "totalRawUsd": "13104.514502",
+    },
+    "marginSummary": {
+        "accountValue": "13109.482328",
+        "totalMarginUsed": "4.967826",
+        "totalNtlPos": "100.02765",
+        "totalRawUsd": "13009.454678",
+    },
+    "withdrawable": "13104.514502",
+}
+
+# The channel's documented shape: the summaries and withdrawable as JSON numbers
+_CLEARINGHOUSE_STATE_NUMERIC = {
+    **_CLEARINGHOUSE_STATE,
+    "crossMaintenanceMarginUsed": 0.0,
+    "crossMarginSummary": {
+        "accountValue": 13104.514502,
+        "totalMarginUsed": 0.0,
+        "totalNtlPos": 0.0,
+        "totalRawUsd": 13104.514502,
+    },
+    "marginSummary": {
+        "accountValue": 13109.482328,
+        "totalMarginUsed": 4.967826,
+        "totalNtlPos": 100.02765,
+        "totalRawUsd": 13009.454678,
+    },
+    "withdrawable": 13104.514502,
+}
+
+
+@pytest_asyncio.fixture
+async def clearinghouse_state_ws_server(event_loop, request):
+    # A venue double pushing the account's clearinghouse state on its subscription
+    clearinghouse_state = request.param
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        pushed = False
+
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                continue
+            payload = json.loads(msg.data)
+            subscription = payload.get("subscription", {})
+            if subscription.get("type") == "clearinghouseState" and not pushed:
+                pushed = True
+                user = subscription["user"]
+                frame = {
+                    "channel": "clearinghouseState",
+                    "data": {"dex": "", "user": user, "clearinghouseState": clearinghouse_state},
+                }
+                await ws.send_str(json.dumps(frame))
+        return ws
+
+    app = web.Application()
+    app.add_routes([web.get("/ws", handler)])
+
+    server = TestServer(app)
+    await server.start_server(loop=event_loop)
+    yield server
+    await server.close()
 
 
 @pytest.mark.asyncio
@@ -146,6 +251,7 @@ async def test_resolved_config_account_address_used_for_subscriptions(
         assert client._account_address == agent_account
         ws_client.subscribe_order_updates.assert_awaited_once_with(agent_account)
         ws_client.subscribe_user_events.assert_awaited_once_with(agent_account)
+        ws_client.subscribe_clearinghouse_state.assert_awaited_once_with(agent_account)
     finally:
         await client._disconnect()
 
@@ -167,6 +273,7 @@ async def test_factory_account_address_used_for_subscriptions(exec_client_builde
         http_client.get_user_address.assert_not_called()
         ws_client.subscribe_order_updates.assert_awaited_once_with(account_address)
         ws_client.subscribe_user_events.assert_awaited_once_with(account_address)
+        ws_client.subscribe_clearinghouse_state.assert_awaited_once_with(account_address)
     finally:
         await client._disconnect()
 
@@ -199,11 +306,88 @@ async def test_connect_success(exec_client_builder, monkeypatch):
         ws_client.connect.assert_awaited_once()
         ws_client.subscribe_order_updates.assert_awaited_once()
         ws_client.subscribe_user_events.assert_awaited_once()
+        ws_client.subscribe_clearinghouse_state.assert_awaited_once()
     finally:
         await client._disconnect()
 
     # Assert
     ws_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_connect_subscribes_clearinghouse_state_after_the_account_snapshot(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, ws_client, _, _ = exec_client_builder(monkeypatch)
+    sequence: list[str] = []
+    monkeypatch.setattr(
+        client,
+        "generate_account_state",
+        lambda **kwargs: sequence.append("account_state"),
+    )
+    ws_client.subscribe_clearinghouse_state.side_effect = lambda user: sequence.append(
+        "subscribe_clearinghouse_state",
+    )
+
+    # Act
+    await client._connect()
+    await client._disconnect()
+
+    # Assert
+    assert sequence == ["account_state", "subscribe_clearinghouse_state"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "clearinghouse_state_ws_server",
+    [_CLEARINGHOUSE_STATE, _CLEARINGHOUSE_STATE_NUMERIC],
+    ids=["strings", "numbers"],
+    indirect=True,
+)
+async def test_pushed_clearinghouse_state_generates_the_account_wide_margin(
+    exec_client_builder,
+    monkeypatch,
+    clearinghouse_state_ws_server,
+):
+    # Arrange
+    url = str(clearinghouse_state_ws_server.make_url("/ws")).replace("http://", "ws://", 1)
+    client, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"base_url_ws": url},
+        real_ws=True,
+    )
+    generate_account_state = MagicMock()
+    monkeypatch.setattr(client, "generate_account_state", generate_account_state)
+
+    # Act
+    await client._connect()
+    try:
+        # The connect-time read states no margin, so a margin can only come from the push
+        for _ in range(200):
+            if any(call.kwargs["margins"] for call in generate_account_state.call_args_list):
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await client._disconnect()
+
+    # Assert
+    pushed = generate_account_state.call_args_list[-1].kwargs
+    assert pushed["margins"] == [
+        MarginBalance(
+            initial=Money.from_str("4.967826 USDC"),
+            maintenance=Money.from_str("4.967826 USDC"),
+        ),
+    ]
+    assert pushed["balances"] == [
+        AccountBalance(
+            total=Money.from_str("13109.495728 USDC"),
+            locked=Money.from_str("4.981226 USDC"),
+            free=Money.from_str("13104.514502 USDC"),
+        ),
+    ]
+    assert pushed["reported"] is True
 
 
 @pytest.mark.asyncio

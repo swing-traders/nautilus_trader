@@ -132,6 +132,17 @@ struct TestServerState {
     user_fills_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     /// Optional override for `historicalOrders` info responses; defaults to `[]`.
     historical_orders_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+
+    /// Every WebSocket subscription received, in order.
+    ws_subscriptions: Arc<tokio::sync::Mutex<Vec<Value>>>,
+
+    /// A frame pushed once, on the first `clearinghouseState` subscription.
+    ws_push_on_clearinghouse_subscription: Arc<tokio::sync::Mutex<Option<Value>>>,
+
+    /// A clearinghouse state the socket pushes on `push_clearinghouse_state`; while set, a
+    /// `spotClearinghouseState` request pushes it first when the channel is subscribed.
+    clearinghouse_push: Arc<tokio::sync::Mutex<Option<Value>>>,
+    push_clearinghouse_state: Arc<tokio::sync::Notify>,
     rate_limit_after: Arc<AtomicUsize>,
     /// When set, `handle_exchange` awaits `pause_release` before returning.
     /// Lets a test hold the response so it can assert on synchronous state
@@ -159,6 +170,10 @@ impl Default for TestServerState {
             last_clearinghouse_user: Arc::new(tokio::sync::Mutex::new(None)),
             user_fills_response: Arc::new(tokio::sync::Mutex::new(None)),
             historical_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
+            ws_subscriptions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            ws_push_on_clearinghouse_subscription: Arc::new(tokio::sync::Mutex::new(None)),
+            clearinghouse_push: Arc::new(tokio::sync::Mutex::new(None)),
+            push_clearinghouse_state: Arc::new(tokio::sync::Notify::new()),
             rate_limit_after: Arc::new(AtomicUsize::new(usize::MAX)),
             pause_next_exchange: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pause_release: Arc::new(tokio::sync::Notify::new()),
@@ -297,6 +312,21 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
             .into_response()
         }
         "spotClearinghouseState" => {
+            let push_first = state.clearinghouse_push.lock().await.is_some()
+                && state
+                    .ws_subscriptions
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|subscription| subscription["type"] == "clearinghouseState");
+
+            if push_first {
+                state.push_clearinghouse_state.notify_one();
+
+                // Lets the push reach the client ahead of this reply
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
             if let Some(body) = state.spot_clearinghouse_response.lock().await.clone() {
                 Json(body).into_response()
             } else {
@@ -680,7 +710,24 @@ async fn send_ws_post_error_response(socket: &mut WebSocket, id: u64, payload: &
 }
 
 async fn handle_ws_socket(mut socket: WebSocket, state: TestServerState) {
-    while let Some(message) = socket.next().await {
+    loop {
+        let message = tokio::select! {
+            message = socket.next() => message,
+            () = state.push_clearinghouse_state.notified() => {
+                let frame = state.clearinghouse_push.lock().await.clone();
+
+                if let Some(frame) = frame
+                    && socket
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(message) = message else { break };
         let Ok(message) = message else { break };
 
         match message {
@@ -700,7 +747,29 @@ async fn handle_ws_socket(mut socket: WebSocket, state: TestServerState) {
                             }
                         }
                         Some("subscribe") => {
-                            // Acknowledge subscription silently
+                            let subscription =
+                                payload.get("subscription").cloned().unwrap_or(Value::Null);
+                            let is_clearinghouse = subscription["type"] == "clearinghouseState";
+                            state.ws_subscriptions.lock().await.push(subscription);
+
+                            let push = if is_clearinghouse {
+                                state
+                                    .ws_push_on_clearinghouse_subscription
+                                    .lock()
+                                    .await
+                                    .take()
+                            } else {
+                                None
+                            };
+
+                            if let Some(frame) = push
+                                && socket
+                                    .send(Message::Text(frame.to_string().into()))
+                                    .await
+                                    .is_err()
+                            {
+                                break;
+                            }
                         }
                         Some("unsubscribe") => {}
                         Some("post") if !handle_ws_post(&mut socket, &state, &payload).await => {
@@ -2175,6 +2244,173 @@ async fn test_query_account_propagates_spot_endpoint_failure() {
     assert!(
         event.is_err(),
         "no AccountState must be emitted when spot state fails to parse; got {event:?}",
+    );
+}
+
+fn assert_account_wide_margin(account_state: &AccountState, margin_used: rust_decimal::Decimal) {
+    assert_eq!(account_state.margins.len(), 1);
+    let margin = &account_state.margins[0];
+    assert!(margin.instrument_id.is_none());
+    assert_eq!(margin.currency.code.as_str(), "USDC");
+    assert_eq!(margin.initial.as_decimal(), margin_used);
+    assert_eq!(margin.maintenance.as_decimal(), margin_used);
+}
+
+async fn next_account_state(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    matches: impl Fn(&AccountState) -> bool,
+) -> Option<AccountState> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        if let ExecutionEvent::Account(account_state) = event
+            && matches(&account_state)
+        {
+            return Some(account_state);
+        }
+    }
+    None
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_connect_reads_margin_used_from_the_account_wide_summary() {
+    let state = TestServerState::default();
+    let frame = load_json("ws_clearinghouse_state.json");
+    *state.perp_clearinghouse_response.lock().await =
+        Some(frame["data"]["clearinghouseState"].clone());
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    let account_state = next_account_state(&mut rx, |_| true).await;
+    client.disconnect().await.unwrap();
+
+    let account_state = account_state.expect("connect emits the account state");
+    assert_account_wide_margin(&account_state, rust_decimal_macros::dec!(4.967826));
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_connect_subscribes_clearinghouse_state_for_the_queried_account() {
+    let state = TestServerState::default();
+    let subscriptions = state.ws_subscriptions.clone();
+    let last_user = state.last_clearinghouse_user.clone();
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+
+    client.connect().await.unwrap();
+    let user = last_user
+        .lock()
+        .await
+        .clone()
+        .expect("connect queries the clearinghouse state");
+    let expected = json!({"type": "clearinghouseState", "user": user, "dex": ""});
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !subscriptions.lock().await.contains(&expected) && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    client.disconnect().await.unwrap();
+
+    let subscriptions = subscriptions.lock().await;
+    assert!(
+        subscriptions.contains(&expected),
+        "no {expected} among {subscriptions:?}"
+    );
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pushed_clearinghouse_state_emits_the_account_wide_margin() {
+    let state = TestServerState::default();
+    *state.ws_push_on_clearinghouse_subscription.lock().await =
+        Some(load_json("ws_clearinghouse_state.json"));
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+
+    // The connect-time read states no margin used, so a margin can only come from the push
+    let pushed = next_account_state(&mut rx, |account_state| {
+        account_state
+            .margins
+            .iter()
+            .any(|margin| !margin.initial.is_zero())
+    })
+    .await;
+    client.disconnect().await.unwrap();
+
+    let pushed = pushed.expect("the pushed clearinghouse state is emitted");
+    assert!(pushed.is_reported);
+    assert_account_wide_margin(&pushed, rust_decimal_macros::dec!(4.967826));
+    assert_eq!(pushed.balances.len(), 1);
+    let balance = &pushed.balances[0];
+    assert_eq!(balance.currency.code.as_str(), "USDC");
+    assert_eq!(
+        balance.total.as_decimal(),
+        rust_decimal_macros::dec!(13109.495728)
+    );
+    assert_eq!(
+        balance.free.as_decimal(),
+        rust_decimal_macros::dec!(13104.514502)
+    );
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_connect_applies_the_snapshot_before_any_pushed_clearinghouse_state() {
+    // The venue pushes a newer state during the spot read whenever the account channel is
+    // already subscribed, and again once connected.
+    let state = TestServerState::default();
+    *state.clearinghouse_push.lock().await = Some(load_json("ws_clearinghouse_state.json"));
+    let subscriptions = state.ws_subscriptions.clone();
+    let push = state.push_clearinghouse_state.clone();
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    wait_until_async(
+        || {
+            let subscriptions = subscriptions.clone();
+            async move {
+                subscriptions
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|subscription| subscription["type"] == "clearinghouseState")
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    push.notify_one();
+    let mut margins_used = Vec::new();
+
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        if let ExecutionEvent::Account(account_state) = event {
+            margins_used.push(
+                account_state
+                    .margins
+                    .first()
+                    .map(|margin| margin.initial.as_decimal()),
+            );
+        }
+    }
+    client.disconnect().await.unwrap();
+
+    assert_eq!(
+        margins_used,
+        vec![
+            Some(rust_decimal_macros::dec!(0)),
+            Some(rust_decimal_macros::dec!(4.967826)),
+        ]
     );
 }
 

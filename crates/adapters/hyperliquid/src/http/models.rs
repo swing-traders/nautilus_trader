@@ -16,7 +16,7 @@
 use std::fmt::Display;
 
 use alloy_primitives::{Address, keccak256};
-use nautilus_core::hex;
+use nautilus_core::{hex, serialization::deserialize_optional_decimal};
 use nautilus_model::identifiers::{ClientOrderId, VenueOrderId};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1998,7 +1998,7 @@ pub struct ClearinghouseState {
     #[serde(
         default,
         serialize_with = "serialize_optional_decimal_as_str",
-        deserialize_with = "deserialize_optional_decimal_from_str"
+        deserialize_with = "deserialize_optional_decimal"
     )]
     pub withdrawable: Option<Decimal>,
     /// Time of the state snapshot (milliseconds since epoch).
@@ -2193,28 +2193,28 @@ pub struct MarginSummary {
     #[serde(
         rename = "accountValue",
         serialize_with = "serialize_decimal_as_str",
-        deserialize_with = "deserialize_decimal_from_str"
+        deserialize_with = "deserialize_decimal_from_str_or_number"
     )]
     pub account_value: Decimal,
     /// Total notional position value.
     #[serde(
         rename = "totalNtlPos",
         serialize_with = "serialize_decimal_as_str",
-        deserialize_with = "deserialize_decimal_from_str"
+        deserialize_with = "deserialize_decimal_from_str_or_number"
     )]
     pub total_ntl_pos: Decimal,
     /// Total raw USD: the collateral less the signed entry notional of open positions.
     #[serde(
         rename = "totalRawUsd",
         serialize_with = "serialize_decimal_as_str",
-        deserialize_with = "deserialize_decimal_from_str"
+        deserialize_with = "deserialize_decimal_from_str_or_number"
     )]
     pub total_raw_usd: Decimal,
     /// Total margin used across all positions.
     #[serde(
         rename = "totalMarginUsed",
         serialize_with = "serialize_decimal_as_str",
-        deserialize_with = "deserialize_decimal_from_str"
+        deserialize_with = "deserialize_decimal_from_str_or_number"
     )]
     pub total_margin_used: Decimal,
 }
@@ -2227,28 +2227,28 @@ pub struct CrossMarginSummary {
     #[serde(
         rename = "accountValue",
         serialize_with = "serialize_decimal_as_str",
-        deserialize_with = "deserialize_decimal_from_str"
+        deserialize_with = "deserialize_decimal_from_str_or_number"
     )]
     pub account_value: Decimal,
     /// Total notional position value.
     #[serde(
         rename = "totalNtlPos",
         serialize_with = "serialize_decimal_as_str",
-        deserialize_with = "deserialize_decimal_from_str"
+        deserialize_with = "deserialize_decimal_from_str_or_number"
     )]
     pub total_ntl_pos: Decimal,
     /// Total raw USD: the collateral less the signed entry notional of open positions.
     #[serde(
         rename = "totalRawUsd",
         serialize_with = "serialize_decimal_as_str",
-        deserialize_with = "deserialize_decimal_from_str"
+        deserialize_with = "deserialize_decimal_from_str_or_number"
     )]
     pub total_raw_usd: Decimal,
     /// Total margin used by cross positions.
     #[serde(
         rename = "totalMarginUsed",
         serialize_with = "serialize_decimal_as_str",
-        deserialize_with = "deserialize_decimal_from_str"
+        deserialize_with = "deserialize_decimal_from_str_or_number"
     )]
     pub total_margin_used: Decimal,
     /// Withdrawable balance.
@@ -2256,7 +2256,17 @@ pub struct CrossMarginSummary {
         rename = "withdrawable",
         default,
         serialize_with = "serialize_optional_decimal_as_str",
-        deserialize_with = "deserialize_optional_decimal_from_str"
+        deserialize_with = "deserialize_optional_decimal"
     )]
     pub withdrawable: Option<Decimal>,
+}
+
+// The info endpoint returns the summaries as strings, and the WebSocket push is documented
+// with numbers.
+fn deserialize_decimal_from_str_or_number<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_decimal(deserializer)?
+        .ok_or_else(|| serde::de::Error::custom("expected a decimal string or number"))
 }

@@ -65,6 +65,9 @@ struct TestServerState {
     received_pong: Arc<AtomicBool>,
     last_pong: Arc<tokio::sync::Mutex<Option<Vec<u8>>>>,
     ping_count: Arc<AtomicUsize>,
+
+    /// Overrides the frame pushed on a `clearinghouseState` subscription.
+    clearinghouse_state_frame: Arc<tokio::sync::Mutex<Option<Value>>>,
 }
 
 impl Default for TestServerState {
@@ -81,6 +84,7 @@ impl Default for TestServerState {
             received_pong: Arc::new(AtomicBool::new(false)),
             last_pong: Arc::new(tokio::sync::Mutex::new(None)),
             ping_count: Arc::new(AtomicUsize::new(0)),
+            clearinghouse_state_frame: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -172,6 +176,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
     let book_payload = load_json("ws_book_data.json");
     let allmids_payload = load_json("ws_allmids.json");
     let all_dexs_asset_ctxs_payload = load_json("ws_all_dexs_asset_ctxs.json");
+    let clearinghouse_state_payload = load_json("ws_clearinghouse_state.json");
 
     while let Some(message) = socket.next().await {
         let Ok(message) = message else { break };
@@ -239,6 +244,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                                         }),
                                         "allMids" => allmids_payload.clone(),
                                         "allDexsAssetCtxs" => all_dexs_asset_ctxs_payload.clone(),
+                                        "clearinghouseState" => state
+                                            .clearinghouse_state_frame
+                                            .lock()
+                                            .await
+                                            .clone()
+                                            .unwrap_or_else(|| clearinghouse_state_payload.clone()),
                                         _ => json!({"channel": sub_type, "data": {}}),
                                     };
 
@@ -920,6 +931,147 @@ async fn test_subscribe_user_events() {
     .await;
 
     client.disconnect().await.expect("close failed");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_subscribe_clearinghouse_state_streams_the_account_state() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws");
+
+    let account_id = AccountId::from("HYPERLIQUID-001");
+    let mut client = connect_client(&ws_url, Some(account_id)).await;
+    client.connect().await.expect("connect failed");
+    wait_until_active(&client, 2.0)
+        .await
+        .expect("client inactive");
+
+    client
+        .subscribe_clearinghouse_state(TEST_USER_ADDRESS)
+        .await
+        .expect("subscribe failed");
+    let msg = tokio::time::timeout(Duration::from_secs(2), client.next_event())
+        .await
+        .expect("timed out waiting for the account state")
+        .expect("stream closed");
+
+    let NautilusWsMessage::AccountState(account_state) = msg else {
+        panic!("expected AccountState, was {msg:?}");
+    };
+    assert_eq!(account_state.account_id, account_id);
+    assert!(account_state.is_reported);
+    assert_eq!(account_state.margins.len(), 1);
+    assert_eq!(
+        account_state.margins[0].initial.as_decimal(),
+        rust_decimal_macros::dec!(4.967826)
+    );
+
+    // The first perp dex is named explicitly, as the pushed state names it
+    let subscription = json!({"type": "clearinghouseState", "user": TEST_USER_ADDRESS, "dex": ""});
+    assert_eq!(
+        state.subscriptions.lock().await.clone(),
+        vec![("clearinghouseState".to_string(), subscription.clone())]
+    );
+
+    client
+        .unsubscribe_clearinghouse_state(TEST_USER_ADDRESS)
+        .await
+        .expect("unsubscribe failed");
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { !state.unsubscriptions.lock().await.is_empty() }
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+
+    assert_eq!(
+        state.unsubscriptions.lock().await.clone(),
+        vec![subscription]
+    );
+
+    client.disconnect().await.expect("close failed");
+}
+
+// The channel's documented shape: the summaries and withdrawable as JSON numbers
+fn with_numeric_summaries(mut frame: Value) -> Value {
+    let to_number = |value: &Value| -> Value {
+        serde_json::from_str(value.as_str().expect("a decimal string")).unwrap()
+    };
+    let state = &mut frame["data"]["clearinghouseState"];
+
+    for summary in ["marginSummary", "crossMarginSummary"] {
+        for value in state[summary].as_object_mut().unwrap().values_mut() {
+            *value = to_number(value);
+        }
+    }
+
+    for field in ["crossMaintenanceMarginUsed", "withdrawable"] {
+        state[field] = to_number(&state[field]);
+    }
+    frame
+}
+
+#[rstest]
+#[case::strings(false)]
+#[case::numbers(true)]
+#[tokio::test]
+async fn test_pushed_clearinghouse_state_parses_strings_and_numbers(#[case] numeric: bool) {
+    let state = Arc::new(TestServerState::default());
+    let frame = load_json("ws_clearinghouse_state.json");
+    *state.clearinghouse_state_frame.lock().await = Some(if numeric {
+        with_numeric_summaries(frame)
+    } else {
+        frame
+    });
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws");
+
+    let account_id = AccountId::from("HYPERLIQUID-001");
+    let mut client = connect_client(&ws_url, Some(account_id)).await;
+    client.connect().await.expect("connect failed");
+    wait_until_active(&client, 2.0)
+        .await
+        .expect("client inactive");
+    client
+        .subscribe_clearinghouse_state(TEST_USER_ADDRESS)
+        .await
+        .expect("subscribe failed");
+    let msg = tokio::time::timeout(Duration::from_secs(2), client.next_event())
+        .await
+        .expect("timed out waiting for the account state")
+        .expect("stream closed");
+    client.disconnect().await.expect("close failed");
+
+    let NautilusWsMessage::AccountState(account_state) = msg else {
+        panic!("expected AccountState, was {msg:?}");
+    };
+    assert_eq!(account_state.margins.len(), 1);
+    let margin = &account_state.margins[0];
+    assert_eq!(
+        margin.initial.as_decimal(),
+        rust_decimal_macros::dec!(4.967826)
+    );
+    assert_eq!(
+        margin.maintenance.as_decimal(),
+        rust_decimal_macros::dec!(4.967826)
+    );
+    assert_eq!(account_state.balances.len(), 1);
+    let balance = &account_state.balances[0];
+    assert_eq!(
+        balance.total.as_decimal(),
+        rust_decimal_macros::dec!(13109.495728)
+    );
+    assert_eq!(
+        balance.free.as_decimal(),
+        rust_decimal_macros::dec!(13104.514502)
+    );
+    assert_eq!(
+        balance.locked.as_decimal(),
+        rust_decimal_macros::dec!(4.981226)
+    );
 }
 
 #[rstest]
