@@ -15,12 +15,14 @@
 
 import asyncio
 import json
+import pkgutil
 from decimal import Decimal
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import msgspec
 import pytest
+from pytest_mock import MockerFixture
 
 from nautilus_trader.adapters.binance.common.constants import BINANCE_VENUE
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
@@ -75,6 +77,7 @@ from nautilus_trader.trading.strategy import Strategy
 
 
 ETHUSDT_PERP_BINANCE = TestInstrumentProvider.ethusdt_perp_binance()
+BTCUSDT_PERP_BINANCE = TestInstrumentProvider.btcusdt_perp_binance()
 
 
 def _account_update_raw(wallet_balance: str) -> bytes:
@@ -3592,6 +3595,72 @@ class TestBinanceFuturesExecutionClient:
         # Assert
         assert query.await_count == 3
         assert symbol_config.await_count == 1
+
+    # -------------------------------------------------------------------------
+    # ACCOUNT_CONFIG_UPDATE leverage
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_account_config_update_sets_the_symbol_leverage(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        account = self.cache.account(self.exec_client.account_id)
+        account.set_leverage(BTCUSDT_PERP_BINANCE.id, Decimal(10))
+        query = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+        )
+        symbol_config = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_symbol_config",
+        )
+        raw = pkgutil.get_data(
+            package="tests.integration_tests.adapters.binance.resources.ws_messages",
+            resource="ws_futures_account_config_update_leverage.json",
+        )
+
+        # Act
+        self.exec_client._handle_user_ws_message(raw)
+        await self._settle()
+
+        # Assert
+        assert account.leverage(BTCUSDT_PERP_BINANCE.id) == Decimal(25)
+        query.assert_not_called()
+        symbol_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_account_config_update_of_the_multi_assets_mode_changes_no_leverage(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        account = self.cache.account(self.exec_client.account_id)
+        account.set_leverage(BTCUSDT_PERP_BINANCE.id, Decimal(10))
+        query = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+        )
+        symbol_config = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_symbol_config",
+        )
+        raw = pkgutil.get_data(
+            package="tests.integration_tests.adapters.binance.resources.ws_messages",
+            resource="ws_futures_account_config_update_multi_assets.json",
+        )
+
+        # Act
+        self.exec_client._handle_user_ws_message(raw)
+        await self._settle()
+
+        # Assert
+        assert account.leverages() == {BTCUSDT_PERP_BINANCE.id: Decimal(10)}
+        query.assert_not_called()
+        symbol_config.assert_not_called()
 
 
 # Best-effort leverage initialization in `_update_account_state`: a `set_leverage`

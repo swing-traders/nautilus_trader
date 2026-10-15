@@ -183,6 +183,33 @@ class BinanceFuturesAccountUpdateWrapper(msgspec.Struct, frozen=True):
     data: BinanceFuturesAccountUpdateMsg
 
 
+class BinanceFuturesTradePairConfig(msgspec.Struct, frozen=True):
+    """
+    Inner struct leverage for Binance Futures Account Configuration Update events.
+    """
+
+    s: str  # Symbol
+    l: int  # Leverage
+
+
+class BinanceFuturesAccountConfigUpdateMsg(msgspec.Struct, frozen=True):
+    """
+    WebSocket message for Binance Futures Account Configuration Update events.
+
+    A leverage change carries `ac`, a Multi-Assets mode change carries `ai` (not decoded).
+
+    References
+    ----------
+    https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/user-data-streams
+
+    """
+
+    e: BinanceFuturesEventType  # Event type
+    E: int  # Event time
+    T: int  # Transaction time
+    ac: BinanceFuturesTradePairConfig | None = None
+
+
 class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
     """
     WebSocket message 'inner struct' for Binance Futures Order Update events.

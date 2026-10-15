@@ -38,6 +38,9 @@ from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFutu
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesDualSidePosition
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesLeverage
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesPositionRisk
+from nautilus_trader.adapters.binance.futures.schemas.user import (
+    BinanceFuturesAccountConfigUpdateMsg,
+)
 from nautilus_trader.adapters.binance.futures.schemas.user import BinanceFuturesAccountUpdateMsg
 from nautilus_trader.adapters.binance.futures.schemas.user import BinanceFuturesAlgoUpdateMsg
 from nautilus_trader.adapters.binance.futures.schemas.user import BinanceFuturesOrderUpdateMsg
@@ -181,6 +184,9 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
         self._decoder_futures_user_msg = msgspec.json.Decoder(BinanceFuturesUserMsgData)
         self._decoder_futures_order_update = msgspec.json.Decoder(BinanceFuturesOrderUpdateMsg)
         self._decoder_futures_account_update = msgspec.json.Decoder(BinanceFuturesAccountUpdateMsg)
+        self._decoder_futures_account_config_update = msgspec.json.Decoder(
+            BinanceFuturesAccountConfigUpdateMsg,
+        )
         self._decoder_futures_trade_lite = msgspec.json.Decoder(BinanceFuturesTradeLiteMsg)
         self._decoder_futures_algo_update = msgspec.json.Decoder(BinanceFuturesAlgoUpdateMsg)
 
@@ -804,7 +810,14 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
         self._log.warning("MARGIN CALL received")  # Implement
 
     def _handle_account_config_update(self, raw: bytes) -> None:
-        self._log.info("Account config updated", LogColor.BLUE)  # Implement
+        self._log.info("Account config updated", LogColor.BLUE)
+
+        config_update = self._decoder_futures_account_config_update.decode(raw)
+        if config_update.ac is not None:
+            account: MarginAccount = self.get_account()
+            instrument_id: InstrumentId = self._get_cached_instrument_id(config_update.ac.s)
+            account.set_leverage(instrument_id, Decimal(config_update.ac.l))
+            self._log.debug(f"Set leverage {config_update.ac.s} {config_update.ac.l}X")
 
     def _handle_listen_key_expired(self, raw: bytes) -> None:
         self._log.warning("Listen key expired")
