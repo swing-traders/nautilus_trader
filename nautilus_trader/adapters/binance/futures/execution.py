@@ -240,6 +240,8 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
             for _, symbol, type_ in margin_tasks:
                 self._log.info(f"Set {symbol} margin type to {type_.value}")
 
+        # A leverage read standing at connect is served by this read
+        self._account_leverages_requested = False
         await self._update_account_leverages()
 
     async def _update_account_leverages(self) -> None:
@@ -297,7 +299,7 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
             self._account_query_task.add_done_callback(self._release_account_query_task)
 
     def _release_account_query_task(self, task: asyncio.Task) -> None:
-        # A task cancelled before it starts never reaches its own `finally`
+        # A task cancelled before it starts never reaches its own cancellation handling
         if self._account_query_task is task:
             self._end_account_query()
 
@@ -319,8 +321,16 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
                         await self._update_account_leverages()
                 except Exception as e:
                     self._log.exception("Cannot query account state", e)
-        finally:
+
+                    # The next pass reads the leverages this pass could not
+                    if read_leverages:
+                        self._account_leverages_requested = True
+        except asyncio.CancelledError:
             self._end_account_query()
+            raise
+
+        # A leverage read left by a failed pass waits for the next request
+        self._account_query_task = None
 
     def _end_account_query(self) -> None:
         # Requests pending when a query is cancelled are dropped: connect re-reads the account

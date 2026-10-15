@@ -154,6 +154,17 @@ def _account_info(
     return msgspec.json.decode(json.dumps(payload), type=BinanceFuturesAccountInfo)
 
 
+def _symbol_config(leverage: int) -> BinanceFuturesSymbolConfig:
+    # The venue's GET /fapi/v1/symbolConfig entry for ETHUSDT
+    return BinanceFuturesSymbolConfig(
+        symbol="ETHUSDT",
+        marginType=BinanceFuturesMarginType.CROSS.value,
+        isAutoAddMargin=False,
+        leverage=leverage,
+        maxNotionalValue="1000000",
+    )
+
+
 class TestBinanceFuturesExecutionClient:
     @pytest.fixture(autouse=True)
     def setup(self, request):
@@ -3484,6 +3495,143 @@ class TestBinanceFuturesExecutionClient:
         assert account.leverage(ETHUSDT_PERP_BINANCE.id) == Decimal(20)
         set_leverage.assert_not_called()
         set_margin_type.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_query_account_leaves_its_leverage_read_to_the_next_push(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        account = self.cache.account(self.exec_client.account_id)
+        account.set_leverage(ETHUSDT_PERP_BINANCE.id, Decimal(10))
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            side_effect=[
+                BinanceServerError(503, {"code": -1001, "msg": "Internal error"}, {}),
+                _account_info("9999.50", "400.00", "20.00"),
+                _account_info("9999.50", "400.00", "20.00"),
+            ],
+        )
+        symbol_config = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_symbol_config",
+            return_value=[_symbol_config(leverage=20)],
+        )
+        self.exec_client.query_account(self._query_account_command())
+        await asyncio.sleep(0)
+        await self._settle()
+
+        # Act
+        for _ in range(2):
+            self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+            await self._settle()
+
+        # Assert
+        symbol_config.assert_awaited_once()
+        assert account.leverage(ETHUSDT_PERP_BINANCE.id) == Decimal(20)
+
+    @pytest.mark.asyncio
+    async def test_failed_leverage_read_is_repeated_by_the_next_push(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        account = self.cache.account(self.exec_client.account_id)
+        account.set_leverage(ETHUSDT_PERP_BINANCE.id, Decimal(10))
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            return_value=_account_info("9999.50", "400.00", "20.00"),
+        )
+        symbol_config = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_symbol_config",
+            side_effect=[
+                BinanceServerError(503, {"code": -1001, "msg": "Internal error"}, {}),
+                [_symbol_config(leverage=20)],
+            ],
+        )
+        self.exec_client.query_account(self._query_account_command())
+        await asyncio.sleep(0)
+        await self._settle()
+
+        # Act
+        for _ in range(2):
+            self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+            await self._settle()
+
+        # Assert
+        assert symbol_config.await_count == 2
+        assert account.leverage(ETHUSDT_PERP_BINANCE.id) == Decimal(20)
+
+    @pytest.mark.asyncio
+    async def test_failed_account_update_query_leaves_no_leverage_read_to_the_next_push(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        query = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            side_effect=[
+                BinanceServerError(503, {"code": -1001, "msg": "Internal error"}, {}),
+                _account_info("9999.50", "400.00", "20.00"),
+            ],
+        )
+        symbol_config = mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_symbol_config",
+            return_value=[_symbol_config(leverage=20)],
+        )
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await self._settle()
+
+        # Act
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await self._settle()
+
+        # Assert
+        assert query.await_count == 2
+        symbol_config.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_leverage_read_left_by_a_failed_query_account_is_served_by_connect(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        # Arrange
+        self._seed_account(_account_info("10000.00", "200.00", "10.00"))
+        account = self.cache.account(self.exec_client.account_id)
+        account.set_leverage(ETHUSDT_PERP_BINANCE.id, Decimal(10))
+        mocker.patch.object(
+            self.exec_client._futures_http_account,
+            "query_futures_account_info",
+            side_effect=[
+                BinanceServerError(503, {"code": -1001, "msg": "Internal error"}, {}),
+                _account_info("9999.50", "400.00", "20.00"),
+                _account_info("9999.50", "400.00", "20.00"),
+            ],
+        )
+        self._stub_connect_venue_calls(mocker)
+        symbol_config = self.exec_client._futures_http_account.query_futures_symbol_config
+        symbol_config.return_value = [_symbol_config(leverage=20)]
+        self.exec_client.query_account(self._query_account_command())
+        await asyncio.sleep(0)
+        await self._settle()
+        await self.exec_client.cancel_pending_tasks()
+        await self.exec_client._connect()
+
+        # Act
+        self.exec_client._handle_user_ws_message(_account_update_raw("9999.50"))
+        await self._settle()
+
+        # Assert
+        assert symbol_config.await_count == 1
+        assert account.leverage(ETHUSDT_PERP_BINANCE.id) == Decimal(20)
 
     def _stub_connect_venue_calls(self, mocker) -> None:
         # Every venue call `_connect` makes besides the account query
