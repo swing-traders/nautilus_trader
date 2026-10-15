@@ -1068,7 +1068,8 @@ zeroed, spot USDC is used instead.
 Both are read on connect and on an account query. Once the connect-time state is applied,
 the execution client subscribes the `clearinghouseState` WebSocket channel and applies
 each push: a push carries no spot balances, so it updates USDC only where the perp summary
-reflects it and leaves every other currency as last reported.
+reflects it and leaves every other currency as last reported. An account query's reply is
+dropped when a push has been applied since the query was sent, so it never replaces a newer push.
 
 Standard perps default to cross margin; HIP-3 perps default to isolated. On
 connect, the execution client reconciles orders, fills, and positions against

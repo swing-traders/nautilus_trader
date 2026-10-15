@@ -179,6 +179,9 @@ class HyperliquidExecutionClient(LiveExecutionClient):
 
         self._fee_refresh_task: asyncio.Task | None = None
 
+        # An account query sent before the last applied push is answered with an older state
+        self._account_push_received_ns = 0
+
         self._account_address = account_address
         if self._account_address is None:
             try:
@@ -299,6 +302,12 @@ class HyperliquidExecutionClient(LiveExecutionClient):
 
     async def _update_account_state(self) -> None:
         pyo3_account_state = await self._client.request_account_state()
+        self._generate_queried_account_state(pyo3_account_state)
+
+    def _generate_queried_account_state(
+        self,
+        pyo3_account_state: nautilus_pyo3.AccountState,
+    ) -> None:
         account_state = AccountState.from_dict(pyo3_account_state.to_dict())
 
         self.generate_account_state(
@@ -527,8 +536,14 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             self._log.error(f"Failed to request fill reports for {order.client_order_id}: {e}")
 
     async def _query_account(self, command: QueryAccount) -> None:
+        sent_ns = self._clock.timestamp_ns()
         try:
-            await self._update_account_state()
+            pyo3_account_state = await self._client.request_account_state()
+
+            if self._account_push_received_ns > sent_ns:
+                self._log.debug("Dropped account query reply sent before the last account push")
+            else:
+                self._generate_queried_account_state(pyo3_account_state)
         except Exception as e:
             self._log.error(f"Failed to query account state: {e}")
 
@@ -1171,6 +1186,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             reported=account_state.is_reported,
             ts_event=account_state.ts_event,
         )
+        self._account_push_received_ns = self._clock.timestamp_ns()
 
     def _handle_order_accepted_pyo3(self, msg: nautilus_pyo3.OrderAccepted) -> None:
         event = OrderAccepted.from_dict(msg.to_dict())

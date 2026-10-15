@@ -204,6 +204,7 @@ pub struct HyperliquidExecutionClient {
     ws_dispatch_state: Arc<WsDispatchState>,
     staged_brackets: Arc<Mutex<StagedBracketState>>,
     outcome_settlement_tracker: Arc<Mutex<OutcomeSettlementTracker>>,
+    account_push_received: Arc<Mutex<UnixNanos>>,
 }
 
 impl HyperliquidExecutionClient {
@@ -476,6 +477,7 @@ impl HyperliquidExecutionClient {
             ws_dispatch_state: Arc::new(WsDispatchState::new()),
             staged_brackets: Arc::new(Mutex::new(StagedBracketState::default())),
             outcome_settlement_tracker: Arc::new(Mutex::new(OutcomeSettlementTracker::new())),
+            account_push_received: Arc::new(Mutex::new(UnixNanos::default())),
         })
     }
 
@@ -1545,8 +1547,10 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let account_address = self.get_account_address()?;
         let emitter = self.emitter.clone();
         let clock = self.clock;
+        let account_push_received = self.account_push_received.clone();
 
         self.spawn_task("query_account", async move {
+            let sent = clock.get_time_ns();
             let perp_json = http_client
                 .info_clearinghouse_state(&account_address)
                 .await
@@ -1566,7 +1570,14 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 parse_combined_account_balances_and_margins(&perp_state, &spot_state)
                     .context("failed to parse combined account balances and margins")?;
             let ts_event = clock.get_time_ns();
-            emitter.emit_account_state(balances, margins, true, ts_event);
+
+            // Held across the emit, so no push is applied between the check and the reply
+            let push_received = account_push_received.lock().expect(MUTEX_POISONED);
+            if *push_received > sent {
+                log::debug!("Dropped account query reply sent before the last account push");
+            } else {
+                emitter.emit_account_state(balances, margins, true, ts_event);
+            }
 
             Ok(())
         });
@@ -2031,6 +2042,7 @@ impl HyperliquidExecutionClient {
         let http_client = self.http_client.clone();
         let builder = self.http_client.builder_attribution();
         let clock = self.clock;
+        let account_push_received = self.account_push_received.clone();
         let runtime = get_runtime();
         let handle = runtime.spawn(async move {
             // Cloids for external / untracked orders that reach a terminal
@@ -2217,6 +2229,9 @@ impl HyperliquidExecutionClient {
                             }
                         }
                         NautilusWsMessage::AccountState(account_state) => {
+                            let mut push_received =
+                                account_push_received.lock().expect(MUTEX_POISONED);
+                            *push_received = clock.get_time_ns();
                             emitter.emit_account_state(
                                 account_state.balances,
                                 account_state.margins,

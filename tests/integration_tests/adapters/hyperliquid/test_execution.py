@@ -15,7 +15,9 @@
 
 import asyncio
 import json
+from collections.abc import Callable
 from decimal import Decimal
+from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
@@ -29,7 +31,9 @@ from nautilus_trader.adapters.hyperliquid.config import HyperliquidExecClientCon
 from nautilus_trader.adapters.hyperliquid.constants import HYPERLIQUID_VENUE
 from nautilus_trader.adapters.hyperliquid.execution import HyperliquidExecutionClient
 from nautilus_trader.adapters.hyperliquid.execution import _awaits_reconciliation
+from nautilus_trader.cache.cache import Cache
 from nautilus_trader.core import nautilus_pyo3
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
@@ -38,8 +42,10 @@ from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
+from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
+from nautilus_trader.model.currencies import USDC
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import TriggerType
@@ -388,6 +394,120 @@ async def test_pushed_clearinghouse_state_generates_the_account_wide_margin(
         ),
     ]
     assert pushed["reported"] is True
+
+
+def _venue_account_state(margin_used: str) -> nautilus_pyo3.AccountState:
+    # The account state the query and the clearinghouseState push both deliver
+    free = Decimal("1000.000000") - Decimal(margin_used)
+    values: dict[str, Any] = {
+        "account_id": "HYPERLIQUID-master",
+        "account_type": "MARGIN",
+        "base_currency": "USDC",
+        "balances": [
+            {
+                "total": "1000.000000",
+                "locked": margin_used,
+                "free": str(free),
+                "currency": "USDC",
+            },
+        ],
+        "margins": [{"initial": margin_used, "maintenance": margin_used, "currency": "USDC"}],
+        "reported": True,
+        "event_id": str(UUID4()),
+        "ts_event": 0,
+        "ts_init": 0,
+    }
+    return nautilus_pyo3.AccountState.from_dict(values)
+
+
+def _query_account_command(client: HyperliquidExecutionClient) -> QueryAccount:
+    return QueryAccount(
+        trader_id=client.trader_id,
+        account_id=client.account_id,
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_account_query_reply_sent_before_a_push_is_dropped(
+    exec_client_builder: Callable[
+        ...,
+        tuple[
+            HyperliquidExecutionClient,
+            MagicMock | nautilus_pyo3.HyperliquidWebSocketClient,
+            MagicMock,
+            MagicMock,
+        ],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+    cache: Cache,
+) -> None:
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    answer = asyncio.Event()
+
+    async def request_account_state() -> nautilus_pyo3.AccountState:
+        await answer.wait()
+        return _venue_account_state("1.000000")
+
+    http_client.request_account_state = AsyncMock(side_effect=request_account_state)
+
+    # Act
+    client.query_account(_query_account_command(client))
+    await asyncio.sleep(0)
+    client._handle_msg(_venue_account_state("4.967826"))
+    answer.set()
+    await asyncio.gather(*client._tasks)
+
+    # Assert
+    http_client.request_account_state.assert_awaited_once()
+    account = cache.account(client.account_id)
+    assert account.account_margins() == {
+        USDC: MarginBalance(
+            initial=Money.from_str("4.967826 USDC"),
+            maintenance=Money.from_str("4.967826 USDC"),
+        ),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("push_before_send", [False, True], ids=["no_push", "push_before_send"])
+async def test_account_query_reply_with_no_push_since_its_send_is_applied(
+    exec_client_builder: Callable[
+        ...,
+        tuple[
+            HyperliquidExecutionClient,
+            MagicMock | nautilus_pyo3.HyperliquidWebSocketClient,
+            MagicMock,
+            MagicMock,
+        ],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+    cache: Cache,
+    push_before_send: bool,
+) -> None:
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+    http_client.request_account_state = AsyncMock(return_value=_venue_account_state("1.000000"))
+
+    if push_before_send:
+        client._handle_msg(_venue_account_state("4.967826"))
+
+    # Act
+    client.query_account(_query_account_command(client))
+    await asyncio.sleep(0)
+    await asyncio.gather(*client._tasks)
+
+    # Assert
+    http_client.request_account_state.assert_awaited_once()
+    account = cache.account(client.account_id)
+    assert account.account_margins() == {
+        USDC: MarginBalance(
+            initial=Money.from_str("1.000000 USDC"),
+            maintenance=Money.from_str("1.000000 USDC"),
+        ),
+    }
 
 
 @pytest.mark.asyncio

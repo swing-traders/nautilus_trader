@@ -2414,6 +2414,140 @@ async fn test_connect_applies_the_snapshot_before_any_pushed_clearinghouse_state
     );
 }
 
+fn clearinghouse_state_with_margin_used(margin_used: &str) -> Value {
+    json!({
+        "marginSummary": {
+            "accountValue": "10000.0",
+            "totalMarginUsed": margin_used,
+            "totalNtlPos": "0.0",
+            "totalRawUsd": "10000.0"
+        },
+        "crossMarginSummary": {
+            "accountValue": "10000.0",
+            "totalMarginUsed": margin_used,
+            "totalNtlPos": "0.0",
+            "totalRawUsd": "10000.0"
+        },
+        "crossMaintenanceMarginUsed": "0.0",
+        "withdrawable": "10000.0",
+        "assetPositions": []
+    })
+}
+
+fn query_account_command() -> QueryAccount {
+    QueryAccount::new(
+        TraderId::from("TESTER-001"),
+        Some(*HYPERLIQUID_CLIENT_ID),
+        AccountId::from("HYPERLIQUID-001"),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None, // correlation_id
+    )
+}
+
+async fn connect_with_clearinghouse_state_subscribed(
+    client: &mut HyperliquidExecutionClient,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    subscriptions: Arc<tokio::sync::Mutex<Vec<Value>>>,
+) {
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    wait_until_async(
+        || {
+            let subscriptions = subscriptions.clone();
+            async move {
+                subscriptions
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|subscription| subscription["type"] == "clearinghouseState")
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    next_account_state(rx, |_| true)
+        .await
+        .expect("connect emits the account state");
+}
+
+async fn margins_used_until_quiet(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+) -> Vec<Option<rust_decimal::Decimal>> {
+    let mut margins_used = Vec::new();
+
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        if let ExecutionEvent::Account(account_state) = event {
+            margins_used.push(
+                account_state
+                    .margins
+                    .first()
+                    .map(|margin| margin.initial.as_decimal()),
+            );
+        }
+    }
+    margins_used
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_account_reply_sent_before_a_push_is_dropped() {
+    // The venue pushes a newer state while the query awaits its spot read
+    let state = TestServerState::default();
+    *state.clearinghouse_push.lock().await = Some(load_json("ws_clearinghouse_state.json"));
+    let subscriptions = state.ws_subscriptions.clone();
+    let perp_response = state.perp_clearinghouse_response.clone();
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    connect_with_clearinghouse_state_subscribed(&mut client, &mut rx, subscriptions).await;
+    *perp_response.lock().await = Some(clearinghouse_state_with_margin_used("1.5"));
+
+    client.query_account(query_account_command()).unwrap();
+    let margins_used = margins_used_until_quiet(&mut rx).await;
+    client.disconnect().await.unwrap();
+
+    assert_eq!(
+        margins_used,
+        vec![Some(rust_decimal_macros::dec!(4.967826))]
+    );
+}
+
+#[rstest]
+#[case::no_push(false)]
+#[case::push_before_send(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_account_reply_with_no_push_since_its_send_is_applied(
+    #[case] push_before_send: bool,
+) {
+    let state = TestServerState::default();
+    let clearinghouse_push = state.clearinghouse_push.clone();
+    let push = state.push_clearinghouse_state.clone();
+    let subscriptions = state.ws_subscriptions.clone();
+    let perp_response = state.perp_clearinghouse_response.clone();
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    connect_with_clearinghouse_state_subscribed(&mut client, &mut rx, subscriptions).await;
+
+    if push_before_send {
+        *clearinghouse_push.lock().await = Some(load_json("ws_clearinghouse_state.json"));
+        push.notify_one();
+        next_account_state(&mut rx, |_| true)
+            .await
+            .expect("the pushed clearinghouse state is emitted");
+        *clearinghouse_push.lock().await = None;
+    }
+    *perp_response.lock().await = Some(clearinghouse_state_with_margin_used("1.5"));
+
+    client.query_account(query_account_command()).unwrap();
+    let margins_used = margins_used_until_quiet(&mut rx).await;
+    client.disconnect().await.unwrap();
+
+    assert_eq!(margins_used, vec![Some(rust_decimal_macros::dec!(1.5))]);
+}
+
 const HYPERLIQUID_TEST_INSTRUMENT: &str = "BTC-USD-PERP.HYPERLIQUID";
 
 fn make_limit_order(id: &str) -> OrderAny {
