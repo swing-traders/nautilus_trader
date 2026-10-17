@@ -43,6 +43,7 @@ from nautilus_trader.model.data import CustomData
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
+from nautilus_trader.model.data import capsule_to_list
 from nautilus_trader.model.enums import BarAggregation
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.identifiers import TradeId
@@ -53,6 +54,7 @@ from nautilus_trader.model.instruments import Equity
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+from nautilus_trader.persistence.catalog.parquet import _sanitize_sql_identifier
 from nautilus_trader.persistence.funcs import class_to_filename
 from nautilus_trader.persistence.wranglers_v2 import QuoteTickDataWranglerV2
 from nautilus_trader.persistence.wranglers_v2 import TradeTickDataWranglerV2
@@ -3385,6 +3387,37 @@ def test_backend_session_table_naming_special_characters(catalog: ParquetDataCat
     assert len(instrument_ids) == 2
     assert str(eurusd_instrument.id) in instrument_ids
     assert str(btcusd_instrument.id) in instrument_ids
+
+
+def test_backend_session_table_naming_plus_in_symbol(catalog: ParquetDataCatalog) -> None:
+    # Arrange
+    instrument = TestInstrumentProvider.default_fx_ccy("XAU+USD", Venue("SIM"))
+    quotes = [
+        TestDataStubs.quote_tick(
+            instrument=instrument,
+            ts_init=i * 1000,
+        )
+        for i in range(3)
+    ]
+    catalog.write_data(quotes)
+
+    # Act
+    session = catalog.backend_session(
+        data_cls=QuoteTick,
+        identifiers=[str(instrument.id)],
+    )
+    data = []
+    for chunk in session.to_query_result():
+        data.extend(capsule_to_list(chunk))
+
+    # Assert
+    assert len(data) == 3
+    assert {quote.instrument_id for quote in data} == {instrument.id}
+
+
+def test_sanitize_sql_identifier_replaces_every_non_word_character() -> None:
+    # Act, Assert
+    assert _sanitize_sql_identifier("XAUUSD+.VENUE") == "xauusd__venue"
 
 
 def test_query_first_and_last_timestamp(catalog: ParquetDataCatalog) -> None:

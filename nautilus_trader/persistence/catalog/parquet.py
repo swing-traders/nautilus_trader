@@ -92,6 +92,9 @@ NautilusRustDataType = Union[  # noqa: UP007 (mypy does not like pipe operators)
 # Custom data is returned as Python lists (not FFI capsules) from the Rust backend.
 _RUST_CUSTOM_DATA_TYPES: set[str] = {"BinanceBar"}
 
+# Mirrors the Rust `make_sql_safe_identifier` rule: only ASCII alphanumerics and underscore survive.
+_SQL_UNSAFE_CHARACTERS = re.compile(r"[^A-Za-z0-9_]")
+
 
 class FeatherFile(NamedTuple):
     path: str
@@ -3062,11 +3065,4 @@ def _extract_safe_filename(file_path: str) -> str:
 
 
 def _sanitize_sql_identifier(identifier: str) -> str:
-    return (
-        identifier.replace(".", "_")
-        .replace("-", "_")
-        .replace(" ", "_")
-        .replace("^", "_")
-        .replace(":", "_")
-        .lower()
-    )
+    return _SQL_UNSAFE_CHARACTERS.sub("_", identifier).lower()
