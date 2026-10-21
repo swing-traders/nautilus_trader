@@ -99,4 +99,9 @@ print(f"REPR_COUNT={ObservedTick.representations}")
         text=True,
         check=True,
     )
-    assert f"REPR_COUNT={expected}" in result.stdout
+    repr_count = next(
+        line.removeprefix("REPR_COUNT=")
+        for line in result.stdout.splitlines()
+        if line.startswith("REPR_COUNT=")
+    )
+    assert repr_count == str(expected)
