@@ -181,6 +181,7 @@ cpdef LogGuard init_logging(
 # Global static to flag if pyo3 based logging is initialized
 cdef bint LOGGING_PYO3
 cpdef bint is_logging_initialized()
+cpdef bint is_logging_debug_enabled()
 cpdef void set_logging_pyo3(bint value)
 cpdef void flush_logger()
 cpdef bint sync_logger_to_disk()

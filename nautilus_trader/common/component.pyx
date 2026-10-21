@@ -80,6 +80,7 @@ from nautilus_trader.core.rust.common cimport log_color_from_cstr
 from nautilus_trader.core.rust.common cimport log_color_to_cstr
 from nautilus_trader.core.rust.common cimport log_level_from_cstr
 from nautilus_trader.core.rust.common cimport log_level_to_cstr
+from nautilus_trader.core.rust.common cimport logging_is_debug_enabled
 from nautilus_trader.core.rust.common cimport logger_drop
 from nautilus_trader.core.rust.common cimport logger_flush
 from nautilus_trader.core.rust.common cimport logger_log
@@ -1374,6 +1375,14 @@ cpdef bint is_logging_initialized():
     if LOGGING_PYO3:
         return True
     return <bint>logging_is_initialized()
+
+
+cpdef bint is_logging_debug_enabled():
+    """Return whether DEBUG messages may be emitted by the active logger."""
+    if LOGGING_PYO3:
+        # The PyO3 logger has independent global state.
+        return True
+    return <bint>logging_is_debug_enabled()
 
 
 cpdef bint is_logging_pyo3():

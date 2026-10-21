@@ -741,6 +741,8 @@ void logger_drop(struct LogGuard_API log_guard);
 
 uint8_t logging_is_initialized(void);
 
+uint8_t logging_is_debug_enabled(void);
+
 void logging_set_bypass(void);
 
 void logging_shutdown(void);

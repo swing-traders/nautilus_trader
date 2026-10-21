@@ -559,6 +559,8 @@ cdef extern from "../includes/common.h":
 
     uint8_t logging_is_initialized();
 
+    uint8_t logging_is_debug_enabled();
+
     void logging_set_bypass();
 
     void logging_shutdown();

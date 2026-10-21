@@ -69,7 +69,7 @@ from nautilus_trader.common.component cimport TestClock
 from nautilus_trader.common.component cimport TimeEvent
 from nautilus_trader.common.component cimport flush_logger
 from nautilus_trader.common.component cimport get_component_clocks
-from nautilus_trader.common.component cimport is_logging_initialized
+from nautilus_trader.common.component cimport is_logging_debug_enabled
 from nautilus_trader.common.component cimport log_sysinfo
 from nautilus_trader.common.component cimport set_backtest_force_stop
 from nautilus_trader.common.component cimport set_logging_clock_realtime_mode
@@ -902,22 +902,43 @@ cdef class BacktestEngine:
             if type(first) in BOOK_DATA_TYPES:
                 self._has_book_data.add(first.instrument_id)
 
-        # Add data
+        cdef Data ordered_data
+        cdef uint64_t last_ts_init = self._data[-1].ts_init if self._data else 0
+        cdef bint presorted = not self._data or self._sorted
+        if sort and presorted:
+            for ordered_data in data:
+                if ordered_data.ts_init < last_ts_init:
+                    presorted = False
+                    break
+                last_ts_init = ordered_data.ts_init
+
         self._data.extend(data)
 
         if sort:
-            self._data = sorted(self._data, key=lambda x: x.ts_init)
+            if not presorted:
+                self._data = sorted(self._data, key=lambda x: x.ts_init)
             self._data_iterator.add_data("backtest_data", self._data, append_data=True, presorted=True)
             self._sorted = True
         else:
             self._sorted = False
 
+        cdef InstrumentId last_quote_id = None
+        cdef InstrumentId last_trade_id = None
+        cdef InstrumentId instrument_id
         for data_point in data:
             data_type = type(data_point)
             if data_type is Bar:
                 self._backtest_subscription_names.add(f"{data_point.bar_type}")
-            elif data_type in (QuoteTick, TradeTick):
-                self._backtest_subscription_names.add(f"{data_type.__name__}.{data_point.instrument_id}")
+            elif data_type is QuoteTick:
+                instrument_id = (<QuoteTick>data_point).instrument_id
+                if instrument_id != last_quote_id:
+                    self._backtest_subscription_names.add(f"QuoteTick.{instrument_id}")
+                    last_quote_id = instrument_id
+            elif data_type is TradeTick:
+                instrument_id = (<TradeTick>data_point).instrument_id
+                if instrument_id != last_trade_id:
+                    self._backtest_subscription_names.add(f"TradeTick.{instrument_id}")
+                    last_trade_id = instrument_id
             elif data_type is CustomData:
                 self._backtest_subscription_names.add(f"{type(data_point.data).__name__}.{getattr(data_point.data, 'instrument_id', None)}")
 
@@ -4386,7 +4407,7 @@ cdef class OrderMatchingEngine:
         """
         Condition.not_none(delta, "delta")
 
-        if is_logging_initialized():
+        if is_logging_debug_enabled():
             self._log.debug(f"Processing {delta!r}")
 
         # Validate precisions for ADD and UPDATE actions
@@ -4459,7 +4480,7 @@ cdef class OrderMatchingEngine:
         """
         Condition.not_none(deltas, "deltas")
 
-        if is_logging_initialized():
+        if is_logging_debug_enabled():
             self._log.debug(f"Processing {deltas!r}")
 
         # Validate precisions for ADD and UPDATE actions
@@ -4534,7 +4555,7 @@ cdef class OrderMatchingEngine:
         """
         Condition.not_none(depth, "depth")
 
-        if is_logging_initialized():
+        if is_logging_debug_enabled():
             self._log.debug(f"Processing {depth!r}")
 
         # Validate precisions for non-null orders
@@ -4626,7 +4647,7 @@ cdef class OrderMatchingEngine:
         if not self._quote_execution:
             return
 
-        if is_logging_initialized():
+        if is_logging_debug_enabled():
             self._log.debug(f"Processing {tick!r}")
 
         # Validate precisions
@@ -4703,7 +4724,7 @@ cdef class OrderMatchingEngine:
         """
         Condition.not_none(tick, "tick")
 
-        if is_logging_initialized():
+        if is_logging_debug_enabled():
             self._log.debug(f"Processing {tick!r}")
 
         # Validate precisions
@@ -4896,7 +4917,7 @@ cdef class OrderMatchingEngine:
             else:
                 return
 
-        if is_logging_initialized():
+        if is_logging_debug_enabled():
             self._log.debug(f"Processing {bar!r}")
 
         cdef PriceType price_type = bar_type.spec.price_type
@@ -4993,7 +5014,7 @@ cdef class OrderMatchingEngine:
 
     cdef void _process_trade_bar_open(self, Bar bar, TradeTick tick):
         if not self._core.is_last_initialized or bar._mem.open.raw != self._core.last_raw:
-            if is_logging_initialized():
+            if is_logging_debug_enabled():
                 self._log.debug(f"Updating with open {bar.open}")
 
             self._fill_at_market = True  # Gap from previous bar
@@ -5003,7 +5024,7 @@ cdef class OrderMatchingEngine:
 
     cdef void _process_trade_bar_high(self, Bar bar, TradeTick tick):
         if bar._mem.high.raw > self._core.last_raw:
-            if is_logging_initialized():
+            if is_logging_debug_enabled():
                 self._log.debug(f"Updating with high {bar.high}")
 
             self._fill_at_market = False  # Market moving through prices
@@ -5016,7 +5037,7 @@ cdef class OrderMatchingEngine:
 
     cdef void _process_trade_bar_low(self, Bar bar, TradeTick tick):
         if bar._mem.low.raw < self._core.last_raw:
-            if is_logging_initialized():
+            if is_logging_debug_enabled():
                 self._log.debug(f"Updating with low {bar.low}")
 
             self._fill_at_market = False  # Market moving through prices
@@ -5029,7 +5050,7 @@ cdef class OrderMatchingEngine:
 
     cdef void _process_trade_bar_close(self, Bar bar, TradeTick tick, Quantity close_size = None):
         if bar._mem.close.raw != self._core.last_raw:
-            if is_logging_initialized():
+            if is_logging_debug_enabled():
                 self._log.debug(f"Updating with close {bar.close}")
 
             self._fill_at_market = False  # Market moving through prices
@@ -7434,7 +7455,7 @@ cdef class OrderMatchingEngine:
             reduce_only_remaining_raw = position.quantity._mem.raw
             reduce_only_filled_raw = cached_reduce_only_filled._mem.raw
 
-        if is_logging_initialized():
+        if is_logging_debug_enabled():
             self._log.debug(
                 "Market: "
                 f"bid={self._book.best_bid_size()} @ {self._book.best_bid_price()}, "

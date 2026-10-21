@@ -273,6 +273,11 @@ pub extern "C" fn logging_is_initialized() -> u8 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn logging_is_debug_enabled() -> u8 {
+    u8::from(log::log_enabled!(log::Level::Debug))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn logging_set_bypass() {
     crate::logging::logging_set_bypass();
 }
