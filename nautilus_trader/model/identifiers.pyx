@@ -13,6 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from libc.stdint cimport uintptr_t
 from libc.string cimport memcmp
 from libc.string cimport strcmp
 
@@ -53,6 +54,9 @@ import re
 
 
 GENERIC_SPREAD_ID_SEPARATOR = "___"
+
+# Ustr pointers live for the process; preserve Python string hashes and set order.
+cdef dict _INSTRUMENT_ID_HASHES = {}
 
 
 # Helper functions for sorting (to avoid lambdas in cpdef functions)
@@ -357,9 +361,15 @@ cdef class InstrumentId(Identifier):
         return strcmp(self._mem.symbol._0, other._mem.symbol._0) == 0 and strcmp(self._mem.venue._0, other._mem.venue._0) == 0
 
     def __hash__(self) -> int:
-        # A rare zero hash will cause frequent recomputations
+        cdef tuple key
+        cdef object cached_hash
         if self._hash == 0:
-            self._hash = hash(self.to_str())
+            key = (<uintptr_t>self._mem.symbol._0, <uintptr_t>self._mem.venue._0)
+            cached_hash = _INSTRUMENT_ID_HASHES.get(key)
+            if cached_hash is None:
+                cached_hash = hash(self.to_str())
+                _INSTRUMENT_ID_HASHES[key] = cached_hash
+            self._hash = cached_hash
         return self._hash
 
     @staticmethod

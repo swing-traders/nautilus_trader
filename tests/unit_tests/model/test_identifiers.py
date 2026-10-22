@@ -17,6 +17,7 @@ import pickle
 
 import pytest
 
+from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
@@ -220,6 +221,29 @@ def test_instrument_id_equality() -> None:
     assert instrument_id1 == instrument_id1
     assert instrument_id1 != instrument_id2
     assert instrument_id1 != instrument_id3
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["AUD/USD.SIM", "BTC/ETH.SYNTH", "TËST-PÉRP.BINANCE", "ES.FUT.XCME"],
+)
+def test_instrument_id_hash_matches_string_across_construction_paths(value: str) -> None:
+    symbol, venue = value.rsplit(".", 1)
+    bar_type = BarType.from_str(f"{value}-1-MINUTE-LAST-EXTERNAL")
+    expected = hash(value)
+
+    for _ in range(3):
+        identifiers = [
+            InstrumentId(Symbol(symbol), Venue(venue)),
+            InstrumentId.from_str(value),
+            bar_type.instrument_id,
+            pickle.loads(pickle.dumps(InstrumentId.from_str(value))),  # noqa: S301
+            InstrumentId.from_pyo3(InstrumentId.from_str(value).to_pyo3()),
+        ]
+        for instrument_id in identifiers:
+            assert hash(instrument_id) == expected
+            assert hash(instrument_id) == hash(str(instrument_id))
+            assert hash(instrument_id) == expected
 
 
 def test_instrument_id_str() -> None:
