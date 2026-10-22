@@ -227,7 +227,7 @@ def test_instrument_id_equality() -> None:
     "value",
     ["AUD/USD.SIM", "BTC/ETH.SYNTH", "TËST-PÉRP.BINANCE", "ES.FUT.XCME"],
 )
-def test_instrument_id_hash_matches_string_across_construction_paths(value: str) -> None:
+def test_instrument_id_hash_value_preservation_across_construction_paths(value: str) -> None:
     symbol, venue = value.rsplit(".", 1)
     bar_type = BarType.from_str(f"{value}-1-MINUTE-LAST-EXTERNAL")
     expected = hash(value)
