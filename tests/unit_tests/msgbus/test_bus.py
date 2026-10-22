@@ -13,6 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import msgspec
 import pytest
 
 from nautilus_trader.common.component import MessageBus
@@ -21,6 +22,7 @@ from nautilus_trader.common.component import is_matching_py
 from nautilus_trader.core.message import Request
 from nautilus_trader.core.message import Response
 from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.serialization.serializer import MsgSpecSerializer
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 
 
@@ -656,3 +658,55 @@ def test_add_listener_receives_byte_messages(bus):
 
     # Assert
     assert events == [("any.topic", payload)]
+
+
+@pytest.mark.parametrize("external_pub", [True, False])
+def test_listener_receives_only_serialized_publishable_messages(clock, trader_id, external_pub):
+    serializer = MsgSpecSerializer(msgspec.msgpack)
+    bus = MessageBus(trader_id=trader_id, clock=clock, serializer=serializer)
+    events = []
+
+    class Listener:
+        def is_closed(self):
+            return False
+
+        def publish(self, topic, payload):
+            events.append((topic, payload))
+
+    bus.add_listener(Listener())
+    bus.publish("test.topic", "message", external_pub=external_pub)
+    bus.publish("test.topic", object(), external_pub=external_pub)
+
+    assert events == [("test.topic", serializer.serialize("message"))]
+    assert bus.pub_count == 2
+
+
+def test_publish_without_external_destination_skips_type_scan(bus):
+    class Message:
+        @property
+        def __class__(self):
+            raise AssertionError("unexpected publishable-type scan")
+
+    messages = []
+    bus.subscribe("test.topic", messages.append)
+    message = Message()
+    bus.publish("test.topic", message)
+
+    assert messages == [message]
+    assert bus.pub_count == 1
+
+
+def test_subscriber_can_attach_listener_during_publish(bus):
+    events = []
+
+    class Listener:
+        def is_closed(self):
+            return False
+
+        def publish(self, topic, payload):
+            events.append((topic, payload))
+
+    bus.subscribe("test.topic", lambda msg: bus.add_listener(Listener()))
+    bus.publish("test.topic", b"message", external_pub=False)
+
+    assert events == [("test.topic", b"message")]
