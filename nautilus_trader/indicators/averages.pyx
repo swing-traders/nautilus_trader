@@ -19,6 +19,7 @@ import numpy as np
 
 cimport numpy as np
 from libc.math cimport pow
+from libc.string cimport memcmp
 
 from nautilus_trader.core.correctness cimport Condition
 from nautilus_trader.core.rust.model cimport PriceType
@@ -29,6 +30,21 @@ from nautilus_trader.model.data cimport Bar
 from nautilus_trader.model.data cimport QuoteTick
 from nautilus_trader.model.data cimport TradeTick
 from nautilus_trader.model.objects cimport Price
+
+
+cdef void _check_ma_copy(MovingAverage source, MovingAverage target) except *:
+    if source is target:
+        raise ValueError("source and target alias")
+    if source._params is target._params:
+        raise ValueError("_params alias")
+    if source.name != target.name:
+        raise ValueError("name mismatch")
+    if source._params != target._params:
+        raise ValueError("_params mismatch")
+    if source.period != target.period:
+        raise ValueError("period mismatch")
+    if source.price_type != target.price_type:
+        raise ValueError("price_type mismatch")
 
 
 cdef class MovingAverage(Indicator):
@@ -117,6 +133,31 @@ cdef class SimpleMovingAverage(MovingAverage):
         self._inputs = deque(maxlen=period)
         self.value = 0
 
+    cpdef void copy_state_to(self, Indicator target) except *:
+        """
+        Copy state into an independent, identically configured exact-type target.
+
+        The target's deque and parameter list are retained. The caller must serialize
+        updates, resets and transfers.
+        """
+        if type(target) is not SimpleMovingAverage:
+            raise TypeError("target must be an exact SimpleMovingAverage")
+        if type(self) is not SimpleMovingAverage:
+            raise NotImplementedError("source must be an exact SimpleMovingAverage")
+        cdef SimpleMovingAverage destination = <SimpleMovingAverage>target
+        _check_ma_copy(self, destination)
+        if self._inputs is destination._inputs:
+            raise ValueError("_inputs alias")
+        if self._inputs.maxlen != self.period or destination._inputs.maxlen != destination.period:
+            raise ValueError("_inputs.maxlen mismatch")
+
+        destination._inputs.clear()
+        destination._inputs.extend(self._inputs)
+        destination.count = self.count
+        destination.value = self.value
+        destination.has_inputs = self.has_inputs
+        destination.initialized = self.initialized
+
     cpdef void handle_quote_tick(self, QuoteTick tick):
         """
         Update the indicator with the given quote tick.
@@ -203,6 +244,27 @@ cdef class ExponentialMovingAverage(MovingAverage):
 
         self.alpha = 2.0 / (period + 1.0)
         self.value = 0
+
+    cpdef void copy_state_to(self, Indicator target) except *:
+        """
+        Copy state into an independent, identically configured exact-type target.
+
+        The target's parameter list is retained. The caller must serialize updates,
+        resets and transfers.
+        """
+        if type(target) is not ExponentialMovingAverage:
+            raise TypeError("target must be an exact ExponentialMovingAverage")
+        if type(self) is not ExponentialMovingAverage:
+            raise NotImplementedError("source must be an exact ExponentialMovingAverage")
+        cdef ExponentialMovingAverage destination = <ExponentialMovingAverage>target
+        _check_ma_copy(self, destination)
+        if memcmp(&self.alpha, &destination.alpha, sizeof(double)) != 0:
+            raise ValueError("alpha mismatch")
+
+        destination.count = self.count
+        destination.value = self.value
+        destination.has_inputs = self.has_inputs
+        destination.initialized = self.initialized
 
     cpdef void handle_quote_tick(self, QuoteTick tick):
         """
@@ -725,6 +787,27 @@ cdef class WilderMovingAverage(MovingAverage):
 
         self.alpha = 1.0 / period
         self.value = 0
+
+    cpdef void copy_state_to(self, Indicator target) except *:
+        """
+        Copy state into an independent, identically configured exact-type target.
+
+        The target's parameter list is retained. The caller must serialize updates,
+        resets and transfers.
+        """
+        if type(target) is not WilderMovingAverage:
+            raise TypeError("target must be an exact WilderMovingAverage")
+        if type(self) is not WilderMovingAverage:
+            raise NotImplementedError("source must be an exact WilderMovingAverage")
+        cdef WilderMovingAverage destination = <WilderMovingAverage>target
+        _check_ma_copy(self, destination)
+        if memcmp(&self.alpha, &destination.alpha, sizeof(double)) != 0:
+            raise ValueError("alpha mismatch")
+
+        destination.count = self.count
+        destination.value = self.value
+        destination.has_inputs = self.has_inputs
+        destination.initialized = self.initialized
 
     cpdef void handle_quote_tick(self, QuoteTick tick):
         """

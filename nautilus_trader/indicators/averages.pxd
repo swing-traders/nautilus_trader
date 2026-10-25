@@ -51,10 +51,14 @@ cdef class MovingAverage(Indicator):
 cdef class SimpleMovingAverage(MovingAverage):
     cdef object _inputs
 
+    cpdef void copy_state_to(self, Indicator target) except *
+
 
 cdef class ExponentialMovingAverage(MovingAverage):
     cdef readonly double alpha
     """The moving average alpha value.\n\n:returns: `double`"""
+
+    cpdef void copy_state_to(self, Indicator target) except *
 
 
 cdef class DoubleExponentialMovingAverage(MovingAverage):
@@ -100,6 +104,8 @@ cdef class AdaptiveMovingAverage(MovingAverage):
 cdef class WilderMovingAverage(MovingAverage):
     cdef readonly double alpha
     """The moving average alpha value.\n\n:returns: `double`"""
+
+    cpdef void copy_state_to(self, Indicator target) except *
 
 
 cdef class VariableIndexDynamicAverage(MovingAverage):

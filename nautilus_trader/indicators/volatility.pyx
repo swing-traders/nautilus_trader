@@ -20,9 +20,11 @@ import numpy as np
 from nautilus_trader.indicators.averages import MovingAverageFactory
 
 from libc.math cimport fabs
+from libc.string cimport memcmp
 
 from nautilus_trader.core.correctness cimport Condition
 from nautilus_trader.indicators.averages cimport MovingAverageType
+from nautilus_trader.indicators.averages cimport WilderMovingAverage
 
 
 cdef str get_ma_type_name(MovingAverageType ma_type):
@@ -96,6 +98,52 @@ cdef class AverageTrueRange(Indicator):
         self._value_floor = value_floor
         self._previous_close = 0
         self.value = 0
+
+    cpdef void copy_state_to(self, Indicator target) except *:
+        """
+        Copy state into an identically configured exact-type target with a Wilder child.
+
+        The target's child and parameter lists are retained. The caller must serialize
+        updates, resets and transfers.
+        """
+        if type(target) is not AverageTrueRange:
+            raise TypeError("target must be an exact AverageTrueRange")
+        if type(self) is not AverageTrueRange:
+            raise NotImplementedError("source must be an exact AverageTrueRange")
+        cdef AverageTrueRange destination = <AverageTrueRange>target
+        if type(self._ma) is not type(destination._ma):
+            raise ValueError("_ma type mismatch")
+        if type(self._ma) is not WilderMovingAverage:
+            raise NotImplementedError("_ma must be an exact WilderMovingAverage")
+        if self is destination:
+            raise ValueError("source and target alias")
+        if self._ma is destination._ma:
+            raise ValueError("_ma alias")
+        if (self._params is destination._params
+                or self._params is destination._ma._params
+                or self._ma._params is destination._params):
+            raise ValueError("_params alias")
+        if self.name != destination.name:
+            raise ValueError("name mismatch")
+        if self._params != destination._params:
+            raise ValueError("_params mismatch")
+        if self.period != destination.period:
+            raise ValueError("period mismatch")
+        if self._use_previous != destination._use_previous:
+            raise ValueError("_use_previous mismatch")
+        if memcmp(&self._value_floor, &destination._value_floor, sizeof(double)) != 0:
+            raise ValueError("_value_floor mismatch")
+        cdef double source_floor = self._params[3]
+        cdef double target_floor = destination._params[3]
+        if memcmp(&source_floor, &target_floor, sizeof(double)) != 0:
+            raise ValueError("_params value_floor mismatch")
+
+        # The child validates its complete configuration before either object is written.
+        (<WilderMovingAverage>self._ma).copy_state_to(destination._ma)
+        destination._previous_close = self._previous_close
+        destination.value = self.value
+        destination.has_inputs = self.has_inputs
+        destination.initialized = self.initialized
 
     cpdef void handle_bar(self, Bar bar):
         """

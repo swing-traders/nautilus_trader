@@ -30,6 +30,7 @@ cdef class AverageTrueRange(Indicator):
     """The current value.\n\n:returns: `double`"""
 
     cpdef void update_raw(self, double high, double low, double close)
+    cpdef void copy_state_to(self, Indicator target) except *
     cdef void _floor_value(self)
     cdef void _check_initialized(self)
 
