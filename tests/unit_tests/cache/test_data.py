@@ -37,10 +37,13 @@ from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.data import InstrumentStatus
 from nautilus_trader.model.data import MarkPriceUpdate
 from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.identifiers import Venue
+from nautilus_trader.model.instruments import Cfd
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
@@ -49,6 +52,36 @@ from nautilus_trader.test_kit.stubs.data import TestDataStubs
 
 
 SIM = Venue("SIM")
+
+
+def _cfd(symbol: str, base_currency, quote_currency) -> Cfd:
+    return Cfd(
+        instrument_id=InstrumentId(Symbol(symbol), SIM),
+        raw_symbol=Symbol(symbol),
+        asset_class=AssetClass.FX,
+        quote_currency=quote_currency,
+        price_precision=3,
+        size_precision=2,
+        price_increment=Price.from_str("0.001"),
+        size_increment=Quantity.from_str("0.01"),
+        ts_event=0,
+        ts_init=0,
+        base_currency=base_currency,
+    )
+
+
+def _quote(instrument, bid: str, ask: str) -> QuoteTick:
+    return QuoteTick(
+        instrument_id=instrument.id,
+        bid_price=instrument.make_price(Decimal(bid)),
+        ask_price=instrument.make_price(Decimal(ask)),
+        bid_size=Quantity.from_int(1),
+        ask_size=Quantity.from_int(1),
+        ts_event=0,
+        ts_init=0,
+    )
+
+
 USDJPY_SIM = TestInstrumentProvider.default_fx_ccy("USD/JPY")
 AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
 ETHUSDT_BINANCE = TestInstrumentProvider.ethusdt_binance()
@@ -1353,6 +1386,41 @@ class TestCache:
 
         # Assert
         assert result == 0.80005
+
+    def test_get_xrate_with_cfd_of_two_currencies_prices_its_rate(self):
+        # Arrange
+        audjpy = _cfd("AUDJPY", base_currency=AUD, quote_currency=JPY)
+        self.cache.add_instrument(audjpy)
+        self.cache.add_quote_tick(_quote(audjpy, bid="99.990", ask="100.010"))
+
+        # Act
+        aud_to_jpy = self.cache.get_xrate(SIM, AUD, JPY)
+        jpy_to_aud = self.cache.get_xrate(SIM, JPY, AUD)
+
+        # Assert: mid = (99.990 + 100.010) / 2 = 100.000, and its reciprocal 1 / 100 = 0.01
+        assert aud_to_jpy == 100.0
+        assert jpy_to_aud == 0.01
+
+    def test_get_xrate_with_cfd_of_one_currency_prices_nothing(self):
+        # Arrange
+        nas100 = _cfd("NAS100", base_currency=USD, quote_currency=USD)
+        self.cache.add_instrument(nas100)
+        self.cache.add_quote_tick(_quote(nas100, bid="21000.00", ask="21001.00"))
+
+        # Act, Assert
+        assert self.cache.get_xrate(SIM, USD, JPY) is None
+
+    def test_get_xrate_with_crypto_perpetual(self):
+        # Arrange
+        ethusdt_perp = TestInstrumentProvider.ethusdt_perp_binance()
+        self.cache.add_instrument(ethusdt_perp)
+        self.cache.add_quote_tick(_quote(ethusdt_perp, bid="1999.99", ask="2000.01"))
+
+        # Act
+        result = self.cache.get_xrate(ethusdt_perp.id.venue, ETH, USDT)
+
+        # Assert: mid = (1999.99 + 2000.01) / 2 = 2000.00
+        assert result == 2000.0
 
     def test_get_xrate_fallbacks_to_bars_if_no_quotes_returns_correct_rate(self):
         # Arrange
