@@ -108,7 +108,7 @@ pub struct HyperliquidInstrumentDef {
     pub raw_symbol: Ustr,
     /// Base currency/asset (e.g., "BTC", "PURR").
     pub base: Ustr,
-    /// Quote currency (e.g., "USD" for perps, "USDC" for spot).
+    /// Quote currency (e.g., the dex's collateral token for perps, "USDC" for spot).
     pub quote: Ustr,
     /// Settlement currency for perps. `None` for spot and outcome instruments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,7 +166,7 @@ fn sanitize_symbol(value: &str) -> std::borrow::Cow<'_, str> {
 /// Parse perpetual instrument definitions from Hyperliquid `meta` response.
 ///
 /// Hyperliquid perps follow specific rules:
-/// - Quote is always USD (USDC settled)
+/// - Quote is the dex's collateral token, which also settles (USDC on the default dex)
 /// - Price decimals = max(0, 6 - sz_decimals) per venue docs
 /// - Active = !is_delisted
 ///
@@ -211,7 +211,7 @@ pub(crate) fn parse_perp_instruments_with_settlement(
             symbol: symbol.into(),
             raw_symbol,
             base: asset.name.clone().into(),
-            quote: "USD".into(),
+            quote: settlement_currency.into(),
             settlement: Some(settlement_currency.into()),
             market_type: HyperliquidMarketType::Perp,
             asset_index: asset_index_base + index as u32,
@@ -817,7 +817,6 @@ pub fn create_instrument_from_def(
         }
         HyperliquidMarketType::Perp => {
             let base_currency = get_currency(&def.base);
-            let quote_currency = get_currency(&def.quote);
             let settlement_code = def
                 .settlement
                 .as_ref()
@@ -827,6 +826,8 @@ pub fn create_instrument_from_def(
             } else {
                 get_currency(settlement_code)
             };
+            // After the settlement, so a USDH quote resolves to the currency it registers.
+            let quote_currency = get_currency(&def.quote);
             let min_notional = Some(min_order_notional(quote_currency)?);
 
             Some(InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
@@ -1388,7 +1389,7 @@ mod tests {
         let btc = &defs[0];
         assert_eq!(btc.symbol, "BTC-USD-PERP");
         assert_eq!(btc.base, "BTC");
-        assert_eq!(btc.quote, "USD");
+        assert_eq!(btc.quote, "USDC");
         assert_eq!(btc.settlement.as_ref().unwrap().as_str(), "USDC");
         assert_eq!(btc.market_type, HyperliquidMarketType::Perp);
         assert_eq!(btc.price_decimals, 1); // 6 - 5 = 1
@@ -1420,7 +1421,7 @@ mod tests {
         let btc = &defs[0];
         assert_eq!(btc.symbol, "BTC-USD-PERP");
         assert_eq!(btc.base, "BTC");
-        assert_eq!(btc.quote, "USD");
+        assert_eq!(btc.quote, "USDC");
         assert_eq!(btc.settlement.as_ref().unwrap().as_str(), "USDC");
         assert_eq!(btc.market_type, HyperliquidMarketType::Perp);
         assert_eq!(btc.size_decimals, 5);
@@ -1493,7 +1494,7 @@ mod tests {
         match instrument {
             InstrumentAny::CryptoPerpetual(perp) => {
                 let min_notional = perp.min_notional.unwrap();
-                assert_eq!(min_notional.currency, Currency::USD());
+                assert_eq!(min_notional.currency, Currency::USDC());
                 assert_eq!(min_notional.as_decimal(), dec!(10));
                 assert_eq!(perp.settlement_currency.code.as_str(), "USDC");
             }
@@ -1521,13 +1522,13 @@ mod tests {
         assert_eq!(settlement_currency.as_str(), "USDH");
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].symbol.as_str(), "km:US500-USD-PERP");
-        assert_eq!(defs[0].quote.as_str(), "USD");
+        assert_eq!(defs[0].quote.as_str(), "USDH");
         assert_eq!(defs[0].settlement.as_ref().unwrap().as_str(), "USDH");
 
         let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
         match instrument {
             InstrumentAny::CryptoPerpetual(perp) => {
-                assert_eq!(perp.quote_currency.code.as_str(), "USD");
+                assert_eq!(perp.quote_currency.code.as_str(), "USDH");
                 assert_eq!(perp.settlement_currency.code.as_str(), "USDH");
                 assert_eq!(perp.settlement_currency.name.as_str(), "Hyperliquid USD");
             }
@@ -1545,13 +1546,13 @@ mod tests {
         assert_eq!(settlement_currency.as_str(), "USDE");
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].symbol.as_str(), "hyna:BTC-USD-PERP");
-        assert_eq!(defs[0].quote.as_str(), "USD");
+        assert_eq!(defs[0].quote.as_str(), "USDE");
         assert_eq!(defs[0].settlement.as_ref().unwrap().as_str(), "USDE");
 
         let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
         match instrument {
             InstrumentAny::CryptoPerpetual(perp) => {
-                assert_eq!(perp.quote_currency.code.as_str(), "USD");
+                assert_eq!(perp.quote_currency.code.as_str(), "USDE");
                 assert_eq!(perp.settlement_currency.code.as_str(), "USDE");
             }
             other => panic!("Expected CryptoPerpetual, was {other:?}"),
@@ -1568,8 +1569,30 @@ mod tests {
 
         match instrument {
             InstrumentAny::CryptoPerpetual(perp) => {
-                assert_eq!(perp.quote_currency.code.as_str(), "USD");
+                assert_eq!(perp.quote_currency.code.as_str(), "USDC");
                 assert_eq!(perp.settlement_currency.code.as_str(), "USDC");
+            }
+            other => panic!("Expected CryptoPerpetual, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_hip3_dex_perp_quotes_its_own_collateral_token() {
+        let all_metas: Vec<PerpMeta> =
+            load_test_data("http_all_perp_metas_non_usdc_collateral.json");
+        let spot_meta: SpotMeta = load_test_data("http_spot_meta_non_usdc_collateral.json");
+
+        // Dex 2 (`hyna`) is collateralised by spot token 235, USDE.
+        let collateral = resolve_perp_settlement_currency(&all_metas[2], Some(&spot_meta)).unwrap();
+        let defs =
+            parse_perp_instruments_with_settlement(&all_metas[2], 140_000, collateral.as_str());
+        let instrument = create_instrument_from_def(&defs[0], UnixNanos::default()).unwrap();
+
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.quote_currency.code.as_str(), "USDE");
+                assert_eq!(perp.quote_currency, perp.settlement_currency);
+                assert_eq!(perp.min_notional.unwrap().currency.code.as_str(), "USDE");
             }
             other => panic!("Expected CryptoPerpetual, was {other:?}"),
         }

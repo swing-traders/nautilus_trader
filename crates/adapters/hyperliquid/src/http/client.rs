@@ -3741,7 +3741,6 @@ mod tests {
         client.set_account_id(AccountId::from("HYPERLIQUID-001"));
 
         let base = Currency::new("ARB", 8, 0, "ARB", CurrencyType::Crypto);
-        let usd = Currency::new("USD", 8, 0, "USD", CurrencyType::Crypto);
         let usdc = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
         let clock = get_atomic_clock_realtime();
         let ts = clock.get_time_ns();
@@ -3749,7 +3748,7 @@ mod tests {
             InstrumentId::new(Symbol::new("ARB-USD-PERP"), *HYPERLIQUID_VENUE),
             Symbol::new("ARB"),
             base,
-            usd,
+            usdc,
             usdc,
             false,
             5,
@@ -4350,7 +4349,6 @@ mod tests {
             "dex:STREAMABCD****",
             CurrencyType::Crypto,
         );
-        let usd = Currency::new("USD", 8, 0, "USD", CurrencyType::Crypto);
         let usdc = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
         let clock = get_atomic_clock_realtime();
         let ts = clock.get_time_ns();
@@ -4362,7 +4360,7 @@ mod tests {
             ),
             Symbol::new("dex:STREAMABCD****"),
             base_currency,
-            usd,
+            usdc,
             usdc,
             false,
             6,
