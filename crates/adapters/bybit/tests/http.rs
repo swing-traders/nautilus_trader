@@ -47,11 +47,12 @@ use nautilus_model::{
     data::BarType,
     enums::{OrderSide, OrderType, PositionSideSpecified, TimeInForce, TriggerType},
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol},
-    instruments::{CurrencyPair, InstrumentAny},
+    instruments::{CurrencyPair, Instrument, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
+use rust_decimal_macros::dec;
 use serde_json::{Value, json};
 
 type SettleCoinQueries = Arc<tokio::sync::Mutex<Vec<(String, Option<String>)>>>;
@@ -5115,4 +5116,140 @@ async fn test_modify_order_forwards_the_attached_tp_sl() {
             "slTriggerBy": "LastPrice",
         }),
     );
+}
+
+async fn start_fee_rate_server(fee_rate: Value) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route("/v5/market/time", get(handle_get_server_time))
+        .route("/v5/market/instruments-info", get(handle_get_instruments))
+        .route(
+            "/v5/account/fee-rate",
+            get(move || {
+                let body = fee_rate.clone();
+                async move { Json(body) }
+            }),
+        );
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    wait_for_server(addr, "/v5/market/time").await;
+    addr
+}
+
+fn fee_rate_rejection(error_code: i32, message: &str) -> Value {
+    json!({
+        "retCode": error_code,
+        "retMsg": message,
+        "result": {},
+        "retExtInfo": {},
+        "time": 1704470400123i64
+    })
+}
+
+fn fee_rate_list(list: &Value) -> Value {
+    json!({
+        "retCode": 0,
+        "retMsg": "OK",
+        "result": {"list": list},
+        "retExtInfo": {},
+        "time": 1704470400123i64
+    })
+}
+
+fn credentialed_client(addr: SocketAddr) -> BybitHttpClient {
+    BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(format!("http://{addr}")),
+        60,
+        0,
+        1000,
+        10_000,
+        5_000,
+        None,
+    )
+    .unwrap()
+}
+
+#[rstest]
+#[case::permission_denied(10005, "Permission denied, please check your API key permissions")]
+#[case::parameter_error_off_demo(10001, "Parameter error")]
+#[tokio::test]
+async fn test_request_instruments_fee_rate_rejection_is_error(
+    #[case] error_code: i32,
+    #[case] message: &str,
+) {
+    let addr = start_fee_rate_server(fee_rate_rejection(error_code, message)).await;
+    let client = credentialed_client(addr);
+
+    let result = client
+        .request_instruments(BybitProductType::Linear, None, None)
+        .await;
+
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains(&error_code.to_string()), "{error}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_instruments_symbol_missing_from_fee_map_is_error() {
+    let addr = start_fee_rate_server(fee_rate_list(&json!([{
+        "symbol": "ETHUSDT",
+        "takerFeeRate": "0.0006",
+        "makerFeeRate": "0.0001",
+        "baseCoin": ""
+    }])))
+    .await;
+    let client = credentialed_client(addr);
+
+    let result = client
+        .request_instruments(BybitProductType::Linear, None, None)
+        .await;
+
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("BTCUSDT"), "{error}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_instruments_empty_fee_list_is_error() {
+    let addr = start_fee_rate_server(fee_rate_list(&json!([]))).await;
+    let client = credentialed_client(addr);
+
+    let result = client
+        .request_instruments(BybitProductType::Linear, None, None)
+        .await;
+
+    assert!(result.is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_instruments_without_credentials_uses_default_fee_rate() {
+    let addr = start_fee_rate_server(fee_rate_list(&json!([]))).await;
+    let client = BybitHttpClient::new(
+        Some(format!("http://{addr}")),
+        60,
+        0,
+        1000,
+        10_000,
+        5_000,
+        None,
+    )
+    .unwrap();
+
+    let instruments = client
+        .request_instruments(BybitProductType::Linear, None, None)
+        .await
+        .unwrap();
+
+    assert!(!instruments.is_empty());
+    for instrument in &instruments {
+        assert_eq!(instrument.maker_fee(), dec!(0.001));
+        assert_eq!(instrument.taker_fee(), dec!(0.001));
+    }
 }

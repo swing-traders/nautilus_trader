@@ -3220,42 +3220,74 @@ impl BybitHttpClient {
         Ok(Some(report))
     }
 
+    /// Fetches the account's fee rates for a product, or `None` where NT's default rate applies: a
+    /// client without credentials, or the demo service's refusal of derivatives fee rates.
     async fn fetch_fee_map(
         &self,
         product_type: BybitProductType,
         base_coin: Option<Ustr>,
-    ) -> anyhow::Result<AHashMap<Ustr, BybitFeeRate>> {
+    ) -> anyhow::Result<Option<AHashMap<Ustr, BybitFeeRate>>> {
         let mut fee_params = BybitFeeRateParamsBuilder::default();
         fee_params.category(product_type);
         if let Some(bc) = base_coin {
             fee_params.base_coin(bc.to_string());
         }
         let Ok(params) = fee_params.build() else {
-            return Ok(AHashMap::new());
+            return Ok(None);
         };
 
         match self.inner.get_fee_rate(&params).await {
-            Ok(response) => Ok(response
-                .result
-                .list
-                .into_iter()
-                .map(|f| (f.symbol, f))
-                .collect()),
+            Ok(response) => {
+                anyhow::ensure!(
+                    !response.result.list.is_empty(),
+                    "Bybit answered an empty {} fee rate list via /v5/account/fee-rate",
+                    product_type.as_ref().to_ascii_lowercase()
+                );
+                Ok(Some(
+                    response
+                        .result
+                        .list
+                        .into_iter()
+                        .map(|f| (f.symbol, f))
+                        .collect(),
+                ))
+            }
             Err(BybitHttpError::MissingCredentials) => {
                 log::warn!("Missing credentials for fee rates, using defaults");
-                Ok(AHashMap::new())
+                Ok(None)
             }
             Err(BybitHttpError::BybitError {
                 error_code,
                 ref message,
             }) => {
-                log::warn!(
-                    "{}",
-                    self.fee_rate_rejection_warning(product_type, error_code, message)
-                );
-                Ok(AHashMap::new())
+                let warning = self.fee_rate_rejection_warning(product_type, error_code, message)?;
+                log::warn!("{warning}");
+                Ok(None)
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Returns the fee rate a definition is stamped with: the account's own where the venue
+    /// states fee rates, else NT's documented default.
+    fn instrument_fee_rate(
+        fee_map: Option<&AHashMap<Ustr, BybitFeeRate>>,
+        product_type: BybitProductType,
+        symbol: Ustr,
+    ) -> anyhow::Result<BybitFeeRate> {
+        match fee_map {
+            Some(fee_map) => fee_map.get(&symbol).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Bybit fee rates carry no {} entry for {symbol}",
+                    product_type.as_ref().to_ascii_lowercase()
+                )
+            }),
+            None => Ok(BybitFeeRate {
+                symbol,
+                taker_fee_rate: "0.001".to_string(),
+                maker_fee_rate: "0.001".to_string(),
+                base_coin: None,
+            }),
         }
     }
 
@@ -3300,12 +3332,14 @@ impl BybitHttpClient {
         }
     }
 
+    /// Classifies a rejected fee-rate request: the demo service's refusal of derivatives fee rates
+    /// yields the warning NT's default rate is used under, any other rejection is an error.
     fn fee_rate_rejection_warning(
         &self,
         product_type: BybitProductType,
         error_code: i32,
         message: &str,
-    ) -> String {
+    ) -> anyhow::Result<String> {
         let product_type = product_type.as_ref().to_ascii_lowercase();
         let error_detail = Self::format_bybit_error_detail(error_code, message);
 
@@ -3315,15 +3349,15 @@ impl BybitHttpClient {
             && matches!(product_type.as_str(), "linear" | "inverse")
             && error_code == 10001
         {
-            format!(
+            Ok(format!(
                 "Bybit demo rejected the {product_type} fee rate request via \
                  /v5/account/fee-rate ({error_detail}); demo derivatives fee rates appear \
                  unsupported, using defaults"
-            )
+            ))
         } else {
-            format!(
+            anyhow::bail!(
                 "Fee rate request rejected for {product_type} instruments via \
-                 /v5/account/fee-rate ({error_detail}), using defaults"
+                 /v5/account/fee-rate ({error_detail})"
             )
         }
     }
@@ -3347,7 +3381,7 @@ impl BybitHttpClient {
     where
         D: DeserializeOwned,
         BybitCursorListResponse<D>: BybitResponseCheck,
-        F: FnMut(&D) -> Option<InstrumentAny>,
+        F: FnMut(&D) -> anyhow::Result<Option<InstrumentAny>>,
     {
         let mut instruments = Vec::new();
         let mut cursor: Option<String> = None;
@@ -3366,7 +3400,7 @@ impl BybitHttpClient {
             let response: BybitCursorListResponse<D> = self.inner.get_instruments(&params).await?;
 
             for definition in &response.result.list {
-                if let Some(instrument) = parse(definition) {
+                if let Some(instrument) = parse(definition)? {
                     instruments.push(instrument);
                 }
             }
@@ -3495,13 +3529,6 @@ impl BybitHttpClient {
     ) -> anyhow::Result<Vec<InstrumentAny>> {
         let ts_init = self.generate_ts_init();
 
-        let default_fee_rate = |symbol: Ustr| BybitFeeRate {
-            symbol,
-            taker_fee_rate: "0.001".to_string(),
-            maker_fee_rate: "0.001".to_string(),
-            base_coin: None,
-        };
-
         let instruments = match product_type {
             BybitProductType::Spot => {
                 let fee_map = self.fetch_fee_map(product_type, base_coin).await?;
@@ -3510,11 +3537,9 @@ impl BybitHttpClient {
                     &symbol,
                     base_coin,
                     |def| {
-                        let fee = fee_map
-                            .get(&def.symbol)
-                            .cloned()
-                            .unwrap_or_else(|| default_fee_rate(def.symbol));
-                        parse_spot_instrument(def, &fee, ts_init, ts_init).ok()
+                        let fee =
+                            Self::instrument_fee_rate(fee_map.as_ref(), product_type, def.symbol)?;
+                        Ok(parse_spot_instrument(def, &fee, ts_init, ts_init).ok())
                     },
                 )
                 .await?
@@ -3526,11 +3551,9 @@ impl BybitHttpClient {
                     &symbol,
                     base_coin,
                     |def| {
-                        let fee = fee_map
-                            .get(&def.symbol)
-                            .cloned()
-                            .unwrap_or_else(|| default_fee_rate(def.symbol));
-                        parse_linear_instrument(def, &fee, ts_init, ts_init).ok()
+                        let fee =
+                            Self::instrument_fee_rate(fee_map.as_ref(), product_type, def.symbol)?;
+                        Ok(parse_linear_instrument(def, &fee, ts_init, ts_init).ok())
                     },
                 )
                 .await?
@@ -3542,11 +3565,9 @@ impl BybitHttpClient {
                     &symbol,
                     base_coin,
                     |def| {
-                        let fee = fee_map
-                            .get(&def.symbol)
-                            .cloned()
-                            .unwrap_or_else(|| default_fee_rate(def.symbol));
-                        parse_inverse_instrument(def, &fee, ts_init, ts_init).ok()
+                        let fee =
+                            Self::instrument_fee_rate(fee_map.as_ref(), product_type, def.symbol)?;
+                        Ok(parse_inverse_instrument(def, &fee, ts_init, ts_init).ok())
                     },
                 )
                 .await?
@@ -3559,7 +3580,7 @@ impl BybitHttpClient {
                     base_coin,
                     |def| {
                         let fee = fee_map.get(&def.base_coin);
-                        parse_option_instrument(def, fee, ts_init, ts_init).ok()
+                        Ok(parse_option_instrument(def, fee, ts_init, ts_init).ok())
                     },
                 )
                 .await?
@@ -3590,13 +3611,6 @@ impl BybitHttpClient {
         let ts_init = self.generate_ts_init();
         let mut statuses = AHashMap::new();
 
-        let default_fee_rate = |symbol: Ustr| BybitFeeRate {
-            symbol,
-            taker_fee_rate: "0.001".to_string(),
-            maker_fee_rate: "0.001".to_string(),
-            base_coin: None,
-        };
-
         // A perp with a non-zero delivery time is scheduled for delisting.
         let perp_status = |status: MarketStatusAction, is_scheduled_perp: bool| {
             if status == MarketStatusAction::Trading && is_scheduled_perp {
@@ -3619,11 +3633,9 @@ impl BybitHttpClient {
                             *BYBIT_VENUE,
                         );
                         statuses.insert(id, MarketStatusAction::from(def.status));
-                        let fee = fee_map
-                            .get(&def.symbol)
-                            .cloned()
-                            .unwrap_or_else(|| default_fee_rate(def.symbol));
-                        parse_spot_instrument(def, &fee, ts_init, ts_init).ok()
+                        let fee =
+                            Self::instrument_fee_rate(fee_map.as_ref(), product_type, def.symbol)?;
+                        Ok(parse_spot_instrument(def, &fee, ts_init, ts_init).ok())
                     },
                 )
                 .await?
@@ -3642,11 +3654,9 @@ impl BybitHttpClient {
                         let scheduled = def.contract_type == BybitContractType::LinearPerpetual
                             && def.delivery_time != "0";
                         statuses.insert(id, perp_status(def.status.into(), scheduled));
-                        let fee = fee_map
-                            .get(&def.symbol)
-                            .cloned()
-                            .unwrap_or_else(|| default_fee_rate(def.symbol));
-                        parse_linear_instrument(def, &fee, ts_init, ts_init).ok()
+                        let fee =
+                            Self::instrument_fee_rate(fee_map.as_ref(), product_type, def.symbol)?;
+                        Ok(parse_linear_instrument(def, &fee, ts_init, ts_init).ok())
                     },
                 )
                 .await?
@@ -3665,11 +3675,9 @@ impl BybitHttpClient {
                         let scheduled = def.contract_type == BybitContractType::InversePerpetual
                             && def.delivery_time != "0";
                         statuses.insert(id, perp_status(def.status.into(), scheduled));
-                        let fee = fee_map
-                            .get(&def.symbol)
-                            .cloned()
-                            .unwrap_or_else(|| default_fee_rate(def.symbol));
-                        parse_inverse_instrument(def, &fee, ts_init, ts_init).ok()
+                        let fee =
+                            Self::instrument_fee_rate(fee_map.as_ref(), product_type, def.symbol)?;
+                        Ok(parse_inverse_instrument(def, &fee, ts_init, ts_init).ok())
                     },
                 )
                 .await?
@@ -3687,7 +3695,7 @@ impl BybitHttpClient {
                         );
                         statuses.insert(id, MarketStatusAction::from(def.status));
                         let fee = fee_map.get(&def.base_coin);
-                        parse_option_instrument(def, fee, ts_init, ts_init).ok()
+                        Ok(parse_option_instrument(def, fee, ts_init, ts_init).ok())
                     },
                 )
                 .await?
@@ -4992,55 +5000,62 @@ mod tests {
         BybitProductType::Linear,
         10001,
         "",
-        "Bybit demo rejected the linear fee rate request via /v5/account/fee-rate \
-         (error 10001, no message); demo derivatives fee rates appear unsupported, using defaults"
+        Ok(
+            "Bybit demo rejected the linear fee rate request via /v5/account/fee-rate \
+            (error 10001, no message); demo derivatives fee rates appear unsupported, using defaults"
+        )
     )]
     #[case(
         "https://api-demo.bybit.com",
         BybitProductType::Inverse,
         10001,
         "",
-        "Bybit demo rejected the inverse fee rate request via /v5/account/fee-rate \
-         (error 10001, no message); demo derivatives fee rates appear unsupported, using defaults"
+        Ok(
+            "Bybit demo rejected the inverse fee rate request via /v5/account/fee-rate \
+            (error 10001, no message); demo derivatives fee rates appear unsupported, using defaults"
+        )
     )]
     #[case(
         "https://api.bybit.com",
         BybitProductType::Spot,
         10001,
         "Parameter error",
-        "Fee rate request rejected for spot instruments via /v5/account/fee-rate \
-         (error 10001: Parameter error), using defaults"
+        Err("error 10001: Parameter error")
     )]
     #[case(
         "https://api-demo.bybit.com",
         BybitProductType::Spot,
         10001,
         "Parameter error",
-        "Fee rate request rejected for spot instruments via /v5/account/fee-rate \
-         (error 10001: Parameter error), using defaults"
+        Err("error 10001: Parameter error")
     )]
     #[case(
         "https://api.bybit.com",
         BybitProductType::Linear,
         10001,
         "Parameter error",
-        "Fee rate request rejected for linear instruments via /v5/account/fee-rate \
-         (error 10001: Parameter error), using defaults"
+        Err("error 10001: Parameter error")
     )]
     fn test_fee_rate_rejection_warning(
         #[case] base_url: &str,
         #[case] product_type: BybitProductType,
         #[case] error_code: i32,
         #[case] message: &str,
-        #[case] expected: &str,
+        #[case] expected: Result<&str, &str>,
     ) {
         let client =
             BybitHttpClient::new(Some(base_url.to_string()), 60, 3, 1000, 10_000, 5_000, None)
                 .unwrap();
 
-        let warning = client.fee_rate_rejection_warning(product_type, error_code, message);
+        let result = client.fee_rate_rejection_warning(product_type, error_code, message);
 
-        assert_eq!(warning, expected);
+        match expected {
+            Ok(warning) => assert_eq!(result.unwrap(), warning),
+            Err(error_detail) => {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(error_detail), "{error}");
+            }
+        }
     }
 
     #[rstest]
