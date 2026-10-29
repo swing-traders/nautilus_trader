@@ -14,8 +14,13 @@
 # -------------------------------------------------------------------------------------------------
 
 
+from typing import Any
+
 import pytest
 
+from nautilus_trader.adapters.binance import factories as binance_factories
+from nautilus_trader.adapters.binance.common.constants import BINANCE_FUTURES_ORDER_COUNT_1M_KEY
+from nautilus_trader.adapters.binance.common.constants import BINANCE_FUTURES_ORDER_COUNT_10S_KEY
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
 from nautilus_trader.adapters.binance.common.urls import get_http_base_url
@@ -26,8 +31,13 @@ from nautilus_trader.adapters.binance.factories import BinanceLiveDataClientFact
 from nautilus_trader.adapters.binance.factories import BinanceLiveExecClientFactory
 from nautilus_trader.adapters.binance.futures.data import BinanceFuturesDataClient
 from nautilus_trader.adapters.binance.futures.execution import BinanceFuturesExecutionClient
+from nautilus_trader.adapters.binance.futures.http.account import BinanceFuturesAccountHttpAPI
+from nautilus_trader.adapters.binance.futures.http.market import BinanceFuturesMarketHttpAPI
+from nautilus_trader.adapters.binance.futures.http.wallet import BinanceFuturesWalletHttpAPI
 from nautilus_trader.adapters.binance.spot.data import BinanceSpotDataClient
 from nautilus_trader.adapters.binance.spot.execution import BinanceSpotExecutionClient
+from nautilus_trader.adapters.binance.spot.http.account import BinanceSpotAccountHttpAPI
+from nautilus_trader.adapters.binance.spot.http.market import BinanceSpotMarketHttpAPI
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -430,3 +440,70 @@ class TestBinanceFactories:
         assert isinstance(exec_client, BinanceFuturesExecutionClient)
         assert exec_client._ws_client._account_type == BinanceAccountType.COIN_FUTURES
         assert exec_client._ws_client._stream_base_url == "wss://custom.example/ws/"
+
+
+def _configured_endpoint_quota_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    account_type: BinanceAccountType,
+) -> set[str]:
+    captured: dict[str, Any] = {}
+
+    class CapturingBinanceHttpClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(binance_factories, "BinanceHttpClient", CapturingBinanceHttpClient)
+    binance_factories.get_cached_binance_http_client.cache_clear()
+    try:
+        binance_factories.get_cached_binance_http_client(
+            clock=LiveClock(),
+            account_type=account_type,
+            api_key="api-key",
+            api_secret="api-secret",
+        )
+    finally:
+        binance_factories.get_cached_binance_http_client.cache_clear()
+
+    shared_keys = {
+        "binance:global",
+        BINANCE_FUTURES_ORDER_COUNT_10S_KEY,
+        BINANCE_FUTURES_ORDER_COUNT_1M_KEY,
+    }
+    return {key for key, _ in captured["ratelimiter_quotas"]} - shared_keys
+
+
+def test_futures_quota_keys_equal_endpoint_keys(monkeypatch, binance_http_client):
+    # Arrange
+    clock = LiveClock()
+    account = BinanceFuturesAccountHttpAPI(binance_http_client, clock=clock)
+    wallet = BinanceFuturesWalletHttpAPI(binance_http_client, clock=clock)
+    market = BinanceFuturesMarketHttpAPI(binance_http_client)
+    endpoint_keys = {
+        account._endpoint_order._ratelimiter_key,
+        account._endpoint_all_orders._ratelimiter_key,
+        wallet._endpoint_futures_commission_rate._ratelimiter_key,
+        market._endpoint_klines._ratelimiter_key,
+    }
+
+    # Act
+    configured = _configured_endpoint_quota_keys(monkeypatch, BinanceAccountType.USDT_FUTURES)
+
+    # Assert
+    assert configured == endpoint_keys
+
+
+def test_spot_quota_keys_equal_endpoint_keys(monkeypatch, binance_http_client):
+    # Arrange
+    account = BinanceSpotAccountHttpAPI(binance_http_client, clock=LiveClock())
+    market = BinanceSpotMarketHttpAPI(binance_http_client)
+    endpoint_keys = {
+        account._endpoint_order._ratelimiter_key,
+        account._endpoint_all_orders._ratelimiter_key,
+        market._endpoint_klines._ratelimiter_key,
+    }
+
+    # Act
+    configured = _configured_endpoint_quota_keys(monkeypatch, BinanceAccountType.SPOT)
+
+    # Assert
+    assert configured == endpoint_keys

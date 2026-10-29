@@ -119,9 +119,9 @@ def get_cached_binance_http_client(
         ratelimiter_default_quota = global_quota
         ratelimiter_quotas: list[tuple[str, Quota]] = [
             (global_key, global_quota),
-            ("binance:api/v3/order", Quota.rate_per_minute(3000)),
-            ("binance:api/v3/allOrders", Quota.rate_per_minute(int(3000 / 20))),
-            ("binance:api/v3/klines", Quota.rate_per_minute(600)),
+            ("binance:/api/v3/order", Quota.rate_per_minute(3000)),
+            ("binance:/api/v3/allOrders", Quota.rate_per_minute(int(3000 / 20))),
+            ("binance:/api/v3/klines", Quota.rate_per_minute(600)),
         ]
     else:
         # Futures
@@ -133,10 +133,10 @@ def get_cached_binance_http_client(
             (global_key, global_quota),
             (BINANCE_FUTURES_ORDER_COUNT_10S_KEY, Quota.rate_per_second(30)),
             (BINANCE_FUTURES_ORDER_COUNT_1M_KEY, Quota.rate_per_minute(1200)),
-            ("binance:fapi/v1/order", Quota.rate_per_minute(1200)),
-            ("binance:fapi/v1/allOrders", Quota.rate_per_minute(int(1200 / 20))),
-            ("binance:fapi/v1/commissionRate", Quota.rate_per_minute(int(2400 / 20))),
-            ("binance:fapi/v1/klines", Quota.rate_per_minute(600)),
+            ("binance:/fapi/v1/order", Quota.rate_per_minute(1200)),
+            ("binance:/fapi/v1/allOrders", Quota.rate_per_minute(int(1200 / 20))),
+            ("binance:/fapi/v1/commissionRate", Quota.rate_per_minute(int(2400 / 20))),
+            ("binance:/fapi/v1/klines", Quota.rate_per_minute(600)),
         ]
 
     return BinanceHttpClient(
