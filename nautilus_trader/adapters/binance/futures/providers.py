@@ -172,20 +172,10 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
         ):
             self._log.info("Querying commission rates per symbol (parallel requests)")
 
-            async def _query_fee(symbol: str) -> BinanceFuturesCommissionRate:
-                try:
-                    return await self._http_wallet.query_futures_commission_rate(symbol=symbol)
-                except Exception as e:
-                    self._log.warning(
-                        f"Failed to query commission rate for {symbol}: {e}, falling back to fee tier table",
-                    )
-                    return BinanceFuturesCommissionRate(
-                        symbol=symbol,
-                        makerCommissionRate=fee_rates.maker,
-                        takerCommissionRate=fee_rates.taker,
-                    )
-
-            tasks = [_query_fee(symbol_info.symbol) for symbol_info in exchange_info.symbols]
+            tasks = [
+                self._http_wallet.query_futures_commission_rate(symbol=symbol_info.symbol)
+                for symbol_info in exchange_info.symbols
+            ]
             fees = await asyncio.gather(*tasks)
 
             for symbol_info, fee in zip(exchange_info.symbols, fees, strict=True):
@@ -247,21 +237,9 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
             and self._client.api_key is not None
             and self._client._secret is not None
         ):
-
-            async def _query_fee(symbol: str) -> BinanceFuturesCommissionRate:
-                try:
-                    return await self._http_wallet.query_futures_commission_rate(symbol=symbol)
-                except Exception as e:
-                    self._log.warning(
-                        f"Failed to query commission rate for {symbol}: {e}. Falling back to fee tier table.",
-                    )
-                    return BinanceFuturesCommissionRate(
-                        symbol=symbol,
-                        makerCommissionRate=fee_rates.maker,
-                        takerCommissionRate=fee_rates.taker,
-                    )
-
-            tasks = [_query_fee(symbol) for symbol in symbols]
+            tasks = [
+                self._http_wallet.query_futures_commission_rate(symbol=symbol) for symbol in symbols
+            ]
             fees = await asyncio.gather(*tasks)
 
             for symbol, fee in zip(symbols, fees, strict=True):
@@ -313,17 +291,7 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
             and self._client.api_key is not None
             and self._client._secret is not None
         ):
-            try:
-                fee = await self._http_wallet.query_futures_commission_rate(symbol=symbol)
-            except Exception as e:
-                self._log.warning(
-                    f"Failed to query commission rate for {symbol}: {e}. Falling back to fee tier table.",
-                )
-                fee = BinanceFuturesCommissionRate(
-                    symbol=symbol,
-                    makerCommissionRate=fee_rates.maker,
-                    takerCommissionRate=fee_rates.taker,
-                )
+            fee = await self._http_wallet.query_futures_commission_rate(symbol=symbol)
         else:
             fee = BinanceFuturesCommissionRate(
                 symbol=symbol,

@@ -24,6 +24,7 @@ from nautilus_trader.adapters.binance.config import BinanceInstrumentProviderCon
 from nautilus_trader.adapters.binance.futures.providers import BinanceFuturesInstrumentProvider
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesAccountInfo
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
+from nautilus_trader.adapters.binance.http.error import BinanceClientError
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId
@@ -360,7 +361,7 @@ class TestBinanceInstrumentProvider:
         assert btc_perp.taker_fee == Decimal("0.0005")
 
     @pytest.mark.asyncio
-    async def test_load_all_async_with_commission_rate_query_failure_falls_back(
+    async def test_load_all_async_with_commission_rate_query_failure_raises(
         self,
         binance_http_client,
         live_logger,
@@ -419,16 +420,9 @@ class TestBinanceInstrumentProvider:
             mock_query_account_info,
         )
 
-        # Act
-        await self.provider.load_all_async()
-
-        # Assert - should fall back to fee tier table
-        assert self.provider.count == 3
-
-        btc_perp = self.provider.find(InstrumentId(Symbol("BTCUSDT-PERP"), Venue("BINANCE")))
-        assert btc_perp is not None
-        assert btc_perp.maker_fee == Decimal("0.0002")
-        assert btc_perp.taker_fee == Decimal("0.0005")
+        # Act, Assert
+        with pytest.raises(Exception, match="API error"):
+            await self.provider.load_all_async()
 
     @pytest.mark.asyncio
     async def test_futures_instruments_have_correct_margin_values(
@@ -508,3 +502,110 @@ class TestBinanceInstrumentProvider:
         assert btc_future is not None
         assert btc_future.margin_init == Decimal(1)
         assert btc_future.margin_maint == Decimal(1)
+
+    def _commission_provider(
+        self,
+        binance_http_client,
+        monkeypatch,
+        query_commission_rates: bool,
+    ) -> BinanceFuturesInstrumentProvider:
+        exchange_info_response = pkgutil.get_data(
+            package="tests.integration_tests.adapters.binance.resources.http_responses",
+            resource="http_futures_market_exchange_info.json",
+        )
+
+        async def mock_send_request(
+            self,
+            http_method: str,
+            url_path: str,
+            payload: dict[str, str],
+            ratelimiter_keys: list[str] | None = None,
+        ) -> bytes:
+            if "commissionRate" in url_path:
+                raise BinanceClientError(400, {"code": -1022, "msg": "Signature invalid"}, {})
+            return exchange_info_response
+
+        async def mock_query_account_info(recv_window: str | None = None):
+            return BinanceFuturesAccountInfo(
+                feeTier=0,
+                canTrade=True,
+                canDeposit=True,
+                canWithdraw=True,
+                updateTime=1234567890000,
+                assets=[],
+            )
+
+        async def mock_query_position_risk(*args, **kwargs):
+            return []
+
+        monkeypatch.setattr(target=BinanceHttpClient, name="send_request", value=mock_send_request)
+        provider = BinanceFuturesInstrumentProvider(
+            client=binance_http_client,
+            clock=self.clock,
+            account_type=BinanceAccountType.USDT_FUTURES,
+            config=BinanceInstrumentProviderConfig(query_commission_rates=query_commission_rates),
+        )
+        monkeypatch.setattr(
+            provider._http_account,
+            "query_futures_account_info",
+            mock_query_account_info,
+        )
+        monkeypatch.setattr(
+            provider._http_account,
+            "query_futures_position_risk",
+            mock_query_position_risk,
+        )
+        return provider
+
+    @staticmethod
+    async def _load_btcusdt_perp(provider: BinanceFuturesInstrumentProvider, path: str) -> None:
+        instrument_id = InstrumentId(Symbol("BTCUSDT-PERP"), Venue("BINANCE"))
+        if path == "load_all_async":
+            await provider.load_all_async()
+        elif path == "load_ids_async":
+            await provider.load_ids_async([instrument_id])
+        else:
+            await provider.load_async(instrument_id)
+
+    @pytest.mark.parametrize("path", ["load_ids_async", "load_async"])
+    @pytest.mark.asyncio
+    async def test_commission_rate_failure_raises_with_flag_and_credentials(
+        self,
+        binance_http_client,
+        monkeypatch,
+        path,
+    ):
+        # Arrange
+        provider = self._commission_provider(
+            binance_http_client,
+            monkeypatch,
+            query_commission_rates=True,
+        )
+
+        # Act, Assert
+        with pytest.raises(BinanceClientError):
+            await self._load_btcusdt_perp(provider, path)
+
+    @pytest.mark.parametrize("path", ["load_all_async", "load_ids_async", "load_async"])
+    @pytest.mark.asyncio
+    async def test_without_commission_flag_uses_fee_tier_table(
+        self,
+        binance_http_client,
+        monkeypatch,
+        path,
+    ):
+        # Arrange
+        provider = self._commission_provider(
+            binance_http_client,
+            monkeypatch,
+            query_commission_rates=False,
+        )
+
+        # Act
+        await self._load_btcusdt_perp(provider, path)
+
+        # Assert - tier 0 of the fee tier table
+        btc_perp = provider.find(InstrumentId(Symbol("BTCUSDT-PERP"), Venue("BINANCE")))
+        assert btc_perp is not None
+        assert btc_perp.maker_fee == Decimal("0.0002")
+        assert btc_perp.taker_fee == Decimal("0.0005")

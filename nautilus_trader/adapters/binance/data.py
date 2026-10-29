@@ -36,7 +36,7 @@ from nautilus_trader.adapters.binance.common.types import BinanceTicker
 from nautilus_trader.adapters.binance.config import BinanceDataClientConfig
 from nautilus_trader.adapters.binance.futures.types import BinanceFuturesMarkPriceUpdate
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
-from nautilus_trader.adapters.binance.http.error import BinanceError
+from nautilus_trader.adapters.binance.http.error import get_binance_error_code
 from nautilus_trader.adapters.binance.http.market import BinanceMarketHttpAPI
 from nautilus_trader.adapters.binance.websocket.client import BinanceWebSocketClient
 from nautilus_trader.cache.cache import Cache
@@ -266,11 +266,14 @@ class BinanceCommonDataClient(LiveMarketDataClient):
                     await self._instrument_provider.initialize(reload=True)
                     self._send_all_instruments_to_data_engine()
                     break
-                except BinanceError as e:
-                    error_code = BinanceErrorCode(int(e.message["code"]))
+                except asyncio.CancelledError:
+                    self._log.debug("Canceled task 'update_instruments'")
+                    return
+                except Exception as e:
+                    error_code = get_binance_error_code(e)
                     retries += 1
 
-                    if not self._should_retry(error_code, retries):
+                    if error_code is None or not self._should_retry(error_code, retries):
                         self._log.error(f"Error updating instruments: {e}")
                         break
 
@@ -279,9 +282,6 @@ class BinanceCommonDataClient(LiveMarketDataClient):
                         f"{retries}/{self._max_retries} in {self._retry_delay}s",
                     )
                     await asyncio.sleep(self._retry_delay)
-                except asyncio.CancelledError:
-                    self._log.debug("Canceled task 'update_instruments'")
-                    return
 
     async def _reconnect(self) -> None:
         coros = []
