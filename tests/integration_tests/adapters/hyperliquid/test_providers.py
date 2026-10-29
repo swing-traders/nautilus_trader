@@ -13,7 +13,9 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import json
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -21,6 +23,7 @@ from nautilus_trader.adapters.hyperliquid.constants import HYPERLIQUID_VENUE
 from nautilus_trader.adapters.hyperliquid.enums import HyperliquidProductType
 from nautilus_trader.adapters.hyperliquid.providers import HyperliquidInstrumentProvider
 from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.model.currencies import USDC
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.identifiers import InstrumentId
@@ -273,3 +276,134 @@ def _make_outcome_binary_option() -> BinaryOption:
         ts_event=0,
         ts_init=0,
     )
+
+
+ACCOUNT_ADDRESS = "0x1234567890abcdef1234567890abcdef12345678"
+BTC_PERP_ID = InstrumentId.from_str("BTC-USD-PERP.HYPERLIQUID")
+HIP3_PERP_ID = InstrumentId.from_str("xyz:XYZ100-USD-PERP.HYPERLIQUID")
+
+
+def _make_pyo3_perp(instrument_id: str, raw_symbol: str) -> nautilus_pyo3.CryptoPerpetual:
+    usdc = nautilus_pyo3.Currency.from_str("USDC")
+    return nautilus_pyo3.CryptoPerpetual(
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument_id),
+        raw_symbol=nautilus_pyo3.Symbol(raw_symbol),
+        base_currency=nautilus_pyo3.Currency.from_str("BTC"),
+        quote_currency=usdc,
+        settlement_currency=usdc,
+        is_inverse=False,
+        price_precision=1,
+        size_precision=5,
+        price_increment=nautilus_pyo3.Price.from_str("0.1"),
+        size_increment=nautilus_pyo3.Quantity.from_str("0.00001"),
+        multiplier=None,
+        lot_size=None,
+        max_quantity=None,
+        min_quantity=None,
+        max_notional=None,
+        min_notional=None,
+        max_price=None,
+        min_price=None,
+        margin_init=Decimal("0.05"),
+        margin_maint=Decimal("0.025"),
+        maker_fee=None,
+        taker_fee=None,
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+def _fee_provider(mock_http_client, user_fees: dict | None, account_address: str | None):
+    mock_http_client.load_instrument_definitions = AsyncMock(
+        return_value=[
+            _make_pyo3_perp(BTC_PERP_ID.value, "BTC"),
+            _make_pyo3_perp(HIP3_PERP_ID.value, "xyz:XYZ100"),
+        ],
+    )
+    mock_http_client.info_user_fees = AsyncMock(return_value=json.dumps(user_fees))
+    return HyperliquidInstrumentProvider(
+        client=mock_http_client,
+        config=InstrumentProviderConfig(),
+        product_types=[HyperliquidProductType.PERP, HyperliquidProductType.PERP_HIP3],
+        account_address=account_address,
+    )
+
+
+USER_FEES = {
+    "userCrossRate": "0.00045",
+    "userAddRate": "0.00015",
+    "activeReferralDiscount": "0.04",
+}
+
+
+@pytest.mark.asyncio
+async def test_account_fees_stamp_canonical_perp(mock_http_client):
+    # Arrange
+    provider = _fee_provider(mock_http_client, USER_FEES, ACCOUNT_ADDRESS)
+
+    # Act
+    await provider.load_all_async()
+
+    # Assert - taker 0.00045 x 0.96, maker 0.00015 x 0.96
+    btc_perp = provider.find(BTC_PERP_ID)
+    assert btc_perp.taker_fee == Decimal("0.000432")
+    assert btc_perp.maker_fee == Decimal("0.000144")
+
+
+@pytest.mark.asyncio
+async def test_account_fees_negative_maker_rate_is_not_scaled(mock_http_client):
+    # Arrange
+    provider = _fee_provider(
+        mock_http_client,
+        {**USER_FEES, "userAddRate": "-0.00002"},
+        ACCOUNT_ADDRESS,
+    )
+
+    # Act
+    await provider.load_all_async()
+
+    # Assert
+    btc_perp = provider.find(BTC_PERP_ID)
+    assert btc_perp.maker_fee == Decimal("-0.00002")
+    assert btc_perp.taker_fee == Decimal("0.000432")
+
+
+@pytest.mark.asyncio
+async def test_account_fees_leave_hip3_perp_at_zero(mock_http_client):
+    # Arrange
+    provider = _fee_provider(mock_http_client, USER_FEES, ACCOUNT_ADDRESS)
+
+    # Act
+    await provider.load_all_async()
+
+    # Assert
+    hip3_perp = provider.find(HIP3_PERP_ID)
+    assert hip3_perp.maker_fee == Decimal(0)
+    assert hip3_perp.taker_fee == Decimal(0)
+
+
+@pytest.mark.parametrize("missing", ["userCrossRate", "userAddRate", "activeReferralDiscount"])
+@pytest.mark.asyncio
+async def test_account_fees_missing_field_raises(mock_http_client, missing):
+    # Arrange
+    user_fees = {key: value for key, value in USER_FEES.items() if key != missing}
+    provider = _fee_provider(mock_http_client, user_fees, ACCOUNT_ADDRESS)
+
+    # Act, Assert
+    with pytest.raises(Exception, match=missing):
+        await provider.load_all_async()
+
+
+@pytest.mark.asyncio
+async def test_no_account_address_leaves_zero_fees(mock_http_client):
+    # Arrange
+    provider = _fee_provider(mock_http_client, USER_FEES, account_address=None)
+
+    # Act
+    await provider.load_all_async()
+
+    # Assert
+    btc_perp = provider.find(BTC_PERP_ID)
+    assert btc_perp.maker_fee == Decimal(0)
+    assert btc_perp.taker_fee == Decimal(0)
+    mock_http_client.info_user_fees.assert_not_awaited()

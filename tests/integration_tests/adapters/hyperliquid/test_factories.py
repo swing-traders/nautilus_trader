@@ -21,6 +21,9 @@ from nautilus_trader.adapters.hyperliquid.config import HyperliquidDataClientCon
 from nautilus_trader.adapters.hyperliquid.config import HyperliquidExecClientConfig
 from nautilus_trader.adapters.hyperliquid.enums import HyperliquidProductType
 from nautilus_trader.adapters.hyperliquid.factories import HyperliquidLiveExecClientFactory
+from nautilus_trader.adapters.hyperliquid.factories import (
+    get_cached_hyperliquid_instrument_provider,
+)
 from nautilus_trader.core.nautilus_pyo3 import HyperliquidEnvironment
 
 
@@ -334,3 +337,29 @@ class TestConfigValidation:
 
         # Assert
         assert config.environment == expected_environment
+
+
+def test_cached_instrument_provider_per_account_address():
+    # Arrange
+    client = MagicMock()
+    first = "0x1111111111111111111111111111111111111111"
+    second = "0x2222222222222222222222222222222222222222"
+    get_cached_hyperliquid_instrument_provider.cache_clear()
+
+    # Act
+    try:
+        first_provider = get_cached_hyperliquid_instrument_provider(
+            client=client,
+            account_address=first,
+        )
+        second_provider = get_cached_hyperliquid_instrument_provider(
+            client=client,
+            account_address=second,
+        )
+    finally:
+        get_cached_hyperliquid_instrument_provider.cache_clear()
+
+    # Assert
+    assert first_provider is not second_provider
+    assert first_provider._account_address == first
+    assert second_provider._account_address == second

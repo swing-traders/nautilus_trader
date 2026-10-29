@@ -41,6 +41,9 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
         Optional proxy URL for HTTP and WebSocket transports.
     http_timeout_secs : PositiveInt, default 10
         The timeout (seconds) for HTTP requests.
+    account_address : str, optional
+        The account whose maker and taker fee rates the loaded canonical perpetuals carry.
+        If ``None`` then they carry zero fees.
 
     """
 
@@ -50,6 +53,7 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
     proxy_url: str | None = None
     transport_backend: TransportBackend | None = None
     http_timeout_secs: PositiveInt = 10
+    account_address: str | None = None
 
 
 class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):

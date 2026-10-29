@@ -114,6 +114,7 @@ def get_cached_hyperliquid_instrument_provider(
     client: nautilus_pyo3.HyperliquidHttpClient,
     config: InstrumentProviderConfig | None = None,
     product_types: tuple[HyperliquidProductType, ...] | None = None,
+    account_address: str | None = None,
 ) -> HyperliquidInstrumentProvider:
     """
     Cache and return a Hyperliquid instrument provider.
@@ -128,6 +129,8 @@ def get_cached_hyperliquid_instrument_provider(
         The instrument provider configuration, by default None.
     product_types : tuple[HyperliquidProductType, ...], optional
         The Hyperliquid product types to enable for the provider.
+    account_address : str, optional
+        The account whose fee rates the provider's canonical perpetuals carry.
 
     Returns
     -------
@@ -138,6 +141,7 @@ def get_cached_hyperliquid_instrument_provider(
         client=client,
         config=config,
         product_types=product_types,
+        account_address=account_address,
     )
 
 
@@ -189,6 +193,7 @@ class HyperliquidLiveDataClientFactory(LiveDataClientFactory):
         """
         environment = _resolve_environment(config.environment)
         client = get_cached_hyperliquid_http_client(
+            account_address=config.account_address,
             timeout_secs=config.http_timeout_secs,
             environment=environment,
             proxy_url=config.proxy_url,
@@ -197,6 +202,7 @@ class HyperliquidLiveDataClientFactory(LiveDataClientFactory):
             client=client,
             config=config.instrument_provider,
             product_types=_resolve_product_types(config.product_types),
+            account_address=config.account_address,
         )
         return HyperliquidDataClient(
             loop=loop,

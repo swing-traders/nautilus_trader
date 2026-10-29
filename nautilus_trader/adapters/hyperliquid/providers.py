@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
+from decimal import Decimal
 from typing import Any
 
 from nautilus_trader.adapters.hyperliquid.enums import DEFAULT_PRODUCT_TYPES
@@ -43,11 +45,13 @@ class HyperliquidInstrumentProvider(InstrumentProvider):
         config: InstrumentProviderConfig | None = None,
         *,
         product_types: Iterable[HyperliquidProductType] | None = None,
+        account_address: str | None = None,
     ) -> None:
         PyCondition.not_none(client, "client")
         super().__init__(config=config or InstrumentProviderConfig())
 
         self._client: nautilus_pyo3.HyperliquidHttpClient = client
+        self._account_address = account_address
 
         resolved_types = (
             DEFAULT_PRODUCT_TYPES
@@ -105,6 +109,8 @@ class HyperliquidInstrumentProvider(InstrumentProvider):
             self._instruments_pyo3 = pyo3_instruments
 
             instruments = instruments_from_pyo3(pyo3_instruments)
+            if self._account_address is not None:
+                instruments = await self._with_account_fees(instruments)
             return instruments
         except AttributeError:  # method missing (old wheel?)
             self._log.error("HyperliquidHttpClient is missing load_instrument_definitions")
@@ -112,6 +118,36 @@ class HyperliquidInstrumentProvider(InstrumentProvider):
         except Exception as e:  # pragma: no cover - defensive logging
             self._log.exception("Failed to fetch Hyperliquid instrument metadata", e)
             raise
+
+    async def _with_account_fees(self, instruments: list[Instrument]) -> list[Instrument]:
+        """
+        Return the instruments with each canonical perpetual carrying the account's fee rates.
+
+        The rates are the venue's documented effective rates for a validator-operated perp: the
+        referral discount scales the taker rate and a positive maker rate, never a rebate.
+
+        """
+        user_fees = json.loads(await self._client.info_user_fees())
+        add_rate = Decimal(user_fees["userAddRate"])
+        cross_rate = Decimal(user_fees["userCrossRate"])
+        discount = Decimal(user_fees["activeReferralDiscount"])
+
+        if add_rate > 0:
+            maker_fee = add_rate * (1 - discount)
+        else:
+            maker_fee = add_rate
+        taker_fee = cross_rate * (1 - discount)
+
+        stamped: list[Instrument] = []
+        for instrument in instruments:
+            if isinstance(instrument, CryptoPerpetual) and ":" not in instrument.id.symbol.value:
+                values = CryptoPerpetual.to_dict(instrument)
+                values["maker_fee"] = str(maker_fee)
+                values["taker_fee"] = str(taker_fee)
+                stamped.append(CryptoPerpetual.from_dict(values))
+            else:
+                stamped.append(instrument)
+        return stamped
 
     def _reset_caches(self) -> None:
         self._instruments.clear()
