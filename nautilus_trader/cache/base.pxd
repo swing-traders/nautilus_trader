@@ -101,6 +101,13 @@ cdef class CacheFacade:
         Currency to_currency,
         PriceType price_type=*,
     )
+    cpdef get_xrate_decimal(
+        self,
+        Venue venue,
+        Currency from_currency,
+        Currency to_currency,
+        PriceType price_type=*,
+    )
     cpdef object get_mark_xrate(
         self,
         Currency from_currency,

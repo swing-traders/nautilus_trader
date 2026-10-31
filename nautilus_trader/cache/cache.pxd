@@ -27,6 +27,7 @@ from nautilus_trader.common.component cimport Logger
 from nautilus_trader.core.rust.model cimport OmsType
 from nautilus_trader.core.rust.model cimport OrderSide
 from nautilus_trader.core.rust.model cimport PositionSide
+from nautilus_trader.core.rust.model cimport PriceType
 from nautilus_trader.model.book cimport OrderBook
 from nautilus_trader.model.data cimport Bar
 from nautilus_trader.model.data cimport BarType
@@ -163,6 +164,13 @@ cdef class Cache(CacheFacade):
     cdef list _get_positions_for_ids(self, set position_ids, PositionSide side)
     cdef void _assign_position_id_to_contingencies(self, Order order)
     cpdef Money calculate_unrealized_pnl(self, Position position)
+    cpdef get_xrate_decimal(
+        self,
+        Venue venue,
+        Currency from_currency,
+        Currency to_currency,
+        PriceType price_type=*,
+    )
     cpdef object get_mark_xrate(self, Currency from_currency, Currency to_currency)
     cpdef void set_mark_xrate(self, Currency from_currency, Currency to_currency, double xrate)
     cpdef void clear_mark_xrate(self, Currency from_currency, Currency to_currency)

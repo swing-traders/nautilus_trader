@@ -25,6 +25,7 @@ from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.rust.model import AggregationSource
 from nautilus_trader.model.currencies import AUD
 from nautilus_trader.model.currencies import BTC
+from nautilus_trader.model.currencies import CAD
 from nautilus_trader.model.currencies import ETH
 from nautilus_trader.model.currencies import EUR
 from nautilus_trader.model.currencies import GBP
@@ -1286,6 +1287,109 @@ class TestCache:
 
         # Assert
         assert self.cache.get(key) == obj
+
+    def test_get_xrate_decimal_preserves_calculated_reciprocal(self):
+        # Arrange
+        usdcad = TestInstrumentProvider.default_fx_ccy("USD/CAD")
+        self.cache.add_instrument(usdcad)
+        self.cache.add_quote_tick(_quote(usdcad, bid="1.38", ask="1.38"))
+
+        # Act
+        result = self.cache.get_xrate_decimal(SIM, CAD, USD)
+        calculated = nautilus_pyo3.get_exchange_rate(
+            from_currency="CAD",
+            to_currency="USD",
+            price_type=nautilus_pyo3.PriceType.MID,
+            quotes_bid={"USD/CAD": 1.38},
+            quotes_ask={"USD/CAD": 1.38},
+        )
+
+        # Assert: 1 / 1.38 = 50 / 69, rounded to 28 decimal places.
+        assert isinstance(result, Decimal)
+        assert result == Decimal("0.7246376811594202898550724638")
+        assert result == calculated
+        assert result != Decimal(str(self.cache.get_xrate(SIM, CAD, USD)))
+
+    def test_get_xrate_decimal_preserves_non_round_quote_reciprocal(self):
+        # Arrange
+        usdcad = TestInstrumentProvider.default_fx_ccy("USD/CAD")
+        self.cache.add_instrument(usdcad)
+        self.cache.add_quote_tick(_quote(usdcad, bid="1.37951", ask="1.37951"))
+
+        # Act
+        result = self.cache.get_xrate_decimal(SIM, CAD, USD, PriceType.MID)
+
+        # Assert: 1 / 1.37951 = 100000 / 137951, rounded to 28 decimal places.
+        assert isinstance(result, Decimal)
+        assert result == Decimal("0.7248950714384092902552355547")
+
+    @pytest.mark.parametrize(
+        ("price_type", "expected"),
+        [
+            (PriceType.BID, Decimal("1.37")),
+            (PriceType.ASK, Decimal("1.39")),
+            (PriceType.MID, Decimal("1.38")),
+        ],
+    )
+    def test_get_xrate_decimal_selects_quote_side(self, price_type, expected):
+        # Arrange
+        usdcad = TestInstrumentProvider.default_fx_ccy("USD/CAD")
+        self.cache.add_instrument(usdcad)
+        self.cache.add_quote_tick(_quote(usdcad, bid="1.37", ask="1.39"))
+
+        # Act
+        result = self.cache.get_xrate_decimal(SIM, USD, CAD, price_type)
+
+        # Assert
+        assert isinstance(result, Decimal)
+        assert result == expected
+
+    @pytest.mark.parametrize("price_type", [PriceType.MID, PriceType.MARK, PriceType.LAST])
+    def test_get_xrate_decimal_with_same_currency_returns_decimal_one(self, price_type):
+        # Arrange, Act
+        result = self.cache.get_xrate_decimal(SIM, USD, USD, price_type)
+
+        # Assert
+        assert isinstance(result, Decimal)
+        assert result == Decimal(1)
+
+    def test_get_xrate_decimal_with_no_quotes_returns_none(self):
+        # Arrange, Act, Assert
+        assert self.cache.get_xrate_decimal(SIM, CAD, USD) is None
+
+    def test_get_xrate_decimal_with_no_route_returns_none(self):
+        # Arrange
+        self.cache.add_instrument(AUDUSD_SIM)
+        self.cache.add_quote_tick(_quote(AUDUSD_SIM, bid="0.80", ask="0.80"))
+
+        # Act, Assert
+        assert self.cache.get_xrate_decimal(SIM, CAD, USD) is None
+
+    def test_get_xrate_decimal_with_last_price_returns_none_like_float_rate(self):
+        # Arrange
+        self.cache.add_instrument(AUDUSD_SIM)
+        self.cache.add_quote_tick(_quote(AUDUSD_SIM, bid="0.80", ask="0.80"))
+
+        # Act, Assert
+        assert self.cache.get_xrate_decimal(SIM, AUD, USD, PriceType.LAST) is None
+        assert self.cache.get_xrate(SIM, AUD, USD, PriceType.LAST) is None
+
+    def test_get_xrate_decimal_with_unset_mark_returns_none(self):
+        # Arrange, Act, Assert
+        assert self.cache.get_xrate_decimal(SIM, CAD, USD, PriceType.MARK) is None
+
+    def test_get_xrate_decimal_with_mark_converts_stored_float(self):
+        # Arrange
+        self.cache.set_mark_xrate(USD, CAD, 1.38)
+
+        # Act
+        result = self.cache.get_xrate_decimal(SIM, USD, CAD, PriceType.MARK)
+        inverse = self.cache.get_xrate_decimal(SIM, CAD, USD, PriceType.MARK)
+
+        # Assert: marks store doubles, including the double-rounded inverse.
+        assert isinstance(result, Decimal)
+        assert result == Decimal("1.38")
+        assert inverse == Decimal("0.7246376811594204")
 
     def test_get_xrate_returns_correct_rate(self):
         # Arrange

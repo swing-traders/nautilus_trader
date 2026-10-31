@@ -211,6 +211,16 @@ cdef class CacheFacade:
         """Abstract method (implement in subclass)."""
         raise NotImplementedError("method `get_xrate` must be implemented in the subclass")  # pragma: no cover
 
+    cpdef get_xrate_decimal(
+        self,
+        Venue venue,
+        Currency from_currency,
+        Currency to_currency,
+        PriceType price_type=PriceType.MID,
+    ):
+        """Abstract method (implement in subclass)."""
+        raise NotImplementedError("method `get_xrate_decimal` must be implemented in the subclass")  # pragma: no cover
+
     cpdef object get_mark_xrate(
         self,
         Currency from_currency,

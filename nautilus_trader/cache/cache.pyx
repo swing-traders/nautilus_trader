@@ -3806,6 +3806,64 @@ cdef class Cache(CacheFacade):
         except ValueError as e:
             self._log.error(f"Cannot calculate exchange rate: {e!r}")
 
+    cpdef get_xrate_decimal(
+        self,
+        Venue venue,
+        Currency from_currency,
+        Currency to_currency,
+        PriceType price_type=PriceType.MID,
+    ):
+        """
+        Return the calculated exchange rate as a ``Decimal``, or ``None`` if unavailable.
+
+        Mark rates are stored as floats and converted through their decimal string.
+
+        Parameters
+        ----------
+        venue : Venue
+            The venue for the exchange rate.
+        from_currency : Currency
+            The currency to convert from.
+        to_currency : Currency
+            The currency to convert to.
+        price_type : PriceType
+            The price type for the exchange rate.
+
+        Returns
+        -------
+        Decimal or ``None``
+
+        Raises
+        ------
+        ValueError
+            If `price_type` is ``LAST``.
+
+        """
+        Condition.not_none(from_currency, "from_currency")
+        Condition.not_none(to_currency, "to_currency")
+
+        if from_currency == to_currency:
+            return Decimal(1)
+
+        if price_type == PriceType.MARK:
+            xrate = self.get_mark_xrate(from_currency, to_currency)
+            return Decimal(str(xrate)) if xrate is not None else None
+
+        cdef tuple quotes = self._build_quote_table(venue)
+        if not quotes[0] and not quotes[1]:
+            return None
+
+        try:
+            return nautilus_pyo3.get_exchange_rate(
+                from_currency=from_currency.code,
+                to_currency=to_currency.code,
+                price_type=nautilus_pyo3.PriceType.from_int(price_type),
+                quotes_bid=quotes[0],
+                quotes_ask=quotes[1],
+            )
+        except ValueError as e:
+            self._log.error(f"Cannot calculate exchange rate: {e!r}")
+
     cdef tuple _build_quote_table(self, Venue venue):
         cdef dict bid_quotes = {}
         cdef dict ask_quotes = {}
