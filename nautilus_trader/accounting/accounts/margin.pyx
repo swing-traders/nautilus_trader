@@ -420,6 +420,16 @@ cdef class MarginAccount(Account):
                 raw += margin.maintenance._mem.raw
         return Money.from_raw_c(raw, currency)
 
+    cpdef bint books_pnl(self, Instrument instrument):
+        # The account books a fill's PnL for every class but the premium ones, whose
+        # notional it books as a cash flow on every fill
+        return instrument.instrument_class not in (
+            InstrumentClass.OPTION,
+            InstrumentClass.OPTION_SPREAD,
+            InstrumentClass.BINARY_OPTION,
+            InstrumentClass.WARRANT,
+        )
+
 # -- COMMANDS -------------------------------------------------------------------------------------
 
     cpdef void set_default_leverage(self, leverage: Decimal):
@@ -963,12 +973,7 @@ cdef class MarginAccount(Account):
             Money pnl
             Quantity pnl_quantity
 
-        if instrument.instrument_class in (
-            InstrumentClass.OPTION,
-            InstrumentClass.OPTION_SPREAD,
-            InstrumentClass.BINARY_OPTION,
-            InstrumentClass.WARRANT,
-        ):
+        if not self.books_pnl(instrument):
             # For premium-based instruments, realize the notional value as a cash flow on every fill
             pnl = instrument.notional_value(fill.last_qty, fill.last_px)
             if fill.order_side == OrderSide.BUY:

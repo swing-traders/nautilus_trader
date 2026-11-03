@@ -1591,6 +1591,7 @@ class OrderType(Enum):
 class PositionAdjustmentType(Enum):
     COMMISSION = "COMMISSION"
     FUNDING = "FUNDING"
+    SWAP_CHARGE = "SWAP_CHARGE"
 
 class PositionSide(Enum):
     FLAT = "FLAT"

@@ -158,6 +158,7 @@ cdef class AccountsManager:
         if account.base_currency is not None:
             self._update_balance_single_currency(
                 account=account,
+                instrument=instrument,
                 fill=fill,
                 pnl=Money(0, account.base_currency) if not pnls else pnls[0],
             )
@@ -484,6 +485,7 @@ cdef class AccountsManager:
     cdef bint _update_balance_single_currency(
         self,
         Account account,
+        Instrument instrument,
         OrderFilled fill,
         Money pnl,
     ):
@@ -525,6 +527,9 @@ cdef class AccountsManager:
 
             # Convert to account base currency
             pnl = Money(pnl.as_f64_c() * xrate, account.base_currency)
+
+        if account.books_pnl(instrument):
+            account.record_booking(fill.trade_id, pnl, commission)
 
         pnl = pnl.sub(commission)
         if pnl._mem.raw == 0:

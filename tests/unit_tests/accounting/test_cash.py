@@ -95,6 +95,15 @@ class TestCashAccount:
         # Assert
         assert account.is_unleveraged(AUDUSD_SIM.id)
 
+    def test_books_pnl_returns_false(self):
+        # A cash account books a fill's cost or proceeds as a cash flow, never a PnL
+        # Arrange, Act
+        account = TestExecStubs.cash_account()
+
+        # Assert
+        assert account.books_pnl(AUDUSD_SIM) is False
+        assert account.books_pnl(AAPL_XNAS) is False
+
     def test_instantiate_single_asset_cash_account(self):
         # Arrange
         event = AccountState(

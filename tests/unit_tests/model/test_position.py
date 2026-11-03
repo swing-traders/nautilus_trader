@@ -14,6 +14,7 @@
 # -------------------------------------------------------------------------------------------------
 
 import json
+import pickle
 from decimal import Decimal
 
 import pytest
@@ -23,6 +24,7 @@ from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.core.rust.model import PositionAdjustmentType
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import BTC
+from nautilus_trader.model.currencies import CAD
 from nautilus_trader.model.currencies import ETH
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.currencies import USDT
@@ -48,6 +50,7 @@ from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 
 AAPL_XNAS = TestInstrumentProvider.equity(symbol="AAPL", venue="XNAS")
 AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+AUDCAD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/CAD")
 BTCUSDT_BINANCE = TestInstrumentProvider.btcusdt_binance()
 ETHUSDT_BINANCE = TestInstrumentProvider.ethusdt_binance()
 XBTUSD_BITMEX = TestInstrumentProvider.xbtusd_bitmex()
@@ -3580,3 +3583,648 @@ class TestPosition:
         commissions = position.commissions()
         assert len(commissions) == 1
         assert abs(commissions[0].as_double() - 0.001) < 1e-9
+
+    def test_new_position_has_no_carry_or_account_book(self) -> None:
+        """
+        A new position carries no swap accrual and no account book.
+        """
+        # Arrange
+        order = self.order_factory.market(
+            AUDCAD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(10_000),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=AUDCAD_SIM,
+            position_id=PositionId("P-001"),
+            last_px=Price.from_str("0.89577"),
+            commission=Money(0, CAD),
+        )
+
+        # Act
+        position = Position(instrument=AUDCAD_SIM, fill=fill)
+
+        # Assert
+        assert position.unrealized_carry == Money(0, CAD)
+        assert position.accrued_carry is None
+        assert position.booked_pnl is None
+        assert position.booked_commissions is None
+
+    def test_swap_adjustments_accrue_carry_without_touching_realized_pnl(self) -> None:
+        """
+        SWAP adjustments accumulate into the two carries and leave realized PnL untouched.
+        """
+        # Arrange
+        order = self.order_factory.market(
+            AUDCAD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(10_000),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=AUDCAD_SIM,
+            position_id=PositionId("P-001"),
+            last_px=Price.from_str("0.89577"),
+            commission=Money(0, CAD),
+        )
+        position = Position(instrument=AUDCAD_SIM, fill=fill)
+        assert position.realized_pnl == Money(0, CAD)
+
+        # Act
+        adjustment1 = self._swap_adjustment(
+            position,
+            pnl_change=Money("-2.16", CAD),
+            settled_change=Money("-1.64", USD),
+        )
+        position.apply_adjustment(adjustment1)
+        adjustment2 = self._swap_adjustment(
+            position,
+            pnl_change=Money("-0.72", CAD),
+            settled_change=Money("-0.55", USD),
+        )
+        position.apply_adjustment(adjustment2)
+
+        # Assert
+        assert position.unrealized_carry == Money("-2.88", CAD)
+        assert position.accrued_carry == Money("-2.19", USD)
+        assert position.realized_pnl == Money(0, CAD)
+        assert len(position.adjustments) == 2
+        assert adjustment1.fills_before == 1
+        assert adjustment2.fills_before == 1
+
+    def test_flattening_fill_folds_carry_into_realized_pnl(self) -> None:
+        """
+        The fill that flattens the position folds the carry into realized PnL.
+        """
+        # Arrange
+        order = self.order_factory.market(
+            AUDCAD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(10_000),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=AUDCAD_SIM,
+            position_id=PositionId("P-001"),
+            last_px=Price.from_str("0.89577"),
+            commission=Money(0, CAD),
+        )
+        position = Position(instrument=AUDCAD_SIM, fill=fill)
+        position.apply_adjustment(
+            self._swap_adjustment(
+                position,
+                pnl_change=Money("-2.16", CAD),
+                settled_change=Money("-1.64", USD),
+            ),
+        )
+        position.apply_adjustment(
+            self._swap_adjustment(
+                position,
+                pnl_change=Money("-0.72", CAD),
+                settled_change=Money("-0.55", USD),
+            ),
+        )
+
+        # Act: close the short (0.89577 -> 0.89966 is -38.90 CAD trading PnL)
+        closing_order = self.order_factory.market(
+            AUDCAD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(10_000),
+        )
+        closing_fill = TestEventStubs.order_filled(
+            closing_order,
+            instrument=AUDCAD_SIM,
+            position_id=position.id,
+            last_px=Price.from_str("0.89966"),
+            commission=Money(0, CAD),
+        )
+        position.apply(closing_fill)
+
+        # Assert
+        assert position.is_closed
+        assert position.realized_pnl == Money("-41.78", CAD)  # -38.90 - 2.88
+        assert position.unrealized_carry == Money(0, CAD)
+        assert position.accrued_carry == Money("-2.19", USD)
+
+    def test_funding_adjustment_leaves_carries_unchanged(self) -> None:
+        """
+        A FUNDING adjustment moves realized PnL as before and leaves both carries at
+        their initial state.
+        """
+        # Arrange
+        order = self.order_factory.market(
+            BTCUSDT_BINANCE.id,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=BTCUSDT_BINANCE,
+            position_id=PositionId("P-001"),
+            last_px=Price.from_int(50_000),
+            commission=Money(0, USDT),
+        )
+        position = Position(instrument=BTCUSDT_BINANCE, fill=fill)
+
+        # Act
+        funding = PositionAdjusted(
+            trader_id=TestIdStubs.trader_id(),
+            strategy_id=TestIdStubs.strategy_id(),
+            instrument_id=BTCUSDT_BINANCE.id,
+            position_id=position.id,
+            account_id=TestIdStubs.account_id(),
+            adjustment_type=PositionAdjustmentType.FUNDING,
+            quantity_change=None,
+            pnl_change=Money("10.00", USDT),
+            reason=None,
+            event_id=UUID4(),
+            ts_event=1_000_000_000,
+            ts_init=1_000_000_000,
+        )
+        position.apply_adjustment(funding)
+
+        # Assert
+        assert position.realized_pnl == Money("10.00", USDT)
+        assert position.unrealized_carry == Money(0, USDT)
+        assert position.accrued_carry is None
+        assert funding.fills_before == 1
+
+    def test_reopen_resets_carries_and_account_book(self) -> None:
+        """
+        Reopening a closed position resets the carries and the account book.
+        """
+        # Arrange
+        order = self.order_factory.market(
+            AUDCAD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(10_000),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=AUDCAD_SIM,
+            position_id=PositionId("P-001"),
+            last_px=Price.from_str("0.89577"),
+            commission=Money(0, CAD),
+        )
+        position = Position(instrument=AUDCAD_SIM, fill=fill)
+        position.apply_adjustment(
+            self._swap_adjustment(
+                position,
+                pnl_change=Money("-2.88", CAD),
+                settled_change=Money("-2.19", USD),
+            ),
+        )
+        position.apply_booked(fill.trade_id, Money(0, USD), Money(0, USD))
+
+        closing_order = self.order_factory.market(
+            AUDCAD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(10_000),
+        )
+        closing_fill = TestEventStubs.order_filled(
+            closing_order,
+            instrument=AUDCAD_SIM,
+            position_id=position.id,
+            last_px=Price.from_str("0.89966"),
+            commission=Money(0, CAD),
+        )
+        position.apply(closing_fill)
+        position.apply_booked(closing_fill.trade_id, Money("-27.01", USD), Money(0, USD))
+        assert position.is_closed
+        assert position.booked_pnl == Money("-29.20", USD)
+
+        # Act
+        reopening_order = self.order_factory.market(
+            AUDCAD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(5_000),
+        )
+        reopening_fill = TestEventStubs.order_filled(
+            reopening_order,
+            instrument=AUDCAD_SIM,
+            position_id=position.id,
+            last_px=Price.from_str("0.89900"),
+            commission=Money(0, CAD),
+        )
+        position.apply(reopening_fill)
+
+        # Assert
+        assert position.is_open
+        assert position.unrealized_carry == Money(0, CAD)
+        assert position.accrued_carry is None
+        assert position.booked_pnl is None
+        assert position.booked_commissions is None
+        assert len(position.adjustments) == 0
+
+    def test_pickled_charged_position_keeps_carries_and_adjustments(self) -> None:
+        """
+        A pickled charged position keeps the carries and the adjustments' fields.
+        """
+        # Arrange
+        order = self.order_factory.market(
+            AUDCAD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(10_000),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=AUDCAD_SIM,
+            position_id=PositionId("P-001"),
+            last_px=Price.from_str("0.89577"),
+            commission=Money(0, CAD),
+        )
+        position = Position(instrument=AUDCAD_SIM, fill=fill)
+        position.apply_adjustment(
+            self._swap_adjustment(
+                position,
+                pnl_change=Money("-2.16", CAD),
+                settled_change=Money("-1.64", USD),
+            ),
+        )
+
+        # Act
+        unpickled = pickle.loads(pickle.dumps(position))  # noqa: S301 (pickle is safe here)
+
+        # Assert
+        assert unpickled.unrealized_carry == Money("-2.16", CAD)
+        assert unpickled.accrued_carry == Money("-1.64", USD)
+        assert len(unpickled.adjustments) == 1
+        assert unpickled.adjustments[0].settled_change == Money("-1.64", USD)
+        assert unpickled.adjustments[0].fills_before == 1
+
+    def test_swap_adjustment_dict_round_trip_keeps_settled_change_and_fills_before(self) -> None:
+        """
+        The dict codec carries the new SWAP fields.
+        """
+        # Arrange
+        adjustment = PositionAdjusted(
+            trader_id=TestIdStubs.trader_id(),
+            strategy_id=TestIdStubs.strategy_id(),
+            instrument_id=AUDCAD_SIM.id,
+            position_id=PositionId("P-123456"),
+            account_id=TestIdStubs.account_id(),
+            adjustment_type=PositionAdjustmentType.SWAP_CHARGE,
+            quantity_change=None,
+            pnl_change=Money("-2.16", CAD),
+            reason=None,
+            event_id=UUID4(),
+            ts_event=1_000_000_000,
+            ts_init=1_000_000_000,
+            settled_change=Money("-1.64", USD),
+            fills_before=2,
+        )
+
+        # Act
+        values = PositionAdjusted.to_dict(adjustment)
+        reconstructed = PositionAdjusted.from_dict(values)
+
+        # Assert
+        assert values["adjustment_type"] == "SWAP_CHARGE"
+        assert values["settled_change"] == "-1.64 USD"
+        assert values["fills_before"] == 2
+        assert reconstructed.adjustment_type == PositionAdjustmentType.SWAP_CHARGE
+        assert reconstructed.settled_change == Money("-1.64", USD)
+        assert reconstructed.fills_before == 2
+
+    def test_apply_booked_sums_pnl_and_commissions(self) -> None:
+        """
+        Each booking sums pnl - commission into booked_pnl and commission into
+        booked_commissions.
+        """
+        # Arrange
+        order = self.order_factory.market(
+            AAPL_XNAS.id,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=AAPL_XNAS,
+            position_id=PositionId("P-001"),
+            last_px=Price.from_int(100),
+            commission=Money(0, USD),
+        )
+        position = Position(instrument=AAPL_XNAS, fill=fill)
+
+        # Act
+        position.apply_booked(fill.trade_id, Money("-27.01", USD), Money(0, USD))
+        position.apply_booked(TradeId("E-002"), Money(0, USD), Money("0.68", USD))
+
+        # Assert
+        assert position.booked_pnl == Money("-27.69", USD)
+        assert position.booked_commissions == Money("0.68", USD)
+
+    def test_flattening_fill_folds_accrued_carry_into_booked_pnl(self) -> None:
+        """
+        The flattening fill folds the accrued carry into the account book.
+        """
+        # Arrange
+        order = self.order_factory.market(
+            AAPL_XNAS.id,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=AAPL_XNAS,
+            position_id=PositionId("P-001"),
+            last_px=Price.from_int(100),
+            commission=Money(0, USD),
+        )
+        position = Position(instrument=AAPL_XNAS, fill=fill)
+        position.apply_booked(fill.trade_id, Money(0, USD), Money(0, USD))
+        position.apply_adjustment(
+            self._swap_adjustment(
+                position,
+                pnl_change=Money("-5.00", USD),
+                settled_change=Money("-5.00", USD),
+            ),
+        )
+
+        # Act: close at 110 (+10 trading PnL)
+        closing_order = self.order_factory.market(
+            AAPL_XNAS.id,
+            OrderSide.SELL,
+            Quantity.from_int(1),
+        )
+        closing_fill = TestEventStubs.order_filled(
+            closing_order,
+            instrument=AAPL_XNAS,
+            position_id=position.id,
+            last_px=Price.from_int(110),
+            commission=Money(0, USD),
+        )
+        position.apply(closing_fill)
+        position.apply_booked(closing_fill.trade_id, Money("10.00", USD), Money(0, USD))
+
+        # Assert
+        assert position.is_closed
+        assert position.realized_pnl == Money("5.00", USD)  # +10 - 5
+        assert position.booked_pnl == Money("5.00", USD)  # -5 accrued + 10
+        assert position.booked_commissions == Money(0, USD)
+
+    def test_purge_replays_swap_at_its_boundary(self) -> None:
+        """
+        A purge replays a preserved SWAP adjustment once its original fills have
+        passed, restamping the surviving count (fills A, B, swap(2), C; purge B ->
+        A, swap(1), C).
+        """
+        # Arrange
+        position = self._charged_aapl_position()
+
+        # Assert state before the purge
+        assert position.realized_pnl == Money("10.00", USD)
+        assert position.unrealized_carry == Money("-5.00", USD)
+        assert position.adjustments[0].fills_before == 2
+
+        # Act
+        position.purge_events_for_order(ClientOrderId("O-002"))
+
+        # Assert
+        assert [e.client_order_id.value for e in position.events] == ["O-001", "O-003"]
+        assert len(position.adjustments) == 1
+        assert position.adjustments[0].adjustment_type == PositionAdjustmentType.SWAP_CHARGE
+        assert position.adjustments[0].fills_before == 1
+        assert position.realized_pnl == Money("5.00", USD)  # +10 - 5
+        assert position.unrealized_carry == Money(0, USD)
+        assert position.accrued_carry == Money("-5.00", USD)
+        assert position.side == PositionSide.FLAT
+
+    def test_purge_replays_other_adjustments_after_surviving_fills(self) -> None:
+        """
+        A purge replays a preserved FUNDING adjustment after the surviving fills
+        (fills A, funding, B, C; purge B -> A, C, funding).
+        """
+        # Arrange
+        position = self._charged_aapl_position(
+            adjustment_type=PositionAdjustmentType.FUNDING,
+            pnl_change=Money("2.00", USD),
+            settled_change=None,
+        )
+
+        # Act
+        position.purge_events_for_order(ClientOrderId("O-002"))
+
+        # Assert
+        assert [e.client_order_id.value for e in position.events] == ["O-001", "O-003"]
+        assert position.side == PositionSide.FLAT
+        assert len(position.adjustments) == 1
+        assert position.adjustments[0].adjustment_type == PositionAdjustmentType.FUNDING
+        assert position.realized_pnl == Money("12.00", USD)  # +10 + 2
+
+    def test_purge_opening_fill_of_charged_position_drops_the_swap(self) -> None:
+        """
+        A SWAP adjustment reached while the replayed position is flat is dropped.
+        """
+        # Arrange
+        open_order = self.order_factory.market(
+            AAPL_XNAS.id,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+        )
+        open_fill = TestEventStubs.order_filled(
+            open_order,
+            instrument=AAPL_XNAS,
+            position_id=PositionId("P-001"),
+            last_px=Price.from_int(100),
+            commission=Money(0, USD),
+        )
+        position = Position(instrument=AAPL_XNAS, fill=open_fill)
+        position.apply_adjustment(
+            self._swap_adjustment(
+                position,
+                pnl_change=Money("-5.00", USD),
+                settled_change=Money("-5.00", USD),
+            ),
+        )
+
+        close_order = self.order_factory.market(
+            AAPL_XNAS.id,
+            OrderSide.SELL,
+            Quantity.from_int(1),
+        )
+        close_fill = TestEventStubs.order_filled(
+            close_order,
+            instrument=AAPL_XNAS,
+            position_id=PositionId("P-001"),
+            last_px=Price.from_int(100),
+            commission=Money(0, USD),
+        )
+        position.apply(close_fill)
+        assert position.is_closed
+
+        # Act
+        position.purge_events_for_order(open_order.client_order_id)
+
+        # Assert
+        assert len(position.adjustments) == 0
+        assert position.unrealized_carry == Money(0, USD)
+        assert position.accrued_carry is None
+
+    def test_purge_drops_the_purged_orders_booking_and_resums(self) -> None:
+        """
+        A purge drops the purged order's booking and re-sums the account book.
+        """
+        # Arrange
+        position = self._charged_aapl_position(adjustment_type=None)
+        position.apply_booked(TradeId("E-001"), Money(0, USD), Money("1.00", USD))
+        position.apply_booked(TradeId("E-002"), Money(0, USD), Money("1.00", USD))
+        position.apply_booked(TradeId("E-003"), Money("20.00", USD), Money("1.00", USD))
+        assert position.booked_pnl == Money("17.00", USD)
+        assert position.booked_commissions == Money("3.00", USD)
+
+        # Act
+        position.purge_events_for_order(ClientOrderId("O-002"))
+
+        # Assert
+        assert position.booked_pnl == Money("18.00", USD)  # -1 + 19
+        assert position.booked_commissions == Money("2.00", USD)
+
+    def _booked_audusd_fill(
+        self,
+        side: OrderSide,
+        price: str,
+        trade_id: TradeId,
+    ) -> OrderFilled:
+        order = self.order_factory.market(AUDUSD_SIM.id, side, Quantity.from_int(100))
+        return TestEventStubs.order_filled(
+            order,
+            instrument=AUDUSD_SIM,
+            position_id=PositionId("P-001"),
+            trade_id=trade_id,
+            last_px=Price.from_str(price),
+            commission=Money(0, USD),
+        )
+
+    def test_purge_of_no_order_keeps_each_booking_of_fills_sharing_a_trade_id(self) -> None:
+        """
+        Two fills sharing a trade ID each keep their own booking through a purge that
+        removes no fill.
+        """
+        # Arrange: buy 100 at 1.00000 booked 0, sell 100 at 1.10000 booked 10 USD
+        shared = TradeId("SHARED")
+        opening = self._booked_audusd_fill(OrderSide.BUY, "1.00000", shared)
+        closing = self._booked_audusd_fill(OrderSide.SELL, "1.10000", shared)
+        position = Position(instrument=AUDUSD_SIM, fill=opening)
+        position.apply_booked(shared, Money(0, USD), Money(0, USD))
+        position.apply(closing)
+        position.apply_booked(shared, Money(10, USD), Money(0, USD))
+
+        # Act
+        position.purge_events_for_order(ClientOrderId("NOT-PRESENT"))
+
+        # Assert
+        assert position.realized_pnl == Money(10, USD)  # 100 x (1.10000 - 1.00000)
+        assert position.booked_pnl == Money(10, USD)  # 0 + 10
+        assert position.booked_commissions == Money(0, USD)
+
+    def test_purge_keeps_the_booking_of_a_surviving_fill_sharing_the_purged_trade_id(
+        self,
+    ) -> None:
+        """
+        A purge keeps the booking of a surviving fill that shares the purged fill's
+        trade ID.
+        """
+        # Arrange: buys A and B of 100 at 1.00000 booked 0, sell C of 100 at 1.10000
+        # booked 10 USD; B and C share a trade ID
+        shared = TradeId("SHARED")
+        fill_a = self._booked_audusd_fill(OrderSide.BUY, "1.00000", TradeId("A"))
+        fill_b = self._booked_audusd_fill(OrderSide.BUY, "1.00000", shared)
+        fill_c = self._booked_audusd_fill(OrderSide.SELL, "1.10000", shared)
+        position = Position(instrument=AUDUSD_SIM, fill=fill_a)
+        position.apply_booked(fill_a.trade_id, Money(0, USD), Money(0, USD))
+        position.apply(fill_b)
+        position.apply_booked(shared, Money(0, USD), Money(0, USD))
+        position.apply(fill_c)
+        position.apply_booked(shared, Money(10, USD), Money(0, USD))
+
+        # Act
+        position.purge_events_for_order(fill_b.client_order_id)
+
+        # Assert: A then C, flat
+        assert position.is_closed
+        assert position.realized_pnl == Money(10, USD)  # 100 x (1.10000 - 1.00000)
+        assert position.booked_pnl == Money(10, USD)  # A's 0 + C's 10
+
+    def _swap_adjustment(
+        self,
+        position: Position,
+        pnl_change: Money,
+        settled_change: Money | None,
+    ) -> PositionAdjusted:
+        return PositionAdjusted(
+            trader_id=position.trader_id,
+            strategy_id=position.strategy_id,
+            instrument_id=position.instrument_id,
+            position_id=position.id,
+            account_id=position.account_id,
+            adjustment_type=PositionAdjustmentType.SWAP_CHARGE,
+            quantity_change=None,
+            pnl_change=pnl_change,
+            reason=None,
+            event_id=UUID4(),
+            ts_event=1_000_000_000,
+            ts_init=1_000_000_000,
+            settled_change=settled_change,
+        )
+
+    def _charged_aapl_position(
+        self,
+        adjustment_type: PositionAdjustmentType | None = PositionAdjustmentType.SWAP_CHARGE,
+        pnl_change: Money | None = Money("-5.00", USD),
+        settled_change: Money | None = Money("-5.00", USD),
+    ) -> Position:
+        # Fills A and B buy 1 @ 100 each, fill C sells 1 @ 110, the adjustment between B and C
+        fill_a = TestEventStubs.order_filled(
+            self.order_factory.market(AAPL_XNAS.id, OrderSide.BUY, Quantity.from_int(1)),
+            instrument=AAPL_XNAS,
+            position_id=PositionId("P-001"),
+            client_order_id=ClientOrderId("O-001"),
+            trade_id=TradeId("E-001"),
+            last_px=Price.from_int(100),
+            commission=Money(0, USD),
+        )
+        position = Position(instrument=AAPL_XNAS, fill=fill_a)
+
+        fill_b = TestEventStubs.order_filled(
+            self.order_factory.market(AAPL_XNAS.id, OrderSide.BUY, Quantity.from_int(1)),
+            instrument=AAPL_XNAS,
+            position_id=PositionId("P-001"),
+            client_order_id=ClientOrderId("O-002"),
+            trade_id=TradeId("E-002"),
+            last_px=Price.from_int(100),
+            commission=Money(0, USD),
+        )
+        position.apply(fill_b)
+
+        if adjustment_type is not None:
+            position.apply_adjustment(
+                PositionAdjusted(
+                    trader_id=position.trader_id,
+                    strategy_id=position.strategy_id,
+                    instrument_id=position.instrument_id,
+                    position_id=position.id,
+                    account_id=position.account_id,
+                    adjustment_type=adjustment_type,
+                    quantity_change=None,
+                    pnl_change=pnl_change,
+                    reason=None,
+                    event_id=UUID4(),
+                    ts_event=1_000_000_000,
+                    ts_init=1_000_000_000,
+                    settled_change=settled_change,
+                ),
+            )
+
+        fill_c = TestEventStubs.order_filled(
+            self.order_factory.market(AAPL_XNAS.id, OrderSide.SELL, Quantity.from_int(1)),
+            instrument=AAPL_XNAS,
+            position_id=PositionId("P-001"),
+            client_order_id=ClientOrderId("O-003"),
+            trade_id=TradeId("E-003"),
+            last_px=Price.from_int(110),
+            commission=Money(0, USD),
+        )
+        position.apply(fill_c)
+        return position

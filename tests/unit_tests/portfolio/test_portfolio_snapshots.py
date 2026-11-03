@@ -19,24 +19,30 @@ Tests for Portfolio functionality with position snapshots and PnL calculations.
 from decimal import Decimal
 
 from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.currencies import CAD
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events.account import AccountState
+from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import PositionId
+from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.objects import AccountBalance
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.position import Position
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from nautilus_trader.test_kit.stubs.data import TestDataStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
 
 AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+AUDCAD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/CAD")
+USDCAD_SIM = TestInstrumentProvider.default_fx_ccy("USD/CAD")
 
 
 def test_portfolio_calculates_realized_pnl_with_position_snapshots(
@@ -2359,3 +2365,119 @@ def test_snapshot_conversion_with_mark_xrates(
     assert total_pnl_regular is not None
     assert total_pnl_regular.currency == USD
     assert total_pnl_regular == Money(15.00, USD)  # Same result with MID rate
+
+
+def test_realized_pnl_account_book_tells_generations_by_identity(
+    portfolio,
+    cache,
+    exec_engine,
+    clock,
+    account_id,
+):
+    """
+    Two netting generations with equal booked figures are counted twice: the last
+    retained generation is told from the cached closed position by its closing
+    identity (closing order ID and close time), never by equal money.
+    """
+    # Arrange
+    exec_engine.start()
+
+    account_state = AccountState(
+        account_id=account_id,
+        account_type=AccountType.MARGIN,
+        base_currency=USD,
+        reported=True,
+        balances=[AccountBalance(Money(1_000_000, USD), Money(0, USD), Money(1_000_000, USD))],
+        margins=[],
+        info={},
+        event_id=UUID4(),
+        ts_event=clock.timestamp_ns(),
+        ts_init=clock.timestamp_ns(),
+    )
+    account = TestExecStubs.margin_account(account_id=account_id)
+    cache.add_account(account)
+    portfolio.update_account(account_state)
+    cache.add_instrument(AUDCAD_SIM)
+    cache.add_instrument(USDCAD_SIM)
+    cache.add_quote_tick(TestDataStubs.quote_tick(USDCAD_SIM, 1.0, 1.0))
+    cache.add_quote_tick(TestDataStubs.quote_tick(AUDCAD_SIM, 1.0, 1.0))
+
+    position_id = PositionId("P-001")
+
+    def build_generation(
+        open_client_id: str,
+        close_client_id: str | None,
+        open_trade_id: str,
+        close_trade_id: str,
+        close_px: str | None,
+        booked_close: float | None,
+        ts_closed: int,
+    ) -> Position:
+        open_order = TestExecStubs.market_order(
+            instrument=AUDCAD_SIM,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            client_order_id=ClientOrderId(open_client_id),
+        )
+        open_fill = TestEventStubs.order_filled(
+            open_order,
+            instrument=AUDCAD_SIM,
+            position_id=position_id,
+            client_order_id=ClientOrderId(open_client_id),
+            trade_id=TradeId(open_trade_id),
+            last_px=Price.from_str("1.00000"),
+            commission=Money(0, CAD),
+        )
+        generation = Position(instrument=AUDCAD_SIM, fill=open_fill)
+        generation.apply_booked(open_fill.trade_id, Money(0, USD), Money(0, USD))
+
+        if close_px is not None:
+            close_order = TestExecStubs.market_order(
+                instrument=AUDCAD_SIM,
+                order_side=OrderSide.SELL,
+                quantity=Quantity.from_int(100),
+                client_order_id=ClientOrderId(close_client_id),
+            )
+            close_fill = TestEventStubs.order_filled(
+                close_order,
+                instrument=AUDCAD_SIM,
+                position_id=position_id,
+                client_order_id=ClientOrderId(close_client_id),
+                trade_id=TradeId(close_trade_id),
+                last_px=Price.from_str(close_px),
+                commission=Money(0, CAD),
+                ts_event=ts_closed,
+            )
+            generation.apply(close_fill)
+            generation.apply_booked(close_fill.trade_id, Money(booked_close, USD), Money(0, USD))
+
+        return generation
+
+    # First generation: loses 10 CAD, booked -10 USD (rate 1.00)
+    gen1 = build_generation("O-1", "O-2", "E-1", "E-2", "0.90000", -10.0, 1)
+    assert gen1.is_closed
+    assert gen1.booked_pnl == Money(-10.0, USD)
+    cache.add_position(gen1, OmsType.NETTING)
+    assert portfolio.realized_pnl(AUDCAD_SIM.id, account_id) == Money(-10.0, USD)
+
+    # Retain the first generation; a second loses 20 CAD, booked -10 USD (rate 0.50)
+    cache.snapshot_position(gen1)
+    gen2 = build_generation("O-3", "O-4", "E-3", "E-4", "0.80000", -10.0, 2)
+    assert gen2.is_closed
+    assert gen2.booked_pnl == Money(-10.0, USD)
+    cache.add_position(gen2, OmsType.NETTING)
+
+    # Act, Assert: the closed second generation is not the retained first, equal
+    # booked money notwithstanding
+    assert portfolio.realized_pnl(AUDCAD_SIM.id, account_id) == Money(-20.0, USD)
+
+    # Retain the second generation and open a third
+    cache.snapshot_position(gen2)
+    gen3 = build_generation("O-5", None, "E-5", "E-6", None, None, 0)
+    assert gen3.is_open
+    assert gen3.booked_pnl == Money(0, USD)
+    cache.add_position(gen3, OmsType.NETTING)
+
+    # Assert
+    assert portfolio.realized_pnl(AUDCAD_SIM.id, account_id) == Money(-20.0, USD)
+    assert portfolio.total_pnl(AUDCAD_SIM.id, account_id=account_id) == Money(-20.0, USD)

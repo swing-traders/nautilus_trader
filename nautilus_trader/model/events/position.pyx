@@ -131,6 +131,8 @@ cdef class PositionEvent(Event):
         uint64_t duration_ns,
         uint64_t ts_event,
         uint64_t ts_init,
+        Money booked_pnl=None,
+        Money booked_commissions=None,
     ):
         self.trader_id = trader_id
         self.strategy_id = strategy_id
@@ -152,6 +154,8 @@ cdef class PositionEvent(Event):
         self.realized_return = realized_return
         self.realized_pnl = realized_pnl
         self.unrealized_pnl = unrealized_pnl
+        self.booked_pnl = booked_pnl
+        self.booked_commissions = booked_commissions
         self.ts_opened = ts_opened
         self.ts_closed = ts_closed
         self.duration_ns = duration_ns
@@ -327,6 +331,8 @@ cdef class PositionOpened(PositionEvent):
         UUID4 event_id not None,
         uint64_t ts_event,
         uint64_t ts_init,
+        Money booked_pnl=None,
+        Money booked_commissions=None,
     ):
         assert side != PositionSide.FLAT  # Design-time check: position side matches event
         super().__init__(
@@ -356,6 +362,8 @@ cdef class PositionOpened(PositionEvent):
             0,
             ts_event,
             ts_init,
+            booked_pnl,
+            booked_commissions,
         )
 
     @staticmethod
@@ -389,6 +397,8 @@ cdef class PositionOpened(PositionEvent):
             event_id=event_id,
             ts_event=position.ts_opened,
             ts_init=ts_init,
+            booked_pnl=position.booked_pnl,
+            booked_commissions=position.booked_commissions,
         )
 
     @staticmethod
@@ -414,6 +424,8 @@ cdef class PositionOpened(PositionEvent):
             event_id=UUID4.from_str_c(values["event_id"]),
             ts_event=values["ts_event"],
             ts_init=values["ts_init"],
+            booked_pnl=Money.from_str_c(values["booked_pnl"]) if values.get("booked_pnl") is not None else None,
+            booked_commissions=Money.from_str_c(values["booked_commissions"]) if values.get("booked_commissions") is not None else None,
         )
 
     @staticmethod
@@ -438,6 +450,8 @@ cdef class PositionOpened(PositionEvent):
             "avg_px_open": obj.avg_px_open,
             "realized_pnl": str(obj.realized_pnl),
             "duration_ns": obj.duration_ns,
+            "booked_pnl": str(obj.booked_pnl) if obj.booked_pnl is not None else None,
+            "booked_commissions": str(obj.booked_commissions) if obj.booked_commissions is not None else None,
             "event_id": obj._event_id.to_str(),
             "ts_event": obj._ts_event,
             "ts_init": obj._ts_init,
@@ -582,6 +596,8 @@ cdef class PositionChanged(PositionEvent):
         uint64_t ts_opened,
         uint64_t ts_event,
         uint64_t ts_init,
+        Money booked_pnl=None,
+        Money booked_commissions=None,
     ):
         assert side != PositionSide.FLAT  # Design-time check: position side matches event
         super().__init__(
@@ -611,6 +627,8 @@ cdef class PositionChanged(PositionEvent):
             0,
             ts_event,
             ts_init,
+            booked_pnl,
+            booked_commissions,
         )
 
     @staticmethod
@@ -648,6 +666,8 @@ cdef class PositionChanged(PositionEvent):
             ts_opened=position.ts_opened,
             ts_event=position.last_event_c().ts_event,
             ts_init=ts_init,
+            booked_pnl=position.booked_pnl,
+            booked_commissions=position.booked_commissions,
         )
 
     @staticmethod
@@ -677,6 +697,8 @@ cdef class PositionChanged(PositionEvent):
             ts_opened=values["ts_opened"],
             ts_event=values["ts_event"],
             ts_init=values["ts_init"],
+            booked_pnl=Money.from_str_c(values["booked_pnl"]) if values.get("booked_pnl") is not None else None,
+            booked_commissions=Money.from_str_c(values["booked_commissions"]) if values.get("booked_commissions") is not None else None,
         )
 
     @staticmethod
@@ -703,6 +725,8 @@ cdef class PositionChanged(PositionEvent):
             "realized_return": obj.realized_return,
             "realized_pnl": str(obj.realized_pnl),
             "unrealized_pnl": str(obj.unrealized_pnl),
+            "booked_pnl": str(obj.booked_pnl) if obj.booked_pnl is not None else None,
+            "booked_commissions": str(obj.booked_commissions) if obj.booked_commissions is not None else None,
             "event_id": obj._event_id.to_str(),
             "ts_opened": obj.ts_opened,
             "ts_event": obj._ts_event,
@@ -851,6 +875,8 @@ cdef class PositionClosed(PositionEvent):
         uint64_t ts_closed,
         uint64_t duration_ns,
         uint64_t ts_init,
+        Money booked_pnl=None,
+        Money booked_commissions=None,
     ):
         assert side == PositionSide.FLAT  # Design-time check: position side matches event
 
@@ -881,6 +907,8 @@ cdef class PositionClosed(PositionEvent):
             duration_ns,
             ts_closed,  # ts_event = ts_closed
             ts_init,
+            booked_pnl,
+            booked_commissions,
         )
 
     @staticmethod
@@ -919,6 +947,8 @@ cdef class PositionClosed(PositionEvent):
             ts_closed=position.ts_closed,
             duration_ns=position.duration_ns,
             ts_init=ts_init,
+            booked_pnl=position.booked_pnl,
+            booked_commissions=position.booked_commissions,
         )
 
     @staticmethod
@@ -949,6 +979,8 @@ cdef class PositionClosed(PositionEvent):
             ts_closed=values["ts_closed"],
             duration_ns=values["duration_ns"],
             ts_init=values["ts_init"],
+            booked_pnl=Money.from_str_c(values["booked_pnl"]) if values.get("booked_pnl") is not None else None,
+            booked_commissions=Money.from_str_c(values["booked_commissions"]) if values.get("booked_commissions") is not None else None,
         )
 
     @staticmethod
@@ -975,6 +1007,8 @@ cdef class PositionClosed(PositionEvent):
             "avg_px_close": obj.avg_px_close,
             "realized_return": obj.realized_return,
             "realized_pnl": str(obj.realized_pnl),
+            "booked_pnl": str(obj.booked_pnl) if obj.booked_pnl is not None else None,
+            "booked_commissions": str(obj.booked_commissions) if obj.booked_commissions is not None else None,
             "event_id": obj._event_id.to_str(),
             "ts_opened": obj.ts_opened,
             "ts_closed": obj.ts_closed,
@@ -1065,6 +1099,11 @@ cdef class PositionAdjusted(Event):
         The quantity change (positive increases quantity, negative decreases).
     pnl_change : Money | None
         The PnL change.
+    settled_change : Money | None
+        The change in the account's currency at the charge.
+    fills_before : int
+        The count of the position's fills applied before the adjustment, stamped at
+        each application.
     reason : str | None
         Optional reason or reference for the adjustment.
     event_id : UUID4
@@ -1089,6 +1128,8 @@ cdef class PositionAdjusted(Event):
         UUID4 event_id not None,
         uint64_t ts_event,
         uint64_t ts_init,
+        Money settled_change=None,
+        int fills_before=0,
     ) -> None:
         self.trader_id = trader_id
         self.strategy_id = strategy_id
@@ -1098,11 +1139,16 @@ cdef class PositionAdjusted(Event):
         self.adjustment_type = adjustment_type
         self.quantity_change = Decimal(str(quantity_change)) if quantity_change is not None else None
         self.pnl_change = pnl_change
+        self.settled_change = settled_change
+        self.fills_before = fills_before
         self.reason = reason
 
         self._event_id = event_id
         self._ts_event = ts_event
         self._ts_init = ts_init
+
+    cdef void _stamp_fills_before(self, int fills_before):
+        self.fills_before = fills_before
 
     def __eq__(self, Event other) -> bool:
         if other is None:
@@ -1189,6 +1235,10 @@ cdef class PositionAdjusted(Event):
         if values.get("pnl_change") is not None:
             pnl_change = Money.from_str_c(values["pnl_change"])
 
+        cdef Money settled_change = None
+        if values.get("settled_change") is not None:
+            settled_change = Money.from_str_c(values["settled_change"])
+
         cdef str adj_type_value = values["adjustment_type"]
         cdef PositionAdjustmentType adjustment_type = position_adjustment_type_from_str(adj_type_value)
 
@@ -1205,19 +1255,13 @@ cdef class PositionAdjusted(Event):
             event_id=UUID4.from_str_c(values["event_id"]),
             ts_event=values["ts_event"],
             ts_init=values["ts_init"],
+            settled_change=settled_change,
+            fills_before=values.get("fills_before", 0),
         )
 
     @staticmethod
     cdef dict to_dict_c(PositionAdjusted obj):
         Condition.not_none(obj, "obj")
-
-        cdef str adjustment_type_str
-        if obj.adjustment_type == PositionAdjustmentType.COMMISSION:
-            adjustment_type_str = "COMMISSION"
-        elif obj.adjustment_type == PositionAdjustmentType.FUNDING:
-            adjustment_type_str = "FUNDING"
-        else:
-            adjustment_type_str = "UNKNOWN"
 
         return {
             "type": type(obj).__name__,
@@ -1226,9 +1270,11 @@ cdef class PositionAdjusted(Event):
             "instrument_id": obj.instrument_id.to_str(),
             "position_id": obj.position_id.to_str(),
             "account_id": obj.account_id.to_str(),
-            "adjustment_type": adjustment_type_str,
+            "adjustment_type": position_adjustment_type_to_str(obj.adjustment_type),
             "quantity_change": str(obj.quantity_change) if obj.quantity_change is not None else None,
             "pnl_change": str(obj.pnl_change) if obj.pnl_change is not None else None,
+            "settled_change": str(obj.settled_change) if obj.settled_change is not None else None,
+            "fills_before": obj.fills_before,
             "reason": obj.reason,
             "event_id": obj._event_id.to_str(),
             "ts_event": obj._ts_event,

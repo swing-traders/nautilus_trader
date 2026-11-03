@@ -71,6 +71,7 @@ cdef class Position:
         self._buy_qty = Quantity.zero_c(precision=instrument.size_precision)
         self._sell_qty = Quantity.zero_c(precision=instrument.size_precision)
         self._commissions = {}
+        self._bookings: dict[TradeId, dict[int, tuple[Money, Money]]] = {}
 
         # Identifiers
         self.trader_id = fill.trader_id
@@ -106,6 +107,10 @@ cdef class Position:
 
         self.realized_return = 0.0
         self.realized_pnl = None
+        self.unrealized_carry = Money(0, self.settlement_currency)
+        self.accrued_carry = None
+        self.booked_pnl = None
+        self.booked_commissions = None
 
         self.apply(fill)
 
@@ -128,6 +133,12 @@ cdef class Position:
         remain, the position is reset to an empty shell with all history cleared
         (including timestamps), making it eligible for immediate cache cleanup.
 
+        A preserved ``SWAP`` adjustment replays at its boundary among the original
+        fills (its `fills_before` restamped to the surviving count) and is dropped
+        when reached while the position is flat; every other preserved adjustment
+        replays after the surviving fills. The purged order's bookings are dropped
+        and the booked figures re-summed from the surviving fills' bookings.
+
         Parameters
         ----------
         client_order_id : ClientOrderId
@@ -136,21 +147,34 @@ cdef class Position:
         """
         Condition.not_none(client_order_id, "client_order_id")
 
-        cdef list[OrderFilled] remaining_events = [
-            event for event in self._events
-            if event.client_order_id != client_order_id
-        ]
+        # Each fill's booking by the fill's position among the original fills
+        cdef dict bookings_by_fill = {
+            fill_index: booking
+            for fill_bookings in self._bookings.values()
+            for fill_index, booking in fill_bookings.items()
+        }
 
         # Preserve non-commission adjustments (funding, manual adjustments, etc.)
         # Commission adjustments will be automatically re-created when fills are replayed
-        cdef list preserved_adjustments = [
+        cdef list swap_boundaries = [
+            (adj, adj.fills_before) for adj in self._adjustments
+            if adj.adjustment_type == PositionAdjustmentType.SWAP_CHARGE
+        ]
+        cdef list other_adjustments = [
             adj for adj in self._adjustments
-            if adj.adjustment_type != PositionAdjustmentType.COMMISSION
+            if adj.adjustment_type not in (PositionAdjustmentType.COMMISSION, PositionAdjustmentType.SWAP_CHARGE)
+        ]
+
+        cdef list original_events = list(self._events)
+        cdef list[OrderFilled] remaining_events = [
+            event for event in original_events
+            if event.client_order_id != client_order_id
         ]
 
         self._events.clear()
         self._trade_ids.clear()
         self._adjustments.clear()
+        self._bookings.clear()
 
         # If no fills remain, reset to flat state clearing all history
         if not remaining_events:
@@ -163,6 +187,10 @@ cdef class Position:
             self.avg_px_close = 0.0
             self.realized_pnl = None
             self.realized_return = 0.0
+            self.unrealized_carry = Money(0, self.settlement_currency)
+            self.accrued_carry = None
+            self.booked_pnl = None
+            self.booked_commissions = None
             self.ts_opened = 0
             self.ts_last = 0
             self.ts_closed = 0
@@ -172,14 +200,30 @@ cdef class Position:
         self.side = PositionSide.FLAT
         self.signed_qty = 0.0
 
-        # Reapply all remaining fills to reconstruct state
+        # Reapply the surviving fills in their original order, each swap adjustment
+        # once its original fills have passed (surviving or purged), each surviving
+        # fill's booking right after it, so the flattening fill folds the carry
+        cdef int fills_passed = 0
+        cdef int swap_index = 0
         cdef OrderFilled event
-        for event in remaining_events:
-            self.apply(event)
+        cdef PositionAdjusted adjustment
+        cdef tuple booking
+        for event in original_events:
+            fills_passed += 1
+            if event.client_order_id != client_order_id:
+                self.apply(event)
+                booking = bookings_by_fill.get(fills_passed - 1)
+                if booking is not None:
+                    self.apply_booked(event.trade_id, booking[0], booking[1])
+
+            while swap_index < len(swap_boundaries) and swap_boundaries[swap_index][1] == fills_passed:
+                adjustment = swap_boundaries[swap_index][0]
+                swap_index += 1
+                if self.side != PositionSide.FLAT:
+                    self.apply_adjustment(adjustment)
 
         # Reapply preserved adjustments to maintain full state
-        cdef PositionAdjusted adjustment
-        for adjustment in preserved_adjustments:
+        for adjustment in other_adjustments:
             self.apply_adjustment(adjustment)
 
     cpdef str info(self):
@@ -569,6 +613,11 @@ cdef class Position:
             self.avg_px_close = 0.0
             self.realized_return = 0.0
             self.realized_pnl = None
+            self.unrealized_carry = Money(0, self.settlement_currency)
+            self.accrued_carry = None
+            self.booked_pnl = None
+            self.booked_commissions = None
+            self._bookings.clear()
 
         self._events.append(fill)
         self._trade_ids.add(fill.trade_id)
@@ -617,7 +666,12 @@ cdef class Position:
             self.peak_qty = self.quantity
 
         if self.quantity._mem.raw == 0 or self.signed_qty == 0.0:
-            # Position closed
+            # Position closed: the accrued carry is realized by this fill
+            if self.unrealized_carry._mem.raw != 0:
+                self.realized_pnl = self.realized_pnl.add(self.unrealized_carry)
+                self.unrealized_carry = Money(0, self.settlement_currency)
+            if self.accrued_carry is not None and self.booked_pnl is not None:
+                self.booked_pnl = self.booked_pnl.add(self.accrued_carry)
             self.side = PositionSide.FLAT
             self.signed_qty = 0.0  # Normalize
             self.closing_order_id = fill.client_order_id
@@ -651,6 +705,8 @@ cdef class Position:
         """
         Condition.not_none(adjustment, "adjustment")
 
+        adjustment._stamp_fills_before(len(self._events))
+
         # Apply quantity change if present
         if adjustment.quantity_change is not None:
             self.signed_qty += float(adjustment.quantity_change)
@@ -664,7 +720,16 @@ cdef class Position:
         # Apply PnL change if present
         cdef double current_pnl
 
-        if adjustment.pnl_change is not None:
+        if adjustment.adjustment_type == PositionAdjustmentType.SWAP_CHARGE:
+            # A swap accrues against the open position and is realized by the flattening fill
+            if adjustment.pnl_change is not None:
+                self.unrealized_carry = self.unrealized_carry.add(adjustment.pnl_change)
+            if adjustment.settled_change is not None:
+                if self.accrued_carry is None:
+                    self.accrued_carry = adjustment.settled_change
+                else:
+                    self.accrued_carry = self.accrued_carry.add(adjustment.settled_change)
+        elif adjustment.pnl_change is not None:
             current_pnl = self.realized_pnl.as_f64_c() if self.realized_pnl is not None else 0.0
             self.realized_pnl = Money(
                 current_pnl + adjustment.pnl_change.as_f64_c(),
@@ -688,6 +753,43 @@ cdef class Position:
 
         self._adjustments.append(adjustment)
         self.ts_last = adjustment.ts_event
+
+    cpdef void apply_booked(self, TradeId trade_id, Money pnl, Money commission):
+        """
+        Apply the PnL and commission the account booked for a fill, in the account's
+        base currency.
+
+        Each booking is kept under its trade ID against the latest fill carrying that ID,
+        so a purge replays every surviving fill's own booking, fills sharing an ID included.
+
+        Parameters
+        ----------
+        trade_id : TradeId
+            The trade match ID of the fill the account booked.
+        pnl : Money
+            The PnL the account booked for the fill.
+        commission : Money
+            The commission the account booked for the fill.
+
+        """
+        Condition.not_none(trade_id, "trade_id")
+        Condition.not_none(pnl, "pnl")
+        Condition.not_none(commission, "commission")
+
+        cdef int fill_index = len(self._events) - 1
+        while fill_index >= 0 and (<OrderFilled>self._events[fill_index]).trade_id != trade_id:
+            fill_index -= 1
+        self._bookings.setdefault(trade_id, {})[fill_index] = (pnl, commission)
+
+        if self.booked_pnl is None:
+            self.booked_pnl = pnl.sub(commission)
+            self.booked_commissions = commission
+            if self.side == PositionSide.FLAT and self.accrued_carry is not None:
+                # The flattening fill brought the first booking, so `apply` had no book to fold into
+                self.booked_pnl = self.booked_pnl.add(self.accrued_carry)
+        else:
+            self.booked_pnl = self.booked_pnl.add(pnl).sub(commission)
+            self.booked_commissions = self.booked_commissions.add(commission)
 
     cpdef Money notional_value(
         self,

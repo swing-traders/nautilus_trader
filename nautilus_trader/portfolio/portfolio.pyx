@@ -65,6 +65,7 @@ from nautilus_trader.model.events.order cimport OrderExpired
 from nautilus_trader.model.events.order cimport OrderFilled
 from nautilus_trader.model.events.order cimport OrderRejected
 from nautilus_trader.model.events.order cimport OrderUpdated
+from nautilus_trader.model.events.position cimport PositionAdjusted
 from nautilus_trader.model.events.position cimport PositionEvent
 from nautilus_trader.model.functions cimport position_side_to_str
 from nautilus_trader.model.functions cimport price_type_to_str
@@ -157,6 +158,11 @@ cdef class Portfolio(PortfolioFacade):
         self._realized_pnls: dict[InstrumentId, dict[AccountId, Money]] = {}
         self._snapshot_sum_per_position: dict[PositionId, Money] = {}
         self._snapshot_last_per_position: dict[PositionId, Money] = {}
+        self._snapshot_booked_sum_per_position: dict[PositionId, Money] = {}
+        self._snapshot_booked_last_per_position: dict[PositionId, Money] = {}
+        self._snapshot_booked_last_identity: dict[PositionId, tuple] = {}
+        self._snapshot_unbooked_sum_per_position: dict[PositionId, Money] = {}
+        self._snapshot_unbooked_last_per_position: dict[PositionId, Money] = {}
         self._snapshot_processed_counts: dict[PositionId, int] = {}
         self._snapshot_account_ids: dict[PositionId, AccountId] = {}
         self._net_positions: dict[InstrumentId, dict[AccountId, Decimal]] = {}
@@ -194,6 +200,7 @@ cdef class Portfolio(PortfolioFacade):
         self._msgbus.register(endpoint="Portfolio.update_account", handler=self.update_account)
         self._msgbus.register(endpoint="Portfolio.update_order", handler=self.update_order)
         self._msgbus.register(endpoint="Portfolio.update_position", handler=self.update_position)
+        self._msgbus.register(endpoint="Portfolio.update_position_adjusted", handler=self.update_position_adjusted)
 
         # Required subscriptions
         self._msgbus.subscribe(topic="events.order.*", handler=self.on_order_event, priority=10)
@@ -625,6 +632,7 @@ cdef class Portfolio(PortfolioFacade):
             Position updated_position
             set[PositionId] snapshot_ids
             Money last_snapshot_pnl
+            Money last_booked_pnl
 
         # Check if this position update represents a new cycle (closed position with realized_pnl)
         # For NETTING OMS, if a position is closed and has snapshots, it might be a new cycle
@@ -636,9 +644,18 @@ cdef class Portfolio(PortfolioFacade):
             # Check if this position_id has snapshots
             snapshot_ids = self._cache.position_snapshot_ids(event.instrument_id)
             if event.position_id in snapshot_ids:
-                # Compare with last snapshot PnL - if different, it's a new cycle
+                # Compare with the last snapshot's figure - if different, it's a new cycle;
+                # the account book is compared where both sides carry one
+                last_booked_pnl = self._snapshot_booked_last_per_position.get(event.position_id)
                 last_snapshot_pnl = self._snapshot_last_per_position.get(event.position_id)
-                if last_snapshot_pnl is not None and updated_position.realized_pnl is not None:
+                if last_booked_pnl is not None and updated_position.booked_pnl is not None:
+                    if (
+                        updated_position.booked_pnl.currency != last_booked_pnl.currency
+                        or updated_position.booked_pnl != last_booked_pnl
+                    ):
+                        # New cycle detected - invalidate all accounts for this instrument
+                        invalidate_all_accounts = True
+                elif last_snapshot_pnl is not None and updated_position.realized_pnl is not None:
                     if (
                         updated_position.realized_pnl.currency != last_snapshot_pnl.currency
                         or updated_position.realized_pnl != last_snapshot_pnl
@@ -669,39 +686,58 @@ cdef class Portfolio(PortfolioFacade):
             return
 
         if updated_position is not None and updated_position.is_closed_c() and updated_position.realized_pnl is not None:
-            self.analyzer.record_trade(
-                updated_position.id,
-                updated_position.realized_pnl,
-                updated_position.ts_last,
-            )
-
             if (
                 account.base_currency is not None
-                and updated_position.realized_pnl.currency != account.base_currency
+                and updated_position.booked_pnl is not None
+                and updated_position.booked_pnl.currency == account.base_currency
             ):
-                if not self._record_converted_trade(
+                # The account's own book is the trade in its base currency; the native PnL is
+                # recorded beside it only in another currency
+                if updated_position.realized_pnl.currency != account.base_currency:
+                    self.analyzer.record_trade(
+                        updated_position.id,
+                        updated_position.realized_pnl,
+                        updated_position.ts_last,
+                    )
+                self.analyzer.record_trade(
+                    updated_position.id,
+                    updated_position.booked_pnl,
+                    updated_position.ts_last,
+                )
+            else:
+                self.analyzer.record_trade(
                     updated_position.id,
                     updated_position.realized_pnl,
                     updated_position.ts_last,
-                    account.base_currency,
-                    event.instrument_id.venue,
+                )
+
+                if (
+                    account.base_currency is not None
+                    and updated_position.realized_pnl.currency != account.base_currency
                 ):
-                    # A rate missing at the close is not yet known: the trade waits for an update
-                    # to supply it
-                    self._log.debug(
-                        f"Account-currency realized PnL for {updated_position.id} pending: "
-                        f"no {self._log_xrate} exchange rate yet for "
-                        f"{updated_position.realized_pnl.currency}/{account.base_currency}",
-                    )
-                    self._pending_realized_trades.setdefault(event.instrument_id, []).append(
-                        (
-                            updated_position.id,
-                            updated_position.realized_pnl,
-                            updated_position.ts_last,
-                            account.base_currency,
-                        ),
-                    )
-                    self._add_pending_xrate(event.instrument_id)
+                    if not self._record_converted_trade(
+                        updated_position.id,
+                        updated_position.realized_pnl,
+                        updated_position.ts_last,
+                        account.base_currency,
+                        event.instrument_id.venue,
+                    ):
+                        # A rate missing at the close is not yet known: the trade waits for an
+                        # update to supply it
+                        self._log.debug(
+                            f"Account-currency realized PnL for {updated_position.id} pending: "
+                            f"no {self._log_xrate} exchange rate yet for "
+                            f"{updated_position.realized_pnl.currency}/{account.base_currency}",
+                        )
+                        self._pending_realized_trades.setdefault(event.instrument_id, []).append(
+                            (
+                                updated_position.id,
+                                updated_position.realized_pnl,
+                                updated_position.ts_last,
+                                account.base_currency,
+                            ),
+                        )
+                        self._add_pending_xrate(event.instrument_id)
 
         if account.type != AccountType.MARGIN or not account.calculate_account_state:
             return  # Nothing to calculate
@@ -725,6 +761,30 @@ cdef class Portfolio(PortfolioFacade):
         if result:
             account_state = self._accounts.generate_account_state(account, event.ts_event)
             self._update_account(account_state)
+
+    cpdef void update_position_adjusted(self, PositionAdjusted event):
+        """
+        Update the portfolio with the given position adjustment.
+
+        A swap charge moves no realized PnL, so no cached PnL is dropped; the
+        account's last state is republished as for a position event.
+
+        Parameters
+        ----------
+        event : PositionAdjusted
+            The adjustment to update with.
+
+        """
+        Condition.not_none(event, "event")
+
+        cdef Account account = self._cache.account(event.account_id)
+        if account is None:
+            return  # No account registered
+
+        self._msgbus.publish_c(
+            topic=f"events.account.{account.id}",
+            msg=account.last_event_c(),
+        )
 
     cpdef void on_order_event(self, OrderEvent event):
         """
@@ -795,6 +855,11 @@ cdef class Portfolio(PortfolioFacade):
         self._pending_realized_trades.clear()
         self._snapshot_sum_per_position.clear()
         self._snapshot_last_per_position.clear()
+        self._snapshot_booked_sum_per_position.clear()
+        self._snapshot_booked_last_per_position.clear()
+        self._snapshot_booked_last_identity.clear()
+        self._snapshot_unbooked_sum_per_position.clear()
+        self._snapshot_unbooked_last_per_position.clear()
         self._snapshot_processed_counts.clear()
         self._snapshot_account_ids.clear()
         self._venues_missing_price.clear()
@@ -1191,7 +1256,7 @@ cdef class Portfolio(PortfolioFacade):
         Return the per-currency total equity for the given venue or account (if found).
 
         For cash and betting accounts: ``balance.total + Σ mark_value(open positions)``.
-        For margin accounts: ``balance.total + Σ unrealized_pnl(open positions)``.
+        For margin accounts: ``balance.total + Σ unrealized_pnl(open positions) + Σ accrued_carry(open positions)``.
 
         Instruments that cannot be priced are tracked via `missing_price_instruments`,
         so equity understatement surfaces via a warn-once log.
@@ -1224,6 +1289,8 @@ cdef class Portfolio(PortfolioFacade):
         cdef set instrument_ids
         cdef InstrumentId instrument_id
         cdef Money pnl
+        cdef Money accrued_carry
+        cdef Position position
         cdef Venue tracker_venue
         if account.is_margin_account:
             # Iterate directly so unpriced instruments surface via the tracker,
@@ -1245,6 +1312,10 @@ cdef class Portfolio(PortfolioFacade):
                         unpriced.add(instrument_id)
                         continue
                     equity[pnl.currency] = equity.get(pnl.currency, 0.0) + pnl.as_f64_c()
+                for position in positions_open:
+                    accrued_carry = position.accrued_carry
+                    if accrued_carry is not None:
+                        equity[accrued_carry.currency] = equity.get(accrued_carry.currency, 0.0) + accrued_carry.as_f64_c()
                 self._update_missing_price_state(tracker_venue, unpriced)
             elif venue is not None and account_id is None:
                 self._venues_missing_price.pop(venue, None)
@@ -2462,12 +2533,22 @@ cdef class Portfolio(PortfolioFacade):
             Position snapshot
             Money sum_pnl
             Money last_pnl
+            Money booked_sum
+            Money booked_last
+            tuple booked_identity
+            Money unbooked_sum
+            Money unbooked_last
 
         if rebuild:
             # Full rebuild: process all snapshots from scratch
             for position_id in snapshot_position_ids:
                 sum_pnl = None
                 last_pnl = None
+                booked_sum = None
+                booked_last = None
+                booked_identity = None
+                unbooked_sum = None
+                unbooked_last = None
                 position_id_snapshots = snapshot_data[position_id]
                 curr_count = len(position_id_snapshots)
 
@@ -2492,6 +2573,29 @@ cdef class Portfolio(PortfolioFacade):
                             # Always update last to the most recent snapshot
                             last_pnl = snapshot.realized_pnl
 
+                        if snapshot.booked_pnl is not None:
+                            # The account book is kept per generation alongside the native sum
+                            if booked_sum is None:
+                                booked_sum = snapshot.booked_pnl
+                            elif booked_sum.currency == snapshot.booked_pnl.currency:
+                                booked_sum = Money(
+                                    booked_sum.as_double() + snapshot.booked_pnl.as_double(),
+                                    booked_sum.currency
+                                )
+
+                            booked_last = snapshot.booked_pnl
+                            booked_identity = (snapshot.closing_order_id, snapshot.ts_closed)
+                        elif snapshot.realized_pnl is not None:
+                            if unbooked_sum is None:
+                                unbooked_sum = snapshot.realized_pnl
+                            elif unbooked_sum.currency == snapshot.realized_pnl.currency:
+                                unbooked_sum = Money(
+                                    unbooked_sum.as_double() + snapshot.realized_pnl.as_double(),
+                                    unbooked_sum.currency
+                                )
+
+                            unbooked_last = snapshot.realized_pnl
+
                 # Update tracking structures
                 if sum_pnl is not None:
                     self._snapshot_sum_per_position[position_id] = sum_pnl
@@ -2499,6 +2603,22 @@ cdef class Portfolio(PortfolioFacade):
                 else:
                     self._snapshot_sum_per_position.pop(position_id, None)
                     self._snapshot_last_per_position.pop(position_id, None)
+
+                if booked_sum is not None:
+                    self._snapshot_booked_sum_per_position[position_id] = booked_sum
+                    self._snapshot_booked_last_per_position[position_id] = booked_last
+                    self._snapshot_booked_last_identity[position_id] = booked_identity
+                else:
+                    self._snapshot_booked_sum_per_position.pop(position_id, None)
+                    self._snapshot_booked_last_per_position.pop(position_id, None)
+                    self._snapshot_booked_last_identity.pop(position_id, None)
+
+                if unbooked_sum is not None:
+                    self._snapshot_unbooked_sum_per_position[position_id] = unbooked_sum
+                    self._snapshot_unbooked_last_per_position[position_id] = unbooked_last
+                else:
+                    self._snapshot_unbooked_sum_per_position.pop(position_id, None)
+                    self._snapshot_unbooked_last_per_position.pop(position_id, None)
 
                 self._snapshot_processed_counts[position_id] = curr_count
         else:
@@ -2515,6 +2635,11 @@ cdef class Portfolio(PortfolioFacade):
 
                 sum_pnl = self._snapshot_sum_per_position.get(position_id)
                 last_pnl = self._snapshot_last_per_position.get(position_id)
+                booked_sum = self._snapshot_booked_sum_per_position.get(position_id)
+                booked_last = self._snapshot_booked_last_per_position.get(position_id)
+                booked_identity = self._snapshot_booked_last_identity.get(position_id)
+                unbooked_sum = self._snapshot_unbooked_sum_per_position.get(position_id)
+                unbooked_last = self._snapshot_unbooked_last_per_position.get(position_id)
 
                 # Process only new snapshots
                 for idx in range(prev_count, curr_count):
@@ -2537,6 +2662,28 @@ cdef class Portfolio(PortfolioFacade):
                         # Update last to most recent
                         last_pnl = snapshot.realized_pnl
 
+                    if snapshot.booked_pnl is not None:
+                        if booked_sum is None:
+                            booked_sum = snapshot.booked_pnl
+                        elif booked_sum.currency == snapshot.booked_pnl.currency:
+                            booked_sum = Money(
+                                booked_sum.as_double() + snapshot.booked_pnl.as_double(),
+                                booked_sum.currency
+                            )
+
+                        booked_last = snapshot.booked_pnl
+                        booked_identity = (snapshot.closing_order_id, snapshot.ts_closed)
+                    elif snapshot.realized_pnl is not None:
+                        if unbooked_sum is None:
+                            unbooked_sum = snapshot.realized_pnl
+                        elif unbooked_sum.currency == snapshot.realized_pnl.currency:
+                            unbooked_sum = Money(
+                                unbooked_sum.as_double() + snapshot.realized_pnl.as_double(),
+                                unbooked_sum.currency
+                            )
+
+                        unbooked_last = snapshot.realized_pnl
+
                 # Update tracking structures
                 if sum_pnl is not None:
                     self._snapshot_sum_per_position[position_id] = sum_pnl
@@ -2544,6 +2691,22 @@ cdef class Portfolio(PortfolioFacade):
                 else:
                     self._snapshot_sum_per_position.pop(position_id, None)
                     self._snapshot_last_per_position.pop(position_id, None)
+
+                if booked_sum is not None:
+                    self._snapshot_booked_sum_per_position[position_id] = booked_sum
+                    self._snapshot_booked_last_per_position[position_id] = booked_last
+                    self._snapshot_booked_last_identity[position_id] = booked_identity
+                else:
+                    self._snapshot_booked_sum_per_position.pop(position_id, None)
+                    self._snapshot_booked_last_per_position.pop(position_id, None)
+                    self._snapshot_booked_last_identity.pop(position_id, None)
+
+                if unbooked_sum is not None:
+                    self._snapshot_unbooked_sum_per_position[position_id] = unbooked_sum
+                    self._snapshot_unbooked_last_per_position[position_id] = unbooked_last
+                else:
+                    self._snapshot_unbooked_sum_per_position.pop(position_id, None)
+                    self._snapshot_unbooked_last_per_position.pop(position_id, None)
 
                 self._snapshot_processed_counts[position_id] = curr_count
 
@@ -2562,6 +2725,11 @@ cdef class Portfolio(PortfolioFacade):
             self._snapshot_processed_counts.pop(stale_position_id, None)
             self._snapshot_sum_per_position.pop(stale_position_id, None)
             self._snapshot_last_per_position.pop(stale_position_id, None)
+            self._snapshot_booked_sum_per_position.pop(stale_position_id, None)
+            self._snapshot_booked_last_per_position.pop(stale_position_id, None)
+            self._snapshot_booked_last_identity.pop(stale_position_id, None)
+            self._snapshot_unbooked_sum_per_position.pop(stale_position_id, None)
+            self._snapshot_unbooked_last_per_position.pop(stale_position_id, None)
             self._snapshot_account_ids.pop(stale_position_id, None)
 
         # Invalidate PnL cache when snapshots change (new snapshots or purges)
@@ -2585,6 +2753,7 @@ cdef class Portfolio(PortfolioFacade):
             PositionId position_id
             Money sum_pnl
             Money last_pnl
+            Money booked_sum
             object contribution_result
             double contribution
             AccountId snapshot_account_id
@@ -2593,6 +2762,13 @@ cdef class Portfolio(PortfolioFacade):
             double xrate
             PriceType conv_price_type
             Instrument instrument
+            tuple last_identity
+
+        # On the account-currency path each retained generation contributes its booked
+        # PnL unconverted where it carries one, its native PnL converted where it does not
+        cdef bint account_book = (
+            self._convert_to_account_base_currency and account.base_currency is not None
+        )
 
         for position_id in snapshot_ids:
             # Only process snapshots for the requested account
@@ -2600,7 +2776,29 @@ cdef class Portfolio(PortfolioFacade):
             if snapshot_account_id != account_id:
                 continue  # Skip snapshots from other accounts
 
-            sum_pnl = self._snapshot_sum_per_position.get(position_id)
+            last_identity = None
+            if account_book:
+                booked_sum = self._snapshot_booked_sum_per_position.get(position_id)
+                if booked_sum is not None:
+                    contribution_result = self._calculate_snapshot_contribution(
+                        position_id=position_id,
+                        active_position_ids=active_position_ids,
+                        positions=positions,
+                        sum_pnl=booked_sum,
+                        last_pnl=self._snapshot_booked_last_per_position.get(position_id),
+                        last_identity=self._snapshot_booked_last_identity.get(position_id),
+                        account_book=True,
+                        processed_ids=processed_ids,
+                    )
+                    if contribution_result is not None:
+                        total_pnl += <double>contribution_result  # Already in the account currency
+
+                sum_pnl = self._snapshot_unbooked_sum_per_position.get(position_id)
+                last_pnl = self._snapshot_unbooked_last_per_position.get(position_id)
+            else:
+                sum_pnl = self._snapshot_sum_per_position.get(position_id)
+                last_pnl = self._snapshot_last_per_position.get(position_id)
+
             if sum_pnl is None:
                 continue  # No PnL for this position
 
@@ -2609,6 +2807,9 @@ cdef class Portfolio(PortfolioFacade):
                 active_position_ids=active_position_ids,
                 positions=positions,
                 sum_pnl=sum_pnl,
+                last_pnl=last_pnl,
+                last_identity=last_identity,
+                account_book=account_book,
                 processed_ids=processed_ids,
             )
             if contribution_result is None:
@@ -2660,13 +2861,17 @@ cdef class Portfolio(PortfolioFacade):
         set active_position_ids,
         list positions,
         Money sum_pnl,
+        Money last_pnl,
+        tuple last_identity,
+        bint account_book,
         set processed_ids,
     ):
-        # Calculate the contribution from a snapshot using the 3-case combination rule
+        # Calculate the contribution from a snapshot using the 3-case combination rule;
+        # the account book tells the last retained generation from the cached closed
+        # position by its closing identity, never by equal money
         cdef:
             double contribution = 0.0
             Position position
-            Money last_pnl
         if position_id not in active_position_ids:
             # Case 1: Position NOT in cache - add sum of all snapshots
             contribution = sum_pnl.as_double()
@@ -2690,13 +2895,25 @@ cdef class Portfolio(PortfolioFacade):
 
                 # Position's PnL will be added in the positions loop below
                 # Do NOT mark as processed - we still need to add current PnL
+            elif last_identity is not None:
+                # Case 3 on the account book: the cached closed position is the last
+                # retained generation only when it carries that generation's identity
+                if (
+                    position.closing_order_id == last_identity[0]
+                    and position.ts_closed == last_identity[1]
+                ):
+                    contribution = sum_pnl.as_double() - last_pnl.as_double()
+                else:
+                    contribution = sum_pnl.as_double()
+            elif account_book and position.booked_pnl is not None:
+                # Case 3 on the account book: a booked generation is contributed by the book
+                contribution = sum_pnl.as_double()
             else:
                 # Case 3: Position CLOSED
                 # If last snapshot equals current position realized PnL, subtract it here;
                 # when we add the position realized below, net effect is `sum`.
                 # If not equal (new closed cycle not snapshotted), include full `sum` here
                 # and add the position realized below (net `sum + realized`).
-                last_pnl = self._snapshot_last_per_position.get(position_id)
                 if (
                     last_pnl is not None
                     and position.realized_pnl is not None
@@ -2729,6 +2946,10 @@ cdef class Portfolio(PortfolioFacade):
             object xrate_result
             double xrate
             object bet_position
+            bint use_booked
+        cdef bint account_book = (
+            self._convert_to_account_base_currency and account.base_currency is not None
+        )
         for position in positions:
             if position.instrument_id != instrument_id:
                 continue  # Nothing to calculate
@@ -2743,8 +2964,17 @@ cdef class Portfolio(PortfolioFacade):
             if self._debug:
                 self._log.debug(f"Adding realized PnL for {position}")
 
+            use_booked = (
+                account_book
+                and account.books_pnl(instrument)
+                and position.booked_pnl is not None
+            )
+
             # Add position's realized PnL
-            if isinstance(instrument, BettingInstrument):
+            if use_booked:
+                # The account's own book is already in its base currency
+                pnl = position.booked_pnl.as_f64_c()
+            elif isinstance(instrument, BettingInstrument):
                 bet_position = self._get_bet_position(position, instrument)
                 if bet_position is None:
                     self._log.debug(
@@ -2756,7 +2986,7 @@ cdef class Portfolio(PortfolioFacade):
             else:
                 pnl = position.realized_pnl.as_f64_c()
 
-            if self._convert_to_account_base_currency and account.base_currency is not None:
+            if not use_booked and self._convert_to_account_base_currency and account.base_currency is not None:
                 xrate_result = self._get_xrate_to_account_base(
                     instrument=instrument,
                     account=account,

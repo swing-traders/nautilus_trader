@@ -239,6 +239,10 @@ cdef class CashAccount(Account):
 
 # -- CALCULATIONS ---------------------------------------------------------------------------------
 
+    cpdef bint books_pnl(self, Instrument instrument):
+        # A cash account books a fill's cost or proceeds as a cash flow, never a PnL
+        return False
+
     cpdef bint is_unleveraged(self, InstrumentId instrument_id):
         return True
 

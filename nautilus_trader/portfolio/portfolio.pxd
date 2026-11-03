@@ -27,6 +27,7 @@ from nautilus_trader.model.data cimport Bar
 from nautilus_trader.model.data cimport QuoteTick
 from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.events.order cimport OrderEvent
+from nautilus_trader.model.events.position cimport PositionAdjusted
 from nautilus_trader.model.events.position cimport PositionEvent
 from nautilus_trader.model.identifiers cimport AccountId
 from nautilus_trader.model.identifiers cimport InstrumentId
@@ -59,6 +60,11 @@ cdef class Portfolio(PortfolioFacade):
     cdef dict[InstrumentId, dict[AccountId, Money]] _realized_pnls
     cdef dict[PositionId, Money] _snapshot_sum_per_position
     cdef dict[PositionId, Money] _snapshot_last_per_position
+    cdef dict[PositionId, Money] _snapshot_booked_sum_per_position
+    cdef dict[PositionId, Money] _snapshot_booked_last_per_position
+    cdef dict[PositionId, tuple] _snapshot_booked_last_identity
+    cdef dict[PositionId, Money] _snapshot_unbooked_sum_per_position
+    cdef dict[PositionId, Money] _snapshot_unbooked_last_per_position
     cdef dict[PositionId, int] _snapshot_processed_counts
     cdef dict[PositionId, AccountId] _snapshot_account_ids
     cdef dict[InstrumentId, dict[AccountId, Decimal]] _net_positions
@@ -83,6 +89,7 @@ cdef class Portfolio(PortfolioFacade):
     cpdef void update_account(self, AccountState event)
     cpdef void update_order(self, OrderEvent event)
     cpdef void update_position(self, PositionEvent event)
+    cpdef void update_position_adjusted(self, PositionAdjusted event)
     cpdef void on_order_event(self, OrderEvent event)
     cpdef void on_position_event(self, PositionEvent event)
 
@@ -117,7 +124,7 @@ cdef class Portfolio(PortfolioFacade):
     cdef Currency _determine_pnl_currency(self, Account account, Instrument instrument)
     cdef dict _aggregate_pnls_by_instrument(self, list positions, bint is_realized, AccountId account_id, Currency target_currency)
     cdef tuple _process_snapshot_pnl_contributions(self, InstrumentId instrument_id, AccountId account_id, list positions, Currency currency, Account account)
-    cdef object _calculate_snapshot_contribution(self, PositionId position_id, set active_position_ids, list positions, Money sum_pnl, set processed_ids)
+    cdef object _calculate_snapshot_contribution(self, PositionId position_id, set active_position_ids, list positions, Money sum_pnl, Money last_pnl, tuple last_identity, bint account_book, set processed_ids)
     cdef object _process_active_position_realized_pnl(self, list positions, InstrumentId instrument_id, Instrument instrument, Account account, Currency currency, set processed_ids)
     cdef Money _calculate_unrealized_pnl(self, InstrumentId instrument_id, Price price=*, AccountId account_id=*)
     cdef object _calculate_total_unrealized_pnl(self, list positions_open, InstrumentId instrument_id, Instrument instrument, Account account, Currency currency, Price price)

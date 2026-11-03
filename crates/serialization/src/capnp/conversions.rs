@@ -862,6 +862,7 @@ pub fn position_adjustment_type_to_capnp(
     match value {
         PositionAdjustmentType::Commission => enums_capnp::PositionAdjustmentType::Commission,
         PositionAdjustmentType::Funding => enums_capnp::PositionAdjustmentType::Funding,
+        PositionAdjustmentType::SwapCharge => enums_capnp::PositionAdjustmentType::Swap,
     }
 }
 
@@ -872,6 +873,7 @@ pub fn position_adjustment_type_from_capnp(
     match value {
         enums_capnp::PositionAdjustmentType::Commission => PositionAdjustmentType::Commission,
         enums_capnp::PositionAdjustmentType::Funding => PositionAdjustmentType::Funding,
+        enums_capnp::PositionAdjustmentType::Swap => PositionAdjustmentType::SwapCharge,
     }
 }
 

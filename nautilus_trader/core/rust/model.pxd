@@ -423,6 +423,11 @@ cdef extern from "../includes/model.h":
         COMMISSION # = 1,
         # Funding payment affecting position realized PnL.
         FUNDING # = 2,
+        # Swap charge accruing against the open position, realized when it closes.
+        #
+        # Named `SwapCharge` so the generated C enum member stays clear of
+        # `InstrumentClass::Swap` (C enum members share one namespace).
+        SWAP_CHARGE # = 3,
 
     # A record flag bit field, indicating event end and data information.
     cpdef enum RecordFlag:

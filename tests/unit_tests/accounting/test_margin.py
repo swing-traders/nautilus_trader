@@ -28,13 +28,20 @@ from nautilus_trader.model.currencies import BTC
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.enums import AccountType
+from nautilus_trader.model.enums import AssetClass
+from nautilus_trader.model.enums import InstrumentClass
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.events import AccountState
 from nautilus_trader.model.identifiers import AccountId
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import StrategyId
+from nautilus_trader.model.identifiers import Symbol
+from nautilus_trader.model.identifiers import TradeId
+from nautilus_trader.model.identifiers import Venue
+from nautilus_trader.model.instruments.base import Instrument
 from nautilus_trader.model.objects import AccountBalance
 from nautilus_trader.model.objects import MarginBalance
 from nautilus_trader.model.objects import Money
@@ -48,6 +55,31 @@ from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 
 
 AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+
+AUDUSD_CFD = TestInstrumentProvider.audusd_cfd()
+AAPL_OPTION = TestInstrumentProvider.aapl_option()
+OPTION_SPREAD = TestInstrumentProvider.option_spread()
+BINARY_OPTION = TestInstrumentProvider.binary_option()
+
+WARRANT_SIM = Instrument(
+    instrument_id=InstrumentId(Symbol("WARRANT1"), Venue("SIM")),
+    raw_symbol=Symbol("WARRANT1"),
+    asset_class=AssetClass.EQUITY,
+    instrument_class=InstrumentClass.WARRANT,
+    quote_currency=USD,
+    is_inverse=False,
+    price_precision=2,
+    size_precision=0,
+    size_increment=Quantity.from_int(1),
+    multiplier=Quantity.from_int(1),
+    margin_init=Decimal(0),
+    margin_maint=Decimal(0),
+    maker_fee=Decimal(0),
+    taker_fee=Decimal(0),
+    ts_event=0,
+    ts_init=0,
+)
+
 USDJPY_SIM = TestInstrumentProvider.default_fx_ccy("USD/JPY")
 ADABTC_BINANCE = TestInstrumentProvider.adabtc_binance()
 BTCUSDT_BINANCE = TestInstrumentProvider.btcusdt_binance()
@@ -149,6 +181,57 @@ class TestMarginAccount:
         # Assert
         assert account.leverage(AUDUSD_SIM.id) == Decimal(100)
         assert account.leverages() == {AUDUSD_SIM.id: Decimal(100)}
+
+    def test_books_pnl(self):
+        # A margin account books PnL for every class but the premium ones
+        # Arrange, Act
+        account = TestExecStubs.margin_account()
+
+        # Assert
+        assert account.books_pnl(AUDUSD_SIM) is True
+        assert account.books_pnl(AUDUSD_CFD) is True
+        assert account.books_pnl(AAPL_OPTION) is False
+        assert account.books_pnl(OPTION_SPREAD) is False
+        assert account.books_pnl(BINARY_OPTION) is False
+        assert account.books_pnl(WARRANT_SIM) is False
+
+    def test_calculate_pnls_books_a_cash_flow_where_the_account_declares_no_pnl(self):
+        # Arrange: an account answering False for AUD/USD books its fills as the premium classes
+        class CashFlowMarginAccount(MarginAccount):
+            def books_pnl(self, instrument):
+                return False
+
+        account = CashFlowMarginAccount(TestEventStubs.margin_account_state())
+        order = self.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=AUDUSD_SIM,
+            position_id=PositionId("P-123456"),
+            strategy_id=StrategyId("S-001"),
+            last_px=Price.from_str("1.00000"),
+        )
+
+        # Act
+        result = account.calculate_pnls(instrument=AUDUSD_SIM, fill=fill, position=None)
+
+        # Assert: the buy's notional, 100,000 x 1.00000 USD, as an outflow
+        assert result == [Money(-100_000, USD)]
+
+    def test_record_and_take_booking(self):
+        # Arrange
+        account = TestExecStubs.margin_account()
+
+        # Act
+        account.record_booking(TradeId("E-1"), Money("-27.01", USD), Money("0.68", USD))
+
+        # Assert
+        assert account.take_booking(TradeId("E-1")) == (Money("-27.01", USD), Money("0.68", USD))
+        assert account.take_booking(TradeId("E-1")) is None
+        assert account.take_booking(TradeId("E-2")) is None
 
     def test_is_unleveraged_with_leverage_returns_false(self):
         # Arrange

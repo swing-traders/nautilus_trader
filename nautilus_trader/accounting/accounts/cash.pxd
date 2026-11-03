@@ -33,6 +33,8 @@ cdef class CashAccount(Account):
     cpdef void update_balance_locked(self, InstrumentId instrument_id, Money locked)
     cpdef void clear_balance_locked(self, InstrumentId instrument_id)
 
+    cpdef bint books_pnl(self, Instrument instrument)
+
 # -- CALCULATIONS ---------------------------------------------------------------------------------
 
     cpdef Money calculate_balance_locked(

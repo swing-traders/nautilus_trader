@@ -79,6 +79,10 @@ cdef class PositionEvent(Event):
     """The realized PnL for the position (including commissions).\n\n:returns: `Money`"""
     cdef readonly Money unrealized_pnl
     """The unrealized PnL for the position (including commissions).\n\n:returns: `Money`"""
+    cdef readonly Money booked_pnl
+    """The PnL the account booked for the position, in the account's base currency.\n\n:returns: `Money` or ``None``"""
+    cdef readonly Money booked_commissions
+    """The commissions the account booked for the position, in the account's base currency.\n\n:returns: `Money` or ``None``"""
     cdef readonly uint64_t ts_opened
     """UNIX timestamp (nanoseconds) when the position was opened.\n\n:returns: `uint64_t`"""
     cdef readonly uint64_t ts_closed
@@ -159,8 +163,14 @@ cdef class PositionAdjusted(Event):
     """The quantity change (can be negative).\n\n:returns: `Decimal` or `None`"""
     cdef readonly Money pnl_change
     """The PnL change.\n\n:returns: `Money` or `None`"""
+    cdef readonly Money settled_change
+    """The change in the account's currency at the charge.\n\n:returns: `Money` or `None`"""
+    cdef readonly int fills_before
+    """The count of the position's fills applied before the adjustment.\n\n:returns: `int`"""
     cdef readonly str reason
     """Optional reason for the adjustment.\n\n:returns: `str` or `None`"""
+
+    cdef void _stamp_fills_before(self, int fills_before)
 
     @staticmethod
     cdef PositionAdjusted from_dict_c(dict values)

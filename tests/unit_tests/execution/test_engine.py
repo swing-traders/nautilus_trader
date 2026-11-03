@@ -17,6 +17,8 @@ from decimal import Decimal
 
 import pytest
 
+from nautilus_trader.accounting.accounts.margin import MarginAccount
+from nautilus_trader.accounting.factory import AccountFactory
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.component import TestClock
@@ -34,17 +36,20 @@ from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
 from nautilus_trader.execution.messages import TradingCommand
+from nautilus_trader.model.currencies import CAD
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
+from nautilus_trader.model.enums import PositionAdjustmentType
 from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.events import OrderCanceled
 from nautilus_trader.model.events import OrderUpdated
+from nautilus_trader.model.events.position import PositionAdjusted
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
@@ -55,6 +60,8 @@ from nautilus_trader.model.identifiers import StrategyId
 from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.objects import AccountBalance
+from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
@@ -65,6 +72,7 @@ from nautilus_trader.risk.engine import RiskEngine
 from nautilus_trader.test_kit.mocks.cache_database import MockCacheDatabase
 from nautilus_trader.test_kit.mocks.exec_clients import MockExecutionClient
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from nautilus_trader.test_kit.stubs.data import TestDataStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
@@ -4943,3 +4951,556 @@ class TestExecutionEngine:
         )
         client = engine._find_client_for_command(query_cmd)
         assert client.id == ib_client_id, "QueryAccount should route by account_id issuer"
+
+
+AUDCAD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/CAD")
+USDCAD_SIM = TestInstrumentProvider.default_fx_ccy("USD/CAD")
+AAPL_XNAS = TestInstrumentProvider.equity(symbol="AAPL", venue="XNAS")
+AAPL_OPTION = TestInstrumentProvider.aapl_option()
+
+
+def _engine_stack(venue: str, account_type: AccountType, oms_type: OmsType = OmsType.HEDGING):
+    clock = TestClock()
+    trader_id = TestIdStubs.trader_id()
+    msgbus = MessageBus(trader_id=trader_id, clock=clock)
+    cache = Cache(database=MockCacheDatabase())
+    portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=clock)
+    exec_engine = ExecutionEngine(msgbus=msgbus, cache=cache, clock=clock)
+    risk_engine = RiskEngine(portfolio=portfolio, msgbus=msgbus, cache=cache, clock=clock)
+    client = MockExecutionClient(
+        client_id=ClientId(venue),
+        venue=Venue(venue),
+        account_type=account_type,
+        base_currency=USD,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        oms_type=oms_type,
+    )
+    AccountFactory.register_calculated_account(venue)
+    exec_engine.register_client(client)
+    exec_engine.start()
+
+    strategy = Strategy()
+    strategy.register(
+        trader_id=trader_id,
+        portfolio=portfolio,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+    )
+    return clock, msgbus, cache, portfolio, exec_engine, risk_engine, strategy
+
+
+def _fill(
+    exec_engine,
+    risk_engine,
+    strategy,
+    clock,
+    instrument,
+    side: OrderSide,
+    quantity: int,
+    price: str,
+    commission: Money,
+    position_id: PositionId | None = None,
+    account_id: AccountId | None = None,
+):
+    order = strategy.order_factory.market(
+        instrument.id,
+        side,
+        Quantity.from_int(quantity),
+    )
+    submit_order = SubmitOrder(
+        trader_id=strategy.trader_id,
+        strategy_id=strategy.id,
+        position_id=None,
+        order=order,
+        command_id=UUID4(),
+        ts_init=0,
+    )
+    risk_engine.execute(submit_order)
+    exec_engine.process(TestEventStubs.order_submitted(order))
+    exec_engine.process(TestEventStubs.order_accepted(order))
+    fill = TestEventStubs.order_filled(
+        order,
+        instrument=instrument,
+        position_id=position_id,
+        account_id=account_id,
+        last_px=Price.from_str(price),
+        commission=commission,
+    )
+    exec_engine.process(fill)
+    return fill
+
+
+def _swap(position, pnl_change: Money, settled_change: Money) -> None:
+    position.apply_adjustment(
+        PositionAdjusted(
+            trader_id=position.trader_id,
+            strategy_id=position.strategy_id,
+            instrument_id=position.instrument_id,
+            position_id=position.id,
+            account_id=position.account_id,
+            adjustment_type=PositionAdjustmentType.SWAP_CHARGE,
+            quantity_change=None,
+            pnl_change=pnl_change,
+            reason=None,
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+            settled_change=settled_change,
+        ),
+    )
+
+
+def test_fill_bookings_flow_to_the_positions_account_book() -> None:
+    # A CAD-settled position on a USD account, zero fees, two swap charges of
+    # -1.64 and -0.55 USD, closed with a fill the account booked at -27.01 USD
+    # Arrange
+    clock, msgbus, cache, portfolio, exec_engine, risk_engine, strategy = _engine_stack(
+        "SIM",
+        AccountType.MARGIN,
+    )
+    cache.add_instrument(AUDCAD_SIM)
+    cache.add_instrument(USDCAD_SIM)
+    cache.add_quote_tick(TestDataStubs.quote_tick(USDCAD_SIM, 1.4400, 1.4400))
+    portfolio.update_account(TestEventStubs.margin_account_state())
+    account = cache.account(TestIdStubs.account_id())
+
+    closed_events = []
+    msgbus.subscribe(topic="events.position.*", handler=closed_events.append)
+
+    # Act: open a 10,000 short at 0.89577, zero commission
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDCAD_SIM,
+        OrderSide.SELL,
+        10_000,
+        "0.89577",
+        Money(0, CAD),
+    )
+
+    position = cache.positions_open()[0]
+    assert position.booked_pnl == Money(0, USD)
+    assert position.booked_commissions == Money(0, USD)
+
+    # Two swap charges, as the carry module applies them
+    _swap(position, Money("-2.16", CAD), Money("-1.64", USD))
+    _swap(position, Money("-0.72", CAD), Money("-0.55", USD))
+    cache.update_position(position)
+
+    # Close at 0.89966: trading PnL -38.90 CAD, booked -38.90 / 1.44 = -27.01 USD
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDCAD_SIM,
+        OrderSide.BUY,
+        10_000,
+        "0.89966",
+        Money(0, CAD),
+        position_id=position.id,
+    )
+
+    # Assert
+    position = cache.position(position.id)
+    assert position.is_closed
+    assert position.realized_pnl == Money("-41.78", CAD)
+    assert position.booked_pnl == Money("-29.20", USD)  # -27.01 - 2.19
+    assert position.booked_commissions == Money(0, USD)
+
+    # The account moved by what the manager booked for the fills
+    assert account.balance_total(USD) == Money("999972.99", USD)
+
+    # The carry module's settlement at the close moves the accrued sum
+    balance = account.balance(USD)
+    account.update_balances(
+        [
+            AccountBalance(
+                balance.total + position.accrued_carry,
+                balance.locked,
+                balance.free + position.accrued_carry,
+            ),
+        ],
+    )
+    assert account.balance_total(USD) == Money("999970.80", USD)
+
+    # The PositionClosed event carries the account book
+    assert closed_events[-1].booked_pnl == Money("-29.20", USD)
+    assert closed_events[-1].booked_commissions == Money(0, USD)
+
+    # The portfolio's account-currency read sums the account book, not a conversion
+    assert portfolio.realized_pnl(AUDCAD_SIM.id, account.id) == Money("-29.20", USD)
+
+    # The analyzer records the account-currency trade from the book
+    recorded = portfolio.analyzer.realized_pnls(USD)
+    assert recorded is not None
+    assert recorded.iloc[-1] == -29.20
+
+
+def test_flattening_fill_bringing_the_first_booking_books_the_accrued_carry() -> None:
+    # A CAD-settled 100 short on a USD account opened before any USD/CAD rate, so
+    # the account books nothing for the opening fill; a -5 CAD swap settles as
+    # -5 USD, and the close at 0.90000 is the first fill the account books
+    # Arrange
+    clock, msgbus, cache, portfolio, exec_engine, risk_engine, strategy = _engine_stack(
+        "SIM",
+        AccountType.MARGIN,
+    )
+    cache.add_instrument(AUDCAD_SIM)
+    cache.add_instrument(USDCAD_SIM)
+    portfolio.update_account(TestEventStubs.margin_account_state())
+    account = cache.account(TestIdStubs.account_id())
+
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDCAD_SIM,
+        OrderSide.SELL,
+        100,
+        "1.00000",
+        Money(0, CAD),
+    )
+    position = cache.positions_open()[0]
+    assert position.booked_pnl is None
+
+    cache.add_quote_tick(TestDataStubs.quote_tick(USDCAD_SIM, 1.0, 1.0))
+    _swap(position, Money(-5, CAD), Money(-5, USD))
+    cache.update_position(position)
+
+    # Act: trading PnL 100 x (1.00000 - 0.90000) = 10 CAD, booked 10 / 1.0 = 10 USD
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDCAD_SIM,
+        OrderSide.BUY,
+        100,
+        "0.90000",
+        Money(0, CAD),
+        position_id=position.id,
+    )
+
+    # Assert
+    position = cache.position(position.id)
+    assert position.is_closed
+    assert position.realized_pnl == Money(5, CAD)  # 10 - 5
+    assert position.booked_pnl == Money(5, USD)  # 10 booked at the close - 5 accrued
+    assert position.booked_commissions == Money(0, USD)
+
+    # The carry module's settlement at the close moves the accrued sum: 1,000,000 + 10 - 5
+    balance = account.balance(USD)
+    account.update_balances(
+        [
+            AccountBalance(
+                balance.total + position.accrued_carry,
+                balance.locked,
+                balance.free + position.accrued_carry,
+            ),
+        ],
+    )
+    assert account.balance_total(USD) == Money(1_000_005, USD)
+    assert portfolio.realized_pnl(AUDCAD_SIM.id, account.id) == Money(5, USD)
+
+
+def test_same_currency_close_records_one_analyzer_trade() -> None:
+    # A USD-settled position on a USD account: the account book and the native PnL are the
+    # same trade in the same currency
+    # Arrange
+    clock, msgbus, cache, portfolio, exec_engine, risk_engine, strategy = _engine_stack(
+        "SIM",
+        AccountType.MARGIN,
+    )
+    cache.add_instrument(AUDUSD_SIM)
+    portfolio.update_account(TestEventStubs.margin_account_state())
+    account = cache.account(TestIdStubs.account_id())
+
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDUSD_SIM,
+        OrderSide.BUY,
+        100,
+        "1.00000",
+        Money(0, USD),
+    )
+    position = cache.positions_open()[0]
+
+    # Act: close at 1.10000, PnL 100 x (1.10000 - 1.00000) = 10 USD
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDUSD_SIM,
+        OrderSide.SELL,
+        100,
+        "1.10000",
+        Money(0, USD),
+        position_id=position.id,
+    )
+
+    # Assert
+    assert account.balance_total(USD) == Money(1_000_010, USD)
+    assert portfolio.realized_pnl(AUDUSD_SIM.id, account.id) == Money(10, USD)
+    assert portfolio.analyzer.realized_pnls(USD).to_list() == [10.0]  # one trade of 10 USD
+
+
+def test_fill_bookings_include_converted_fees() -> None:
+    # Fees of 0.90 CAD at each fill booked as 0.68 USD at a fixed 1.3151
+    # Arrange
+    clock, msgbus, cache, portfolio, exec_engine, risk_engine, strategy = _engine_stack(
+        "SIM",
+        AccountType.MARGIN,
+    )
+    cache.add_instrument(AUDCAD_SIM)
+    cache.add_instrument(USDCAD_SIM)
+    cache.add_quote_tick(TestDataStubs.quote_tick(USDCAD_SIM, 1.3151, 1.3151))
+    portfolio.update_account(TestEventStubs.margin_account_state())
+    account = cache.account(TestIdStubs.account_id())
+
+    # Act
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDCAD_SIM,
+        OrderSide.SELL,
+        10_000,
+        "0.89577",
+        Money("0.90", CAD),
+    )
+
+    position = cache.positions_open()[0]
+    assert position.booked_pnl == Money("-0.68", USD)
+    assert position.booked_commissions == Money("0.68", USD)
+
+    _swap(position, Money("-2.16", CAD), Money("-1.64", USD))
+    _swap(position, Money("-0.72", CAD), Money("-0.55", USD))
+    cache.update_position(position)
+
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDCAD_SIM,
+        OrderSide.BUY,
+        10_000,
+        "0.89966",
+        Money("0.90", CAD),
+        position_id=position.id,
+    )
+
+    # Assert
+    position = cache.position(position.id)
+    assert position.booked_pnl == Money("-33.13", USD)  # -0.68 - 2.19 - 29.58 - 0.68
+    assert position.booked_commissions == Money("1.36", USD)
+    assert account.balance_total(USD) == Money("999969.06", USD)  # -0.68 - 29.58 - 0.68
+
+
+def test_flip_hands_the_closed_generation_the_booked_pnl_and_split_commission() -> None:
+    # A 0.10 short with accrued carry reversed by a 0.20 buy under NETTING
+    # Arrange
+    clock, msgbus, cache, portfolio, exec_engine, risk_engine, strategy = _engine_stack(
+        "SIM",
+        AccountType.MARGIN,
+        oms_type=OmsType.NETTING,
+    )
+    cache.add_instrument(AUDCAD_SIM)
+    cache.add_instrument(USDCAD_SIM)
+    cache.add_quote_tick(TestDataStubs.quote_tick(USDCAD_SIM, 1.4400, 1.4400))
+    portfolio.update_account(TestEventStubs.margin_account_state())
+
+    # Act: open the short and charge it
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDCAD_SIM,
+        OrderSide.SELL,
+        10_000,
+        "0.89577",
+        Money(0, CAD),
+    )
+    position = cache.positions_open()[0]
+    position_id = position.id
+    _swap(position, Money("-2.16", CAD), Money("-1.64", USD))
+    _swap(position, Money("-0.72", CAD), Money("-0.55", USD))
+    cache.update_position(position)
+
+    # Reverse with a 0.20 buy paying 2.88 CAD, booked as 2.88 / 1.44 = 2.00 USD: the flip
+    # closes the short and opens a long, each half of the fill (10,000 / 20,000) taking half
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDCAD_SIM,
+        OrderSide.BUY,
+        20_000,
+        "0.89966",
+        Money("2.88", CAD),
+    )
+
+    # Assert: the closed generation carries the PnL, the accrued carry and half the fee;
+    # unsplit, it would read -31.20 / 2.00 USD (whole fee) or -29.20 / 0 USD (none)
+    snapshots = cache.position_snapshots(position_id)
+    assert len(snapshots) == 1
+    closed = snapshots[0]
+    assert closed.is_closed
+    assert closed.realized_pnl == Money("-43.22", CAD)  # -38.90 - 1.44 - 2.88
+    assert closed.booked_pnl == Money("-30.20", USD)  # -27.01 - 1.00 - 2.19
+    assert closed.booked_commissions == Money("1.00", USD)  # 2.00 x 0.5
+
+    # The new long generation starts its own book with the other half of the fee;
+    # unsplit, it would read -2.00 / 2.00 USD (whole fee) or 0 / 0 USD (none)
+    new_position = cache.position(position_id)
+    assert new_position.is_open
+    assert new_position.side == PositionSide.LONG
+    assert new_position.accrued_carry is None
+    assert new_position.booked_pnl == Money("-1.00", USD)  # 0 - 1.00
+    assert new_position.booked_commissions == Money("1.00", USD)  # 2.00 - 1.00
+
+
+def test_frozen_account_leaves_no_account_book() -> None:
+    # A frozen account books nothing, so no book is kept
+    # Arrange
+    clock, msgbus, cache, portfolio, exec_engine, risk_engine, strategy = _engine_stack(
+        "SIM",
+        AccountType.MARGIN,
+    )
+    cache.add_instrument(AUDCAD_SIM)
+    # A frozen account is not registered as calculated
+    account = MarginAccount(TestEventStubs.margin_account_state(), calculate_account_state=False)
+    cache.add_account(account)
+
+    # Act
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AUDCAD_SIM,
+        OrderSide.SELL,
+        10_000,
+        "0.89577",
+        Money(0, CAD),
+    )
+
+    # Assert
+    position = cache.positions_open()[0]
+    assert position.booked_pnl is None
+    assert position.booked_commissions is None
+    assert account.balance_total(USD) == Money(1_000_000, USD)
+
+
+def test_cash_account_position_keeps_no_book() -> None:
+    # A cash account books cash flows, never a PnL book
+    # Arrange
+    clock, msgbus, cache, portfolio, exec_engine, risk_engine, strategy = _engine_stack(
+        "XNAS",
+        AccountType.CASH,
+    )
+    cache.add_instrument(AAPL_XNAS)
+    portfolio.update_account(
+        TestEventStubs.cash_account_state(account_id=AccountId("XNAS-001")),
+    )
+    account = cache.account(AccountId("XNAS-001"))
+
+    # Act: buy 2 at 100, sell 1 at 120
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AAPL_XNAS,
+        OrderSide.BUY,
+        2,
+        "100.00",
+        Money(0, USD),
+        account_id=account.id,
+    )
+    position = cache.positions_open()[0]
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AAPL_XNAS,
+        OrderSide.SELL,
+        1,
+        "120.00",
+        Money(0, USD),
+        position_id=position.id,
+        account_id=account.id,
+    )
+
+    # Assert
+    position = cache.positions_open()[0]
+    assert position.booked_pnl is None
+    assert position.booked_commissions is None
+    assert position.realized_pnl == Money("20.00", USD)
+    assert account.balance_total(USD) == Money("999920.00", USD)  # 1,000,000 - 200 + 120
+    assert portfolio.realized_pnl(AAPL_XNAS.id, account.id) == Money("20.00", USD)
+
+
+def test_margin_option_position_keeps_no_book() -> None:
+    # A margin account books an option's premium as a cash flow, never a PnL book
+    # Arrange
+    clock, msgbus, cache, portfolio, exec_engine, risk_engine, strategy = _engine_stack(
+        "OPRA",
+        AccountType.MARGIN,
+    )
+    cache.add_instrument(AAPL_OPTION)
+    portfolio.update_account(
+        TestEventStubs.margin_account_state(account_id=AccountId("OPRA-001")),
+    )
+    account = cache.account(AccountId("OPRA-001"))
+
+    # Act: buy 2 contracts at a premium of 1.00 (multiplier 100), sell 1 at 1.20
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AAPL_OPTION,
+        OrderSide.BUY,
+        2,
+        "1.00",
+        Money(0, USD),
+        account_id=account.id,
+    )
+    position = cache.positions_open()[0]
+    _fill(
+        exec_engine,
+        risk_engine,
+        strategy,
+        clock,
+        AAPL_OPTION,
+        OrderSide.SELL,
+        1,
+        "1.20",
+        Money(0, USD),
+        position_id=position.id,
+        account_id=account.id,
+    )
+
+    # Assert
+    position = cache.positions_open()[0]
+    assert position.booked_pnl is None
+    assert position.booked_commissions is None
+    assert position.realized_pnl == Money("20.00", USD)
+    assert account.balance_total(USD) == Money("999920.00", USD)  # 1,000,000 - 200 + 120
+    assert portfolio.realized_pnl(AAPL_OPTION.id, account.id) == Money("20.00", USD)

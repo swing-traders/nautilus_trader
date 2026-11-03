@@ -247,6 +247,7 @@ enum MarketStatusAction {
 enum PositionAdjustmentType {
     commission @0;
     funding @1;
+    swap @2;
 }
 
 enum ComponentState {

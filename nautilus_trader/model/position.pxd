@@ -41,6 +41,7 @@ cdef class Position:
     cdef Quantity _buy_qty
     cdef Quantity _sell_qty
     cdef dict _commissions
+    cdef dict _bookings
 
     cdef readonly TraderId trader_id
     """The trader ID associated with the position.\n\n:returns: `TraderId`"""
@@ -102,6 +103,14 @@ cdef class Position:
     """The current realized return for the position.\n\n:returns: `double`"""
     cdef readonly Money realized_pnl
     """The current realized PnL for the position (including commissions).\n\n:returns: `Money` or ``None``"""
+    cdef readonly Money unrealized_carry
+    """The carry accrued against the open position in the settlement currency, realized by the flattening fill.\n\n:returns: `Money`"""
+    cdef readonly Money accrued_carry
+    """The carry accrued in the account's base currency (``None`` until the first settled charge).\n\n:returns: `Money` or ``None``"""
+    cdef readonly Money booked_pnl
+    """The PnL the account booked for the position in its base currency (``None`` where the account books no PnL).\n\n:returns: `Money` or ``None``"""
+    cdef readonly Money booked_commissions
+    """The commissions the account booked for the position in its base currency (``None`` where the account books no PnL).\n\n:returns: `Money` or ``None``"""
 
     cpdef str info(self)
     cpdef dict to_dict(self)
@@ -128,6 +137,7 @@ cdef class Position:
 
     cpdef void apply(self, OrderFilled fill)
     cpdef void apply_adjustment(self, PositionAdjusted adjustment)
+    cpdef void apply_booked(self, TradeId trade_id, Money pnl, Money commission)
 
     cpdef Money notional_value(self, Price price, Currency target_currency=*, Price conversion_price=*)
     cpdef Money cross_notional_value(self, Price price, Price quote_price, Price base_price, Currency target_currency)

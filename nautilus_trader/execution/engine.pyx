@@ -1741,7 +1741,7 @@ cdef class ExecutionEngine(Component):
             for position in sorted(positions_open, key=lambda pos: pos.id.value)
         )
 
-    cpdef void _open_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type):
+    cpdef void _open_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type, tuple booking=None):
         if position is not None:
             try:
                 position._check_duplicate_trade_id(fill)
@@ -1755,6 +1755,12 @@ cdef class ExecutionEngine(Component):
             self._reopen_position(position, oms_type)
 
         position = Position(instrument, fill)
+
+        if booking is None:
+            booking = self._take_booking(fill)
+        if booking is not None:
+            position.apply_booked(fill.trade_id, booking[0], booking[1])
+
         self._cache.add_position(position, oms_type)
 
         cdef PositionOpened event = PositionOpened.create_c(
@@ -1784,13 +1790,18 @@ cdef class ExecutionEngine(Component):
         # Snapshot the closed position so the previous generation is retained
         self._cache.snapshot_position(position)
 
-    cpdef void _update_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type):
+    cpdef void _update_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type, tuple booking=None):
         try:
             position.apply(fill)
         except KeyError as e:
             # Protected against duplicate OrderFilled
             self._log.exception(f"Error on applying {fill!r} to {position!r}", e)
             return  # Not re-raising to avoid crashing engine
+
+        if booking is None:
+            booking = self._take_booking(fill)
+        if booking is not None:
+            position.apply_booked(fill.trade_id, booking[0], booking[1])
 
         self._cache.update_position(position)
 
@@ -1827,6 +1838,14 @@ cdef class ExecutionEngine(Component):
             and fill.last_qty._mem.raw > position.quantity._mem.raw
         )
 
+    cdef tuple _take_booking(self, OrderFilled fill):
+        # The account books a fill before the position applies it; the booking is taken once
+        cdef Account account = self._cache.account(fill.account_id)
+        if account is None:
+            return None
+
+        return account.take_booking(fill.trade_id)
+
     cpdef void _flip_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type):
         cdef Quantity difference = None
         if position.side == PositionSide.LONG or position.side == PositionSide.SHORT:
@@ -1839,6 +1858,16 @@ cdef class ExecutionEngine(Component):
         fill_percent: Decimal = position.quantity / fill.last_qty
         cdef Money commission1 = Money(fill.commission * fill_percent, fill.commission.currency)
         cdef Money commission2 = fill.commission - commission1
+
+        # The booked PnL closes the original generation; the booked commission splits as the fill's
+        cdef tuple booked = self._take_booking(fill)
+        cdef Money booked_commission1 = None
+        cdef tuple booking1 = None
+        cdef tuple booking2 = booked
+        if booked is not None and position.is_open_c():
+            booked_commission1 = Money(booked[1] * fill_percent, booked[1].currency)
+            booking1 = (booked[0], booked_commission1)
+            booking2 = (Money(0, booked[1].currency), booked[1] - booked_commission1)
 
         cdef OrderFilled fill_split1 = None
         if position.is_open_c():
@@ -1865,7 +1894,7 @@ cdef class ExecutionEngine(Component):
             )
 
             # Close original position
-            self._update_position(instrument, position, fill_split1, oms_type)
+            self._update_position(instrument, position, fill_split1, oms_type, booking=booking1)
 
             # Snapshot closed position before reusing ID (NETTING mode)
             if oms_type == OmsType.NETTING:
@@ -1914,7 +1943,7 @@ cdef class ExecutionEngine(Component):
             self._log.warning(f"Flipping position {fill_split2}")
 
         # Open flipped position
-        self._open_position(instrument, None, fill_split2, oms_type)
+        self._open_position(instrument, None, fill_split2, oms_type, booking=booking2)
 
     cpdef void _create_order_state_snapshot(self, Order order):
         if self.debug:

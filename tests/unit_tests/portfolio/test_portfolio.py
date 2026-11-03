@@ -42,7 +42,9 @@ from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import PositionAdjustmentType
 from nautilus_trader.model.events import AccountState
+from nautilus_trader.model.events.position import PositionAdjusted
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import StrategyId
@@ -4238,6 +4240,142 @@ class TestPortfolio:
         # equity[USD] = balances_total[USD] + mark_values[USD]
         expected = account.balances_total()[USD].as_decimal() + mark_values[USD].as_decimal()
         assert equity[USD].as_decimal() == expected
+
+    def test_equity_margin_account_includes_accrued_carry(self):
+        # Equity counts an open position's accrued carry, already in the account
+        # currency, and is unchanged while none is accrued
+        # Arrange
+        AccountFactory.register_calculated_account("SIM")
+
+        account_id = AccountId("SIM-001")
+        state = AccountState(
+            account_id=account_id,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            reported=True,
+            balances=[
+                AccountBalance(
+                    Money(100_000.00, USD),
+                    Money(0.00, USD),
+                    Money(100_000.00, USD),
+                ),
+            ],
+            margins=[],
+            info={},
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+        )
+        self.portfolio.update_account(state)
+
+        quote = TestDataStubs.quote_tick(
+            instrument=AUDUSD_SIM,
+            bid_price=0.80000,
+            ask_price=0.80010,
+        )
+        self.cache.add_quote_tick(quote)
+        self.portfolio.update_quote_tick(quote)
+
+        order = self.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        self.cache.add_order(order, position_id=None)
+        self.exec_engine.process(TestEventStubs.order_submitted(order, account_id=account_id))
+        self.exec_engine.process(TestEventStubs.order_accepted(order, account_id=account_id))
+
+        fill = TestEventStubs.order_filled(
+            order=order,
+            instrument=AUDUSD_SIM,
+            position_id=PositionId("P-LONG"),
+            last_px=Price.from_str("0.80000"),
+            commission=Money(0, USD),
+        )
+        self.exec_engine.process(fill)
+
+        position = Position(instrument=AUDUSD_SIM, fill=fill)
+        self.cache.add_position(position, OmsType.HEDGING)
+        self.portfolio.update_position(TestEventStubs.position_opened(position))
+
+        assert position.accrued_carry is None
+        assert self.portfolio.equity(SIM)[USD] == Money(100_000.00, USD)
+
+        # Act: charge a swap, as the carry module does
+        position.apply_adjustment(
+            PositionAdjusted(
+                trader_id=position.trader_id,
+                strategy_id=position.strategy_id,
+                instrument_id=position.instrument_id,
+                position_id=position.id,
+                account_id=position.account_id,
+                adjustment_type=PositionAdjustmentType.SWAP_CHARGE,
+                quantity_change=None,
+                pnl_change=Money("-2.19", USD),
+                reason=None,
+                event_id=UUID4(),
+                ts_event=0,
+                ts_init=0,
+                settled_change=Money("-2.19", USD),
+            ),
+        )
+        self.cache.update_position(position)
+
+        # Assert
+        assert position.accrued_carry == Money("-2.19", USD)
+        assert self.portfolio.equity(SIM)[USD] == Money(99_997.81, USD)
+
+    def test_update_position_adjusted_republishes_account_state(self):
+        # Arrange
+        AccountFactory.register_calculated_account("SIM")
+
+        account_id = AccountId("SIM-001")
+        state = AccountState(
+            account_id=account_id,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            reported=True,
+            balances=[
+                AccountBalance(
+                    Money(100_000.00, USD),
+                    Money(0.00, USD),
+                    Money(100_000.00, USD),
+                ),
+            ],
+            margins=[],
+            info={},
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+        )
+        self.portfolio.update_account(state)
+
+        received = []
+        self.msgbus.subscribe(topic=f"events.account.{account_id}", handler=received.append)
+
+        adjustment = PositionAdjusted(
+            trader_id=self.trader_id,
+            strategy_id=StrategyId("S-001"),
+            instrument_id=AUDUSD_SIM.id,
+            position_id=PositionId("P-LONG"),
+            account_id=account_id,
+            adjustment_type=PositionAdjustmentType.SWAP_CHARGE,
+            quantity_change=None,
+            pnl_change=Money("-2.19", USD),
+            reason=None,
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+            settled_change=Money("-2.19", USD),
+        )
+
+        # Act
+        self.msgbus.send(endpoint="Portfolio.update_position_adjusted", msg=adjustment)
+
+        # Assert
+        account = self.portfolio.account(SIM)
+        assert len(received) == 1
+        assert received[0] == account.last_event
 
     def test_mark_values_short_position_contributes_negatively(self):
         # Arrange

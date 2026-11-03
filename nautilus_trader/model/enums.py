@@ -417,6 +417,7 @@ if TYPE_CHECKING:
     class PositionAdjustmentType(Enum):
         COMMISSION = 1
         FUNDING = 2
+        SWAP_CHARGE = 3
 
     @unique
     class PositionSide(Enum):

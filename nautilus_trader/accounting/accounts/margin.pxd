@@ -55,6 +55,7 @@ cdef class MarginAccount(Account):
     cpdef Money margin_maint_for_currency(self, Currency currency)
     cpdef Money total_margin_init(self, Currency currency)
     cpdef Money total_margin_maint(self, Currency currency)
+    cpdef bint books_pnl(self, Instrument instrument)
 
 # -- COMMANDS -------------------------------------------------------------------------------------
 

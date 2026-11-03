@@ -46,6 +46,7 @@ cdef class Account:
 
         self._events: list[AccountState] = [event]  # `last_event_c()` guaranteed
         self._commissions: dict[Currency, Money] = {}
+        self._bookings: dict[TradeId, tuple[Money, Money]] = {}
         self._balances: dict[Currency, AccountBalance] = {}
         self._balances_starting: dict[Currency, Money] = {b.currency: b.total for b in event.balances}
 
@@ -349,6 +350,25 @@ cdef class Account:
 
         return self._commissions.get(currency)
 
+    cpdef bint books_pnl(self, Instrument instrument):
+        """
+        Return whether the account books a fill's PnL for the given instrument
+        (rather than a cash flow).
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument for the check.
+
+        Returns
+        -------
+        bool
+
+        """
+        Condition.not_none(instrument, "instrument")
+
+        return True
+
 # -- COMMANDS -------------------------------------------------------------------------------------
 
     cpdef void apply(self, AccountState event):
@@ -472,6 +492,46 @@ cdef class Account:
             retained_events.append(self._events[-1])
 
         self._events = retained_events
+
+    cpdef void record_booking(self, TradeId trade_id, Money pnl, Money commission):
+        """
+        Record the PnL and commission booked for a fill under its trade ID, in the
+        account's base currency, until the position takes them with `take_booking`.
+
+        Parameters
+        ----------
+        trade_id : TradeId
+            The trade match ID of the fill booked.
+        pnl : Money
+            The PnL booked for the fill.
+        commission : Money
+            The commission booked for the fill.
+
+        """
+        Condition.not_none(trade_id, "trade_id")
+        Condition.not_none(pnl, "pnl")
+        Condition.not_none(commission, "commission")
+
+        self._bookings[trade_id] = (pnl, commission)
+
+    cpdef tuple take_booking(self, TradeId trade_id):
+        """
+        Take the booking recorded for the given trade ID, removing it.
+
+        Parameters
+        ----------
+        trade_id : TradeId
+            The trade match ID of the fill booked.
+
+        Returns
+        -------
+        tuple[Money, Money] or ``None``
+            The booked PnL and commission, or ``None`` when nothing was booked.
+
+        """
+        Condition.not_none(trade_id, "trade_id")
+
+        return self._bookings.pop(trade_id, None)
 
 # -- CALCULATIONS ---------------------------------------------------------------------------------
 

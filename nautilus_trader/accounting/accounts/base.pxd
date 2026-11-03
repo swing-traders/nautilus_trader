@@ -22,6 +22,7 @@ from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.events.order cimport OrderFilled
 from nautilus_trader.model.identifiers cimport AccountId
 from nautilus_trader.model.identifiers cimport InstrumentId
+from nautilus_trader.model.identifiers cimport TradeId
 from nautilus_trader.model.instruments.base cimport Instrument
 from nautilus_trader.model.objects cimport AccountBalance
 from nautilus_trader.model.objects cimport Currency
@@ -36,6 +37,7 @@ cdef class Account:
     cdef dict _balances
     cdef dict _balances_starting
     cdef dict _commissions
+    cdef dict _bookings
 
     cdef readonly AccountId id
     """The accounts ID.\n\n:returns: `AccountId`"""
@@ -68,6 +70,7 @@ cdef class Account:
     cpdef Money balance_free(self, Currency currency=*)
     cpdef Money balance_locked(self, Currency currency=*)
     cpdef Money commission(self, Currency currency)
+    cpdef bint books_pnl(self, Instrument instrument)
 
 # -- COMMANDS --------------------------------------------------------------------------------------
 
@@ -75,6 +78,8 @@ cdef class Account:
     cpdef void update_balances(self, list balances)
     cpdef void update_commissions(self, Money commission)
     cpdef void purge_account_events(self, uint64_t ts_now, uint64_t lookback_secs=*)
+    cpdef void record_booking(self, TradeId trade_id, Money pnl, Money commission)
+    cpdef tuple take_booking(self, TradeId trade_id)
 
 # -- CALCULATIONS ----------------------------------------------------------------------------------
 
