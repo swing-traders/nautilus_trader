@@ -39,6 +39,7 @@ from nautilus_trader.core.rust.model cimport InstrumentClass
 from nautilus_trader.core.rust.model cimport LiquiditySide
 from nautilus_trader.core.rust.model cimport MoneyRaw
 from nautilus_trader.core.rust.model cimport OrderSide
+from nautilus_trader.core.rust.model cimport OrderType
 from nautilus_trader.core.rust.model cimport PriceType
 from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.events.order cimport OrderFilled
@@ -487,6 +488,49 @@ cdef class MarginAccount(Account):
 
         """
         return self._margin_model.margin_currency(instrument)
+
+    cpdef bint reserves_untriggered(self, Instrument instrument):
+        """
+        If the venue holds margin for a conditional order of the instrument before it triggers:
+        the margin model's declaration where the account's margin is valued from exposures.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument of the order.
+
+        Returns
+        -------
+        bool
+
+        """
+        return not self.margin_from_exposure or self._margin_model.reserves_untriggered(instrument)
+
+    cpdef bint checks_at_execution(self, Instrument instrument, OrderType order_type, OrderSide order_side):
+        """
+        If the venue admits an order of the given type and side against this account's free
+        margin when it first executes: the margin model's declaration where the account's margin
+        is valued from exposures.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument of the order.
+        order_type : OrderType
+            The order's type.
+        order_side : OrderSide
+            The order's side.
+
+        Returns
+        -------
+        bool
+
+        """
+        return self.margin_from_exposure and self._margin_model.checks_at_execution(
+            instrument,
+            order_type,
+            order_side,
+        )
 
     cpdef bint books_pnl(self, Instrument instrument):
         # The account books a fill's PnL for every class but the premium ones, whose

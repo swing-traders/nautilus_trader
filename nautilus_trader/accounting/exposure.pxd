@@ -41,5 +41,7 @@ cdef class Exposure:
     """The average open price of the net position (``None`` when flat).\n\n:returns: `Price` or ``None``"""
 
 
-cpdef tuple order_entry(Order order)
-cpdef list order_entries(list orders)
+cpdef bint is_untriggered(Order order)
+cpdef tuple entry_at(Order order, bint reserves_untriggered, Quantity quantity, Quantity leaves, Price price)
+cpdef tuple order_entry(Order order, bint reserves_untriggered=*)
+cpdef list order_entries(list orders, bint reserves_untriggered=*)

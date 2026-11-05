@@ -19,6 +19,7 @@ from nautilus_trader.accounting.exposure cimport Exposure
 from nautilus_trader.core.rust.model cimport AccountType
 from nautilus_trader.core.rust.model cimport LiquiditySide
 from nautilus_trader.core.rust.model cimport OrderSide
+from nautilus_trader.core.rust.model cimport OrderType
 from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.events.order cimport OrderFilled
 from nautilus_trader.model.identifiers cimport AccountId
@@ -82,6 +83,8 @@ cdef class Account:
     cpdef Money total_margin_init(self, Currency currency)
     cpdef Money total_margin_maint(self, Currency currency)
     cpdef Currency margin_currency(self, Instrument instrument)
+    cpdef bint reserves_untriggered(self, Instrument instrument)
+    cpdef bint checks_at_execution(self, Instrument instrument, OrderType order_type, OrderSide order_side)
 
 # -- COMMANDS --------------------------------------------------------------------------------------
 

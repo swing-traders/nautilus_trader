@@ -343,10 +343,32 @@ cdef class SimulatedExchange:
 
     cdef void _process_trading_command(self, TradingCommand command)
     cdef void _process_modify_submitted_order(self, ModifyOrder command)
-    cdef Exposure _exposure_with(self, InstrumentId instrument_id, ClientOrderId excluded, tuple entry)
+    cdef bint _reserves_untriggered(self, InstrumentId instrument_id)
+    cdef Exposure _exposure_with(
+        self,
+        InstrumentId instrument_id,
+        ClientOrderId excluded,
+        tuple entry,
+        Position absorbing=*,
+        Quantity absorbed=*,
+    )
     cdef bint _admits_order(self, OrderMatchingEngine matching_engine, Order order)
     cdef bint _admits_modify(self, ModifyOrder command)
-    cdef str _free_margin_refusal(self, Account account, InstrumentId instrument_id, Exposure exposure)
+    cdef str _execution_refusal(
+        self,
+        Account account,
+        Order order,
+        Price price,
+        Position absorbing,
+        Quantity absorbed,
+    )
+    cdef str _free_margin_refusal(
+        self,
+        Account account,
+        InstrumentId instrument_id,
+        Exposure exposure,
+        Exposure released=*,
+    )
     cdef void _generate_order_modify_rejected(
         self,
         TraderId trader_id,
@@ -401,6 +423,8 @@ cdef class OrderMatchingEngine:
     cdef dict[InstrumentId, BarType] _execution_bar_types
     cdef dict[BarType, object] _execution_bar_deltas
     cdef dict[ClientOrderId, Quantity] _cached_filled_qty
+    cdef SimulatedExchange _exchange
+    cdef set[ClientOrderId] _admitted_executions
 
     cdef readonly Venue venue
     """The venue for the matching engine.\n\n:returns: `Venue`"""
@@ -589,6 +613,7 @@ cdef class OrderMatchingEngine:
 
     cdef VenueOrderId _get_venue_order_id(self, Order order)
     cdef PositionId _get_position_id(self, Order order, bint generate=*)
+    cdef bint _admits_execution(self, Order order)
     cdef PositionId _generate_venue_position_id(self)
     cdef VenueOrderId _generate_venue_order_id(self)
     cdef TradeId _generate_trade_id(self, uint64_t ts_init)

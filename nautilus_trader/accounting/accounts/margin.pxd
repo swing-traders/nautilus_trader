@@ -17,6 +17,8 @@ from decimal import Decimal
 
 from nautilus_trader.accounting.accounts.base cimport Account
 from nautilus_trader.accounting.margin_models cimport MarginModel
+from nautilus_trader.core.rust.model cimport OrderSide
+from nautilus_trader.core.rust.model cimport OrderType
 from nautilus_trader.core.rust.model cimport PositionSide
 from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.identifiers cimport InstrumentId
@@ -48,6 +50,8 @@ cdef class MarginAccount(Account):
     cpdef Money margin_init_for_currency(self, Currency currency)
     cpdef Money margin_maint_for_currency(self, Currency currency)
     cpdef bint books_pnl(self, Instrument instrument)
+    cpdef bint reserves_untriggered(self, Instrument instrument)
+    cpdef bint checks_at_execution(self, Instrument instrument, OrderType order_type, OrderSide order_side)
 
 # -- COMMANDS -------------------------------------------------------------------------------------
 

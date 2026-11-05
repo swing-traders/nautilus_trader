@@ -535,7 +535,12 @@ cdef class AccountsManager:
         # The instrument's balance sums to the venue's held margin: maintenance holds the
         # positions' figure, initial what the orders add on top of it
         cdef Price mark = self._cache.price(instrument.id, PriceType.MARK)
-        cdef Exposure held_exposure = Exposure(instrument, positions_open, order_entries(orders_open), mark)
+        cdef Exposure held_exposure = Exposure(
+            instrument,
+            positions_open,
+            order_entries(orders_open, account.reserves_untriggered(instrument)),
+            mark,
+        )
         cdef Exposure maint_exposure = Exposure(instrument, positions_open, [], mark)
 
         held = self._calculate_exposure_margin(account, instrument, held_exposure, MarginBasis.HELD)

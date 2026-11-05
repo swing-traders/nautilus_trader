@@ -48,6 +48,8 @@ from libc.stdint cimport uint32_t
 from libc.stdint cimport uint64_t
 
 from nautilus_trader.accounting.accounts.base cimport Account
+from nautilus_trader.accounting.exposure cimport entry_at
+from nautilus_trader.accounting.exposure cimport is_untriggered
 from nautilus_trader.accounting.exposure cimport order_entries
 from nautilus_trader.accounting.margin_models cimport LeveragedMarginModel
 from nautilus_trader.accounting.margin_models cimport MarginModel
@@ -3203,6 +3205,7 @@ cdef class SimulatedExchange:
             settlement_prices=self.settlement_prices,
         )
 
+        matching_engine._exchange = self
         self._matching_engines[instrument.id] = matching_engine
 
         self._update_next_instrument_expiration(matching_engine)
@@ -3441,7 +3444,8 @@ cdef class SimulatedExchange:
         """
         Return the instrument's exposure with the given order appended as its own kind: a market
         order at the best ask for a buy and the best bid for a sell, any other order at its price
-        or trigger.
+        or trigger, and an untriggered conditional order not at all where the venue holds nothing
+        for it.
 
         Parameters
         ----------
@@ -3474,10 +3478,27 @@ cdef class SimulatedExchange:
         return self._exposure_with(
             instrument_id,
             order.client_order_id,
-            (order.order_type, order.side, order.quantity, order.leaves_qty, price),
+            entry_at(
+                order,
+                self._reserves_untriggered(instrument_id),
+                order.quantity,
+                order.leaves_qty,
+                price,
+            ),
         )
 
-    cdef Exposure _exposure_with(self, InstrumentId instrument_id, ClientOrderId excluded, tuple entry):
+    cdef bint _reserves_untriggered(self, InstrumentId instrument_id):
+        cdef Account account = self.cache.account_for_venue(self.id)
+        return account is None or account.reserves_untriggered(self.instruments[instrument_id])
+
+    cdef Exposure _exposure_with(
+        self,
+        InstrumentId instrument_id,
+        ClientOrderId excluded,
+        tuple entry,
+        Position absorbing=None,
+        Quantity absorbed=None,
+    ):
         cdef list positions_open = self.cache.positions_open(
             venue=self.id,
             instrument_id=instrument_id,
@@ -3495,7 +3516,7 @@ cdef class SimulatedExchange:
             )
             if o.client_order_id != excluded
         ]
-        cdef list entries = order_entries(orders)
+        cdef list entries = order_entries(orders, self._reserves_untriggered(instrument_id))
         if entry is not None:
             entries.append(entry)
 
@@ -3504,6 +3525,8 @@ cdef class SimulatedExchange:
             positions_open,
             entries,
             self.cache.price(instrument_id, PriceType.MARK),
+            absorbing,
+            absorbed,
         )
 
 # -- COMMANDS -------------------------------------------------------------------------------------
@@ -4033,6 +4056,9 @@ cdef class SimulatedExchange:
         if account is None or not account.checks_free_margin or order.is_reduce_only:
             return True
 
+        if is_untriggered(order) and not self._reserves_untriggered(order.instrument_id):
+            return True  # Holds nothing until it triggers, when it is judged
+
         cdef Exposure exposure = self.exposure_after(order.instrument_id, order)
         if exposure.orders[-1][4] is None:
             return True  # Not priceable here: the matching engine answers the order
@@ -4070,11 +4096,17 @@ cdef class SimulatedExchange:
             quantity._mem.raw - order.filled_qty._mem.raw,
             quantity._mem.precision,
         )
-        cdef Exposure exposure = self._exposure_with(
-            order.instrument_id,
-            order.client_order_id,
-            (order.order_type, order.side, quantity, leaves, price),
+        cdef tuple entry = entry_at(
+            order,
+            self._reserves_untriggered(order.instrument_id),
+            quantity,
+            leaves,
+            price,
         )
+        if entry is None:
+            return True  # Holds nothing until it triggers, when it is judged
+
+        cdef Exposure exposure = self._exposure_with(order.instrument_id, order.client_order_id, entry)
         cdef str reason = self._free_margin_refusal(account, order.instrument_id, exposure)
         if reason is None:
             return True
@@ -4090,7 +4122,39 @@ cdef class SimulatedExchange:
         )
         return False
 
-    cdef str _free_margin_refusal(self, Account account, InstrumentId instrument_id, Exposure exposure):
+    cdef str _execution_refusal(
+        self,
+        Account account,
+        Order order,
+        Price price,
+        Position absorbing,
+        Quantity absorbed,
+    ):
+        # The order's whole leaves are judged as a market order of its side at the given price,
+        # the free margin credited with what the part a position absorbs releases
+        cdef Exposure exposure = self._exposure_with(
+            order.instrument_id,
+            order.client_order_id,
+            (OrderType.MARKET, order.side, order.quantity, order.leaves_qty, price),
+        )
+        cdef Exposure released = None
+        if absorbing is not None:
+            released = self._exposure_with(
+                order.instrument_id,
+                order.client_order_id,
+                None,
+                absorbing,
+                absorbed,
+            )
+        return self._free_margin_refusal(account, order.instrument_id, exposure, released)
+
+    cdef str _free_margin_refusal(
+        self,
+        Account account,
+        InstrumentId instrument_id,
+        Exposure exposure,
+        Exposure released=None,
+    ):
         # An order adding margin beyond the account's free margin is refused; one adding none
         # never is, whatever the sign of free margin
         held = self._portfolio.exposure_margin(self.id, instrument_id, exposure, MarginBasis.HELD)
@@ -4116,6 +4180,13 @@ cdef class SimulatedExchange:
             - account.total_margin_init(currency).as_decimal()
             - account.total_margin_maint(currency).as_decimal()
         )
+        if released is not None:
+            free += standing - self._portfolio.exposure_margin(
+                self.id,
+                instrument_id,
+                released,
+                MarginBasis.HELD,
+            ).as_decimal()
         if increment <= free:
             return None
 
@@ -4387,6 +4458,8 @@ cdef class OrderMatchingEngine:
         self._execution_bar_types: dict[InstrumentId, BarType]  =  {}
         self._execution_bar_deltas: dict[BarType, timedelta]  =  {}
         self._cached_filled_qty: dict[ClientOrderId, Quantity] = {}
+        self._exchange = None
+        self._admitted_executions: set[ClientOrderId] = set()
 
         # Market
         self._core = MatchingCore(
@@ -4455,6 +4528,7 @@ cdef class OrderMatchingEngine:
         self._execution_bar_types.clear()
         self._execution_bar_deltas.clear()
         self._cached_filled_qty.clear()
+        self._admitted_executions.clear()
         self._core.reset()
         self._target_bid = 0
         self._target_ask = 0
@@ -5825,6 +5899,9 @@ cdef class OrderMatchingEngine:
                 )
                 return  # Invalid price
 
+            if not self._admits_execution(order):
+                return  # Rejected
+
             self.accept_order(order)
             self._generate_order_triggered(order)
 
@@ -5867,6 +5944,9 @@ cdef class OrderMatchingEngine:
                     f"ask={self._core.ask}",
                 )
                 return  # Invalid price
+
+            if not self._admits_execution(order):
+                return  # Rejected
 
             self.accept_order(order)
             self._generate_order_triggered(order)
@@ -6223,6 +6303,7 @@ cdef class OrderMatchingEngine:
             if order.is_closed_c():
                 self._core.delete_order(order)
                 self._cached_filled_qty.pop(order.client_order_id, None)
+                self._admitted_executions.discard(order.client_order_id)
                 continue
 
             # Check expiry
@@ -6230,6 +6311,7 @@ cdef class OrderMatchingEngine:
                 if order.expire_time_ns > 0 and timestamp_ns >= order.expire_time_ns:
                     self._core.delete_order(order)
                     self._cached_filled_qty.pop(order.client_order_id, None)
+                    self._admitted_executions.discard(order.client_order_id)
                     self.expire_order(order)
                     continue
 
@@ -6569,6 +6651,7 @@ cdef class OrderMatchingEngine:
         if order.is_closed_c():
             self._core.delete_order(order)
             self._cached_filled_qty.pop(order.client_order_id, None)
+            self._admitted_executions.discard(order.client_order_id)
             return
 
         # Convert quote-denominated quantity at fill time for trigger-style market
@@ -6598,6 +6681,9 @@ cdef class OrderMatchingEngine:
             )
             self.cancel_order(order)
             return  # Order canceled
+
+        if not self._admits_execution(order):
+            return  # Rejected
 
         order.liquidity_side = LiquiditySide.TAKER
         cdef list[tuple[Price, Quantity]] fills = self.determine_market_fills_with_simulation(order)
@@ -6976,6 +7062,7 @@ cdef class OrderMatchingEngine:
         if order.is_closed_c():
             self._core.delete_order(order)
             self._cached_filled_qty.pop(order.client_order_id, None)
+            self._admitted_executions.discard(order.client_order_id)
             return
 
         # Convert quote-denominated quantity at fill time for orders that entered
@@ -7035,6 +7122,9 @@ cdef class OrderMatchingEngine:
             )
             self.cancel_order(order)
             return  # Order canceled
+
+        if not self._admits_execution(order):
+            return  # Rejected
 
         cdef list[tuple[Price, Quantity]] fills = self.determine_limit_fills_with_simulation(order)
 
@@ -8204,6 +8294,7 @@ cdef class OrderMatchingEngine:
                 self._core.delete_order(order)
                 if order.is_closed_c():
                     self._cached_filled_qty.pop(order.client_order_id, None)
+                    self._admitted_executions.discard(order.client_order_id)
                 return
 
             leaves_qty = Quantity.from_raw_c(order.quantity._mem.raw - cached_filled_qty._mem.raw, size_prec)
@@ -8247,6 +8338,7 @@ cdef class OrderMatchingEngine:
             self._core.delete_order(order)
             if order.is_closed_c():
                 self._cached_filled_qty.pop(order.client_order_id, None)
+                self._admitted_executions.discard(order.client_order_id)
 
         if not self._support_contingent_orders:
             return
@@ -8386,6 +8478,55 @@ cdef class OrderMatchingEngine:
 
         return venue_order_id
 
+    cdef bint _admits_execution(self, Order order):
+        # An order its venue held nothing for while it rested is judged once, whole, before its
+        # first execution determines, consumes or applies anything; reduce-only orders never are
+        if (
+            self._exchange is None
+            or order.is_reduce_only
+            or order.client_order_id in self._admitted_executions
+        ):
+            return True
+
+        cdef Account account = self.cache.account_for_venue(self.venue)
+        if account is None or not account.checks_at_execution(self.instrument, order.order_type, order.side):
+            return True
+
+        cdef Price price = order.get_triggered_price_c()
+        if price is None:
+            if order.side == OrderSide.BUY:
+                price = self._core.ask
+            else:
+                price = self._core.bid
+
+        cdef PositionId position_id
+        if self.oms_type == OmsType.HEDGING:
+            position_id = self.cache.position_id(order.client_order_id)
+        else:
+            position_id = self._get_position_id(order)
+
+        cdef Position absorbing = None
+        cdef Quantity absorbed = None
+        if position_id is not None:
+            absorbing = self.cache.position(position_id)
+        if absorbing is not None and absorbing.is_open_c() and absorbing.is_opposite_side(order.side):
+            absorbed = Quantity.from_raw_c(
+                min(order.leaves_qty._mem.raw, absorbing.quantity._mem.raw),
+                self._size_prec,
+            )
+        else:
+            absorbing = None
+
+        cdef str reason = self._exchange._execution_refusal(account, order, price, absorbing, absorbed)
+        if reason is None:
+            self._admitted_executions.add(order.client_order_id)
+            return True
+
+        self._core.delete_order(order)
+        self._cached_filled_qty.pop(order.client_order_id, None)
+        self._generate_order_rejected(order, reason)
+        return False
+
     cdef PositionId _get_position_id(self, Order order, bint generate=True):
         cdef PositionId position_id
         if self.oms_type == OmsType.HEDGING:
@@ -8483,6 +8624,7 @@ cdef class OrderMatchingEngine:
 
         self._core.delete_order(order)
         self._cached_filled_qty.pop(order.client_order_id, None)
+        self._admitted_executions.discard(order.client_order_id)
         self._queue_ahead.pop(order.client_order_id, None)
 
         self._generate_order_canceled(order, venue_order_id=self._get_venue_order_id(order))
@@ -8598,6 +8740,9 @@ cdef class OrderMatchingEngine:
         cdef Price trigger_price = order.trigger_price
         cdef Price price = order.price
 
+        if not self._admits_execution(order):
+            return  # Rejected
+
         self._generate_order_triggered(order)
 
         # Check for immediate fill (which would fill passively as a maker)
@@ -8614,6 +8759,7 @@ cdef class OrderMatchingEngine:
             # Would be liquidity taker
             self._core.delete_order(order)
             self._cached_filled_qty.pop(order.client_order_id, None)
+            self._admitted_executions.discard(order.client_order_id)
             self._generate_order_rejected(
                 order,
                 f"POST_ONLY {order.type_string_c()} {order.side_string_c()} order "

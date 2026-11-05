@@ -65,6 +65,7 @@ from nautilus_trader.model.events.order cimport OrderEvent
 from nautilus_trader.model.events.order cimport OrderExpired
 from nautilus_trader.model.events.order cimport OrderFilled
 from nautilus_trader.model.events.order cimport OrderRejected
+from nautilus_trader.model.events.order cimport OrderTriggered
 from nautilus_trader.model.events.order cimport OrderUpdated
 from nautilus_trader.model.events.position cimport PositionAdjusted
 from nautilus_trader.model.events.position cimport PositionEvent
@@ -585,7 +586,10 @@ cdef class Portfolio(PortfolioFacade):
         if not account.calculate_account_state:
             return  # Nothing to calculate
 
-        if not isinstance(event, _UPDATE_ORDER_EVENTS):
+        # An exposure-valued account holds a triggered stop-limit as the limit it places
+        if not isinstance(event, _UPDATE_ORDER_EVENTS) and not (
+            account.margin_from_exposure and isinstance(event, OrderTriggered)
+        ):
             return  # No change to account state
 
         cdef Order order = self._cache.order(event.client_order_id)
@@ -600,7 +604,11 @@ cdef class Portfolio(PortfolioFacade):
             )
             return  # No order found
 
-        if isinstance(event, OrderRejected) and order.order_type != OrderType.STOP_LIMIT:
+        if (
+            isinstance(event, OrderRejected)
+            and order.order_type != OrderType.STOP_LIMIT
+            and not account.margin_from_exposure
+        ):
             return  # No change to account state
 
         if self._debug:
@@ -876,7 +884,7 @@ cdef class Portfolio(PortfolioFacade):
         if event.account_id is None:
             return  # No account assigned for event
 
-        if not isinstance(event, _UPDATE_ORDER_EVENTS):
+        if not isinstance(event, _UPDATE_ORDER_EVENTS) and not isinstance(event, OrderTriggered):
             return  # No change to account state
 
         if isinstance(event, OrderFilled):
@@ -885,6 +893,9 @@ cdef class Portfolio(PortfolioFacade):
         cdef Account account = self._cache.account(event.account_id)
         if account is None:
             return  # No account registered
+
+        if isinstance(event, OrderTriggered) and not account.margin_from_exposure:
+            return  # No change to account state
 
         cdef AccountState account_state = account.last_event_c()
 

@@ -27,6 +27,7 @@ from nautilus_trader.core import nautilus_pyo3
 from libc.stdint cimport uint8_t
 
 from nautilus_trader.core.rust.model cimport OrderSide
+from nautilus_trader.core.rust.model cimport OrderType
 from nautilus_trader.core.rust.model cimport PositionSide
 from nautilus_trader.model.events.position cimport PositionAdjusted
 from nautilus_trader.model.instruments.base cimport Instrument
@@ -62,6 +63,11 @@ cdef class Exposure:
         The open orders as `(OrderType, OrderSide, quantity, leaves, price)` tuples.
     mark : Price, optional
         The instrument's mark price.
+    absorbing : Position, optional
+        An open position counted reduced by `absorbed`, as an opposite fill of that quantity
+        would leave it.
+    absorbed : Quantity, optional
+        The quantity `absorbing` is reduced by.
 
     """
 
@@ -71,9 +77,12 @@ cdef class Exposure:
         list positions_open not None,
         list orders not None,
         Price mark = None,
+        Position absorbing = None,
+        Quantity absorbed = None,
     ) -> None:
         cdef:
             Position position
+            Quantity quantity
             list decorated = []
             int idx
         for idx, position in enumerate(positions_open):
@@ -87,9 +96,19 @@ cdef class Exposure:
             if not position.is_open_c():
                 continue
             avg_px_open = Decimal(f"{position.avg_px_open:.{position.price_precision}f}")
-            legs.append((position.signed_decimal_qty(), avg_px_open, position.ts_opened))
-            quantity_raw[position.side] += position.quantity._mem.raw
-            notional[position.side] += Fraction(position.quantity.as_decimal()) * _average_open_price(position)
+            quantity = position.quantity
+            signed_qty = position.signed_decimal_qty()
+            if absorbing is not None and position.id == absorbing.id:
+                quantity = Quantity.from_raw_c(quantity._mem.raw - absorbed._mem.raw, quantity._mem.precision)
+                if quantity.is_zero():
+                    continue
+                if position.side == PositionSide.LONG:
+                    signed_qty = quantity.as_decimal()
+                else:
+                    signed_qty = -quantity.as_decimal()
+            legs.append((signed_qty, avg_px_open, position.ts_opened))
+            quantity_raw[position.side] += quantity._mem.raw
+            notional[position.side] += Fraction(quantity.as_decimal()) * _average_open_price(position)
 
         cdef uint8_t size_precision = instrument.size_precision
         if quantity_raw[PositionSide.LONG]:
@@ -182,15 +201,77 @@ cdef double _adjusted(double held, PositionAdjusted adjustment, int precision):
     return held
 
 
-cpdef tuple order_entry(Order order):
+cpdef bint is_untriggered(Order order):
     """
-    Return the order as an exposure entry, or ``None`` for an order that carries no margin: one
-    not open, reduce-only, or without a price or trigger.
+    Return whether the order is a conditional order whose trigger has not been reached: one that
+    declares a trigger price, and has not declared itself triggered.
+
+    Parameters
+    ----------
+    order : Order
+        The order to check.
+
+    Returns
+    -------
+    bool
+
+    """
+    # A trailing order declares its trigger price before the trail has set one
+    return hasattr(order, "trigger_price") and not getattr(order, "is_triggered", False)
+
+
+cpdef tuple entry_at(
+    Order order,
+    bint reserves_untriggered,
+    Quantity quantity,
+    Quantity leaves,
+    Price price,
+):
+    """
+    Return the order as an exposure entry with the given quantity, leaves and price.
+
+    Where the venue holds nothing for an untriggered conditional order the entry is ``None``
+    until it triggers, and a triggered one with a limit price rests as a LIMIT.
 
     Parameters
     ----------
     order : Order
         The order for the entry.
+    reserves_untriggered : bool
+        If the venue holds margin for a conditional order before it triggers.
+    quantity : Quantity
+        The order's quantity.
+    leaves : Quantity
+        The order's working quantity.
+    price : Price
+        The order's price.
+
+    Returns
+    -------
+    tuple[OrderType, OrderSide, Quantity, Quantity, Price] or ``None``
+
+    """
+    if reserves_untriggered:
+        return (order.order_type, order.side, quantity, leaves, price)
+    if is_untriggered(order):
+        return None
+    if hasattr(order, "trigger_price") and order.has_price_c():
+        return (OrderType.LIMIT, order.side, quantity, leaves, price)
+    return (order.order_type, order.side, quantity, leaves, price)
+
+
+cpdef tuple order_entry(Order order, bint reserves_untriggered=True):
+    """
+    Return the order as an exposure entry, or ``None`` for an order that carries no margin: one
+    not open, reduce-only, without a price or trigger, or untriggered where the venue holds
+    nothing for it.
+
+    Parameters
+    ----------
+    order : Order
+        The order for the entry.
+    reserves_untriggered : bool, default True
+        If the venue holds margin for a conditional order before it triggers.
 
     Returns
     -------
@@ -199,16 +280,16 @@ cpdef tuple order_entry(Order order):
     """
     if not order.is_open_c() or order.is_reduce_only or (not order.has_price_c() and not order.has_trigger_price_c()):
         return None
-    return (
-        order.order_type,
-        order.side,
+    return entry_at(
+        order,
+        reserves_untriggered,
         order.quantity,
         order.leaves_qty,
         order.price if order.has_price_c() else order.trigger_price,
     )
 
 
-cpdef list order_entries(list orders):
+cpdef list order_entries(list orders, bint reserves_untriggered=True):
     """
     Return the exposure entries of the given orders that carry margin.
 
@@ -216,6 +297,8 @@ cpdef list order_entries(list orders):
     ----------
     orders : list[Order]
         The orders for the entries.
+    reserves_untriggered : bool, default True
+        If the venue holds margin for a conditional order before it triggers.
 
     Returns
     -------
@@ -226,7 +309,7 @@ cpdef list order_entries(list orders):
     cdef Order order
     cdef tuple entry
     for order in orders:
-        entry = order_entry(order)
+        entry = order_entry(order, reserves_untriggered)
         if entry is not None:
             entries.append(entry)
     return entries

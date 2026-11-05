@@ -16,6 +16,8 @@
 from decimal import Decimal
 
 from nautilus_trader.accounting.exposure cimport Exposure
+from nautilus_trader.core.rust.model cimport OrderSide
+from nautilus_trader.core.rust.model cimport OrderType
 from nautilus_trader.core.rust.model cimport PositionSide
 from nautilus_trader.model.instruments.base cimport Instrument
 from nautilus_trader.model.objects cimport Currency
@@ -26,6 +28,8 @@ from nautilus_trader.model.objects cimport Quantity
 
 cdef class MarginModel:
     cpdef Currency margin_currency(self, Instrument instrument)
+    cpdef bint reserves_untriggered(self, Instrument instrument)
+    cpdef bint checks_at_execution(self, Instrument instrument, OrderType order_type, OrderSide order_side)
 
     cpdef Money calculate_exposure_margin(
         self,

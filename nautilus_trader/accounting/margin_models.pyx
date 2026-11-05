@@ -17,6 +17,8 @@ from decimal import Decimal
 
 from nautilus_trader.accounting.exposure cimport Exposure
 from nautilus_trader.core.correctness cimport Condition
+from nautilus_trader.core.rust.model cimport OrderSide
+from nautilus_trader.core.rust.model cimport OrderType
 from nautilus_trader.core.rust.model cimport PositionSide
 from nautilus_trader.core.rust.model cimport PriceType
 from nautilus_trader.model.instruments.base cimport Instrument
@@ -106,6 +108,43 @@ cdef class MarginModel:
         if instrument.is_inverse:
             return instrument.get_base_currency()
         return instrument.quote_currency
+
+    cpdef bint reserves_untriggered(self, Instrument instrument):
+        """
+        If the venue holds margin for a conditional order of the instrument before it triggers.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument of the order.
+
+        Returns
+        -------
+        bool
+
+        """
+        return True
+
+    cpdef bint checks_at_execution(self, Instrument instrument, OrderType order_type, OrderSide order_side):
+        """
+        If the venue admits an order of the given type and side against the account's free
+        margin when it first executes, rejecting it whole where the margin cannot fund it.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument of the order.
+        order_type : OrderType
+            The order's type.
+        order_side : OrderSide
+            The order's side.
+
+        Returns
+        -------
+        bool
+
+        """
+        return False
 
     cpdef Money calculate_exposure_margin(
         self,
