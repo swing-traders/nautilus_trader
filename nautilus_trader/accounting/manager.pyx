@@ -15,6 +15,7 @@
 
 from decimal import Decimal
 
+from nautilus_trader.accounting.exposure import MarginBasis
 from nautilus_trader.core import nautilus_pyo3
 
 from libc.stdint cimport uint64_t
@@ -22,6 +23,8 @@ from libc.stdint cimport uint64_t
 from nautilus_trader.accounting.accounts.base cimport Account
 from nautilus_trader.accounting.accounts.cash cimport CashAccount
 from nautilus_trader.accounting.accounts.margin cimport MarginAccount
+from nautilus_trader.accounting.exposure cimport Exposure
+from nautilus_trader.accounting.exposure cimport order_entries
 from nautilus_trader.cache.base cimport CacheFacade
 from nautilus_trader.common.component cimport Clock
 from nautilus_trader.common.component cimport Logger
@@ -40,6 +43,7 @@ from nautilus_trader.model.instruments.base cimport Instrument
 from nautilus_trader.model.objects cimport AccountBalance
 from nautilus_trader.model.objects cimport Currency
 from nautilus_trader.model.objects cimport Money
+from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 from nautilus_trader.model.orders.base cimport Order
 from nautilus_trader.model.position cimport Position
@@ -85,10 +89,8 @@ cdef class AccountsManager:
         AccountState
 
         """
-        cdef list margins = []
-        if account.is_margin_account:
-            margins = list(account.margins().values())
-            margins.extend(account.account_margins().values())
+        cdef list margins = list(account.margins().values())
+        margins.extend(account.account_margins().values())
 
         return AccountState(
             account_id=account.id,
@@ -199,6 +201,23 @@ cdef class AccountsManager:
         Condition.not_none(account, "account")
         Condition.not_none(instrument, "instrument")
         Condition.not_none(orders_open, "orders_open")
+
+        cdef list positions_open
+        if account.margin_from_exposure:
+            positions_open = self._cache.positions_open(
+                venue=None,  # Faster query filtering
+                instrument_id=instrument.id,
+                strategy_id=None,
+                side=PositionSide.NO_POSITION_SIDE,
+                account_id=account.id,
+            )
+            return self._update_margin_from_exposure(
+                account,
+                instrument,
+                orders_open,
+                positions_open,
+                ts_event,
+            )
 
         if account.is_cash_account:
             return self._update_balance_locked(
@@ -361,10 +380,11 @@ cdef class AccountsManager:
 
     cpdef bint update_positions(
         self,
-        MarginAccount account,
+        Account account,
         Instrument instrument,
         list positions_open,
         uint64_t ts_event,
+        list orders_open = None,
     ):
         """
         Update the maintenance (position) margin.
@@ -389,6 +409,9 @@ cdef class AccountsManager:
             The open positions for the update.
         ts_event : uint64_t
             UNIX timestamp (nanoseconds) when the account event occurred.
+        orders_open : list[Order], optional
+            The open orders for the update, required for an account whose margin is valued
+            from exposures.
 
         Returns
         -------
@@ -400,6 +423,25 @@ cdef class AccountsManager:
         Condition.not_none(instrument, "instrument")
         Condition.not_none(positions_open, "positions_open")
 
+        if account.margin_from_exposure:
+            Condition.not_none(orders_open, "orders_open")
+            return self._update_margin_from_exposure(
+                account,
+                instrument,
+                orders_open,
+                positions_open,
+                ts_event,
+            )
+
+        return self._update_margin_maint(<MarginAccount?>account, instrument, positions_open, ts_event)
+
+    cdef bint _update_margin_maint(
+        self,
+        MarginAccount account,
+        Instrument instrument,
+        list positions_open,
+        uint64_t ts_event,
+    ):
         cdef Position position
         cdef list decorated = []
         cdef int idx
@@ -481,6 +523,86 @@ cdef class AccountsManager:
         self._log.info(f"{instrument.id} margin_maint={margin_maint_money.to_formatted_str()}")
 
         return True
+
+    cdef bint _update_margin_from_exposure(
+        self,
+        Account account,
+        Instrument instrument,
+        list orders_open,
+        list positions_open,
+        uint64_t ts_event,
+    ):
+        # The instrument's balance sums to the venue's held margin: maintenance holds the
+        # positions' figure, initial what the orders add on top of it
+        cdef Price mark = self._cache.price(instrument.id, PriceType.MARK)
+        cdef Exposure held_exposure = Exposure(instrument, positions_open, order_entries(orders_open), mark)
+        cdef Exposure maint_exposure = Exposure(instrument, positions_open, [], mark)
+
+        held = self._calculate_exposure_margin(account, instrument, held_exposure, MarginBasis.HELD)
+        maint = self._calculate_exposure_margin(account, instrument, maint_exposure, MarginBasis.MAINTENANCE)
+        if held is None or maint is None:
+            self._log.debug(
+                f"Cannot calculate margin: "
+                f"insufficient data for "
+                f"{account.margin_currency(instrument)}/{account.base_currency}"
+            )
+            return False
+
+        cdef Money margin_maint = maint
+        cdef Money margin_init = Money(held.as_decimal() - margin_maint.as_decimal(), margin_maint.currency)
+        account.update_margin_maint(instrument.id, margin_maint)
+        account.update_margin_init(instrument.id, margin_init)
+
+        self._log.info(f"{instrument.id} margin_init={margin_init.to_formatted_str()}")
+        self._log.info(f"{instrument.id} margin_maint={margin_maint.to_formatted_str()}")
+
+        return True
+
+    cdef object _calculate_exposure_margin(
+        self,
+        Account account,
+        Instrument instrument,
+        Exposure exposure,
+        basis,
+    ):
+        # Answers ``None`` where a conversion rate is not yet available
+        cdef Currency margin_currency = account.margin_currency(instrument)
+        cdef tuple xrates = self._margin_xrates(account, instrument, margin_currency)
+        if xrates is None:
+            return None
+
+        cdef Currency to_currency = account.base_currency if account.base_currency is not None else margin_currency
+        return account.calculate_exposure_margin(
+            instrument,
+            exposure,
+            basis,
+            to_currency,
+            xrates[0],
+            xrates[1],
+        )
+
+    cdef tuple _margin_xrates(self, Account account, Instrument instrument, Currency margin_currency):
+        # The rates a buy's and a sell's margin convert at, from the margin currency into the
+        # account currency, at the account's declared price types
+        if margin_currency is None or account.base_currency is None or margin_currency == account.base_currency:
+            return (Decimal(1), Decimal(1))
+
+        xrate_buy = self._cache.get_xrate_decimal(
+            venue=instrument.id.venue,
+            from_currency=margin_currency,
+            to_currency=account.base_currency,
+            price_type=account.buy_price_type,
+        )
+        xrate_sell = self._cache.get_xrate_decimal(
+            venue=instrument.id.venue,
+            from_currency=margin_currency,
+            to_currency=account.base_currency,
+            price_type=account.sell_price_type,
+        )
+        if xrate_buy is None or xrate_sell is None:
+            return None
+
+        return (xrate_buy, xrate_sell)
 
     cdef bint _update_balance_single_currency(
         self,

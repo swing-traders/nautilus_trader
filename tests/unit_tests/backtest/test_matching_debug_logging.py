@@ -78,7 +78,7 @@ try:
 finally:
     engine.dispose()
     flush_logger()
-print(f"REPR_COUNT={ObservedTick.representations}")
+print(f"REPR_COUNT={ObservedTick.representations}", file=sys.stderr)
 """
     environment = dict(os.environ)
     environment.pop("NAUTILUS_LOG", None)
@@ -101,7 +101,7 @@ print(f"REPR_COUNT={ObservedTick.representations}")
     )
     repr_count = next(
         line.removeprefix("REPR_COUNT=")
-        for line in result.stdout.splitlines()
+        for line in result.stderr.splitlines()
         if line.startswith("REPR_COUNT=")
     )
     assert repr_count == str(expected)

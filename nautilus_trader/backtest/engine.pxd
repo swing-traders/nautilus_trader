@@ -19,6 +19,7 @@ from libc.stdint cimport uint32_t
 from libc.stdint cimport uint64_t
 
 from nautilus_trader.accounting.accounts.base cimport Account
+from nautilus_trader.accounting.exposure cimport Exposure
 from nautilus_trader.accounting.margin_models cimport MarginModel
 from nautilus_trader.backtest.execution_client cimport BacktestExecClient
 from nautilus_trader.backtest.models cimport FeeModel
@@ -284,6 +285,7 @@ cdef class SimulatedExchange:
     """Optional instrument_id -> settlement price for instrument expiration."""
 
     cdef dict[InstrumentId, OrderMatchingEngine] _matching_engines
+    cdef object _portfolio
     cdef bint _has_next_instrument_expiration
     cdef uint64_t _next_instrument_expiration_ns
     cdef object _message_queue
@@ -310,6 +312,8 @@ cdef class SimulatedExchange:
     cpdef list[Order] get_open_bid_orders(self, InstrumentId instrument_id=*)
     cpdef list[Order] get_open_ask_orders(self, InstrumentId instrument_id=*)
     cpdef Account get_account(self)
+    cpdef Exposure exposure(self, InstrumentId instrument_id)
+    cpdef Exposure exposure_after(self, InstrumentId instrument_id, Order order)
 
 # -- COMMANDS -------------------------------------------------------------------------------------
 
@@ -339,6 +343,10 @@ cdef class SimulatedExchange:
 
     cdef void _process_trading_command(self, TradingCommand command)
     cdef void _process_modify_submitted_order(self, ModifyOrder command)
+    cdef Exposure _exposure_with(self, InstrumentId instrument_id, ClientOrderId excluded, tuple entry)
+    cdef bint _admits_order(self, OrderMatchingEngine matching_engine, Order order)
+    cdef bint _admits_modify(self, ModifyOrder command)
+    cdef str _free_margin_refusal(self, Account account, InstrumentId instrument_id, Exposure exposure)
     cdef void _generate_order_modify_rejected(
         self,
         TraderId trader_id,

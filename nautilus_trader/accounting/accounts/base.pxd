@@ -15,6 +15,7 @@
 
 from libc.stdint cimport uint64_t
 
+from nautilus_trader.accounting.exposure cimport Exposure
 from nautilus_trader.core.rust.model cimport AccountType
 from nautilus_trader.core.rust.model cimport LiquiditySide
 from nautilus_trader.core.rust.model cimport OrderSide
@@ -26,6 +27,7 @@ from nautilus_trader.model.identifiers cimport TradeId
 from nautilus_trader.model.instruments.base cimport Instrument
 from nautilus_trader.model.objects cimport AccountBalance
 from nautilus_trader.model.objects cimport Currency
+from nautilus_trader.model.objects cimport MarginBalance
 from nautilus_trader.model.objects cimport Money
 from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
@@ -71,6 +73,15 @@ cdef class Account:
     cpdef Money balance_locked(self, Currency currency=*)
     cpdef Money commission(self, Currency currency)
     cpdef bint books_pnl(self, Instrument instrument)
+    cpdef dict margins(self)
+    cpdef dict margins_init(self)
+    cpdef dict margins_maint(self)
+    cpdef dict account_margins(self)
+    cpdef Money margin_init(self, InstrumentId instrument_id)
+    cpdef Money margin_maint(self, InstrumentId instrument_id)
+    cpdef Money total_margin_init(self, Currency currency)
+    cpdef Money total_margin_maint(self, Currency currency)
+    cpdef Currency margin_currency(self, Instrument instrument)
 
 # -- COMMANDS --------------------------------------------------------------------------------------
 
@@ -80,6 +91,8 @@ cdef class Account:
     cpdef void purge_account_events(self, uint64_t ts_now, uint64_t lookback_secs=*)
     cpdef void record_booking(self, TradeId trade_id, Money pnl, Money commission)
     cpdef tuple take_booking(self, TradeId trade_id)
+    cpdef void update_margin_init(self, InstrumentId instrument_id, Money margin_init)
+    cpdef void update_margin_maint(self, InstrumentId instrument_id, Money margin_maint)
 
 # -- CALCULATIONS ----------------------------------------------------------------------------------
 
@@ -100,6 +113,17 @@ cdef class Account:
         Instrument instrument,
         OrderFilled fill,
         Position position=*,
+    )
+
+    cpdef Money calculate_exposure_margin(
+        self,
+        Instrument instrument,
+        Exposure exposure,
+        basis,
+        Currency to_currency,
+        xrate_buy,
+        xrate_sell,
+        bint use_quote_for_inverse=*,
     )
 
     cpdef Money balance_impact(

@@ -39,22 +39,14 @@ cdef class MarginAccount(Account):
 
 # -- QUERIES --------------------------------------------------------------------------------------
 
-    cpdef dict margins(self)
-    cpdef dict margins_init(self)
-    cpdef dict margins_maint(self)
-    cpdef dict account_margins(self)
     cpdef dict account_margins_init(self)
     cpdef dict account_margins_maint(self)
     cpdef dict leverages(self)
     cpdef object leverage(self, InstrumentId instrument_id)
-    cpdef Money margin_init(self, InstrumentId instrument_id)
-    cpdef Money margin_maint(self, InstrumentId instrument_id)
     cpdef MarginBalance margin(self, InstrumentId instrument_id)
     cpdef MarginBalance margin_for_currency(self, Currency currency)
     cpdef Money margin_init_for_currency(self, Currency currency)
     cpdef Money margin_maint_for_currency(self, Currency currency)
-    cpdef Money total_margin_init(self, Currency currency)
-    cpdef Money total_margin_maint(self, Currency currency)
     cpdef bint books_pnl(self, Instrument instrument)
 
 # -- COMMANDS -------------------------------------------------------------------------------------
@@ -62,8 +54,6 @@ cdef class MarginAccount(Account):
     cpdef void set_default_leverage(self, leverage: Decimal)
     cpdef void set_leverage(self, InstrumentId instrument_id, leverage: Decimal)
     cpdef void set_margin_model(self, MarginModel margin_model)
-    cpdef void update_margin_init(self, InstrumentId instrument_id, Money margin_init)
-    cpdef void update_margin_maint(self, InstrumentId instrument_id, Money margin_maint)
     cpdef void update_margin(self, MarginBalance margin)
     cpdef void clear_margin_init(self, InstrumentId instrument_id)
     cpdef void clear_margin_maint(self, InstrumentId instrument_id)

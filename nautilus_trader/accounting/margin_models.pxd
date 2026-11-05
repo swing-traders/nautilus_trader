@@ -15,14 +15,30 @@
 
 from decimal import Decimal
 
+from nautilus_trader.accounting.exposure cimport Exposure
 from nautilus_trader.core.rust.model cimport PositionSide
 from nautilus_trader.model.instruments.base cimport Instrument
+from nautilus_trader.model.objects cimport Currency
 from nautilus_trader.model.objects cimport Money
 from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 
 
 cdef class MarginModel:
+    cpdef Currency margin_currency(self, Instrument instrument)
+
+    cpdef Money calculate_exposure_margin(
+        self,
+        Instrument instrument,
+        Exposure exposure,
+        basis,
+        leverage,
+        Currency to_currency,
+        xrate_buy,
+        xrate_sell,
+        bint use_quote_for_inverse=*,
+    )
+
     cpdef Money calculate_margin_init(
         self,
         Instrument instrument,

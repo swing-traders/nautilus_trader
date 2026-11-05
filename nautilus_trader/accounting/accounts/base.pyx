@@ -21,8 +21,10 @@ from libc.stdint cimport uint64_t
 
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.correctness cimport Condition
+from nautilus_trader.accounting.exposure cimport Exposure
 from nautilus_trader.core.rust.model cimport AccountType
 from nautilus_trader.core.rust.model cimport OrderSide
+from nautilus_trader.core.rust.model cimport PriceType
 from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.functions cimport account_type_to_str
 from nautilus_trader.model.instruments.base cimport Instrument
@@ -369,6 +371,178 @@ cdef class Account:
 
         return True
 
+    @property
+    def checks_free_margin(self):
+        """
+        If the venue refuses an order whose margin exceeds this account's free margin.
+
+        Returns
+        -------
+        bool
+
+        """
+        return False
+
+    @property
+    def margin_from_exposure(self):
+        """
+        If this account's margin is valued from each instrument's whole exposure.
+
+        Returns
+        -------
+        bool
+
+        """
+        return False
+
+    @property
+    def buy_price_type(self):
+        """
+        The price a buy's margin converts into the account currency at.
+
+        Returns
+        -------
+        PriceType
+
+        """
+        return PriceType.BID
+
+    @property
+    def sell_price_type(self):
+        """
+        The price a sell's margin converts into the account currency at.
+
+        Returns
+        -------
+        PriceType
+
+        """
+        return PriceType.ASK
+
+    cpdef dict margins(self):
+        """
+        Return the per-instrument margin balances for the account.
+
+        Returns
+        -------
+        dict[InstrumentId, MarginBalance]
+
+        """
+        return {}
+
+    cpdef dict margins_init(self):
+        """
+        Return the per-instrument initial (order) margins for the account.
+
+        Returns
+        -------
+        dict[InstrumentId, Money]
+
+        """
+        return {}
+
+    cpdef dict margins_maint(self):
+        """
+        Return the per-instrument maintenance (position) margins for the account.
+
+        Returns
+        -------
+        dict[InstrumentId, Money]
+
+        """
+        return {}
+
+    cpdef dict account_margins(self):
+        """
+        Return the account-wide margin balances keyed by collateral currency.
+
+        Returns
+        -------
+        dict[Currency, MarginBalance]
+
+        """
+        return {}
+
+    cpdef Money margin_init(self, InstrumentId instrument_id):
+        """
+        Return the current initial (order) margin for the given instrument.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the query.
+
+        Returns
+        -------
+        Money or ``None``
+
+        """
+        return None
+
+    cpdef Money margin_maint(self, InstrumentId instrument_id):
+        """
+        Return the current maintenance (position) margin for the given instrument.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the query.
+
+        Returns
+        -------
+        Money or ``None``
+
+        """
+        return None
+
+    cpdef Money total_margin_init(self, Currency currency):
+        """
+        Return the total initial margin reserved in the given currency.
+
+        Parameters
+        ----------
+        currency : Currency
+            The currency to total.
+
+        Returns
+        -------
+        Money or ``None``
+
+        """
+        return None
+
+    cpdef Money total_margin_maint(self, Currency currency):
+        """
+        Return the total maintenance margin reserved in the given currency.
+
+        Parameters
+        ----------
+        currency : Currency
+            The currency to total.
+
+        Returns
+        -------
+        Money or ``None``
+
+        """
+        return None
+
+    cpdef Currency margin_currency(self, Instrument instrument):
+        """
+        Return the currency the instrument's margin is stated in.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument for the margin.
+
+        Returns
+        -------
+        Currency or ``None``
+
+        """
+        return None
+
 # -- COMMANDS -------------------------------------------------------------------------------------
 
     cpdef void apply(self, AccountState event):
@@ -533,6 +707,34 @@ cdef class Account:
 
         return self._bookings.pop(trade_id, None)
 
+    cpdef void update_margin_init(self, InstrumentId instrument_id, Money margin_init):
+        """
+        Update the initial (order) margin for the given instrument.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the update.
+        margin_init : Money
+            The current initial (order) margin for the instrument.
+
+        """
+        pass  # The base account holds no margin
+
+    cpdef void update_margin_maint(self, InstrumentId instrument_id, Money margin_maint):
+        """
+        Update the maintenance (position) margin for the given instrument.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the update.
+        margin_maint : Money
+            The current maintenance (position) margin for the instrument.
+
+        """
+        pass  # The base account holds no margin
+
 # -- CALCULATIONS ---------------------------------------------------------------------------------
 
     cpdef bint is_unleveraged(self, InstrumentId instrument_id):
@@ -571,6 +773,43 @@ cdef class Account:
         Position position: Position | None = None,
     ):
         raise NotImplementedError("method `calculate_pnls` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef Money calculate_exposure_margin(
+        self,
+        Instrument instrument,
+        Exposure exposure,
+        basis,
+        Currency to_currency,
+        xrate_buy,
+        xrate_sell,
+        bint use_quote_for_inverse=False,
+    ):
+        """
+        Calculate the margin of an instrument's exposure in `to_currency`.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument for the calculation.
+        exposure : Exposure
+            The positions, open orders and mark to value.
+        basis : MarginBasis
+            ``HELD`` for positions and orders, ``MAINTENANCE`` for positions alone.
+        to_currency : Currency
+            The currency of the figure.
+        xrate_buy : Decimal
+            The rate a buy's margin converts at.
+        xrate_sell : Decimal
+            The rate a sell's margin converts at.
+        use_quote_for_inverse : bool, default False
+            If inverse instrument calculations use quote currency (instead of base).
+
+        Returns
+        -------
+        Money or ``None``
+
+        """
+        return None
 
     cpdef Money balance_impact(
         self,

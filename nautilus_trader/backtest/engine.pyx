@@ -25,6 +25,7 @@ import cython
 import pandas as pd
 
 from nautilus_trader.accounting.error import AccountError
+from nautilus_trader.accounting.exposure import MarginBasis
 from nautilus_trader.backtest.results import BacktestResult
 from nautilus_trader.common.component import is_logging_pyo3
 from nautilus_trader.common.config import InvalidConfiguration
@@ -47,6 +48,7 @@ from libc.stdint cimport uint32_t
 from libc.stdint cimport uint64_t
 
 from nautilus_trader.accounting.accounts.base cimport Account
+from nautilus_trader.accounting.exposure cimport order_entries
 from nautilus_trader.accounting.margin_models cimport LeveragedMarginModel
 from nautilus_trader.accounting.margin_models cimport MarginModel
 from nautilus_trader.backtest.data_client cimport BacktestDataClient
@@ -3014,6 +3016,8 @@ cdef class SimulatedExchange:
         self.fee_model = fee_model
         self.latency_model = latency_model
 
+        self._portfolio = portfolio
+
         # Load modules
         self.modules = []
         for module in modules:
@@ -3392,6 +3396,94 @@ cdef class SimulatedExchange:
         Condition.not_none(self.exec_client, "self.exec_client")
 
         return self.exec_client.get_account()
+
+    cpdef Exposure exposure(self, InstrumentId instrument_id):
+        """
+        Return the instrument's exposure at this venue: its open positions, its open orders that
+        carry margin, and its mark.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument for the exposure.
+
+        Returns
+        -------
+        Exposure
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        return self._exposure_with(instrument_id, None, None)
+
+    cpdef Exposure exposure_after(self, InstrumentId instrument_id, Order order):
+        """
+        Return the instrument's exposure with the given order appended as its own kind: a market
+        order at the best ask for a buy and the best bid for a sell, any other order at its price
+        or trigger.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument for the exposure.
+        order : Order
+            The order to append.
+
+        Returns
+        -------
+        Exposure
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+        Condition.not_none(order, "order")
+
+        cdef Price price
+        if order.order_type == OrderType.MARKET:
+            if order.side == OrderSide.BUY:
+                price = self.best_ask_price(instrument_id)
+            else:
+                price = self.best_bid_price(instrument_id)
+        elif order.has_price_c():
+            price = order.price
+        elif order.has_trigger_price_c():
+            price = order.trigger_price
+        else:
+            price = None
+
+        return self._exposure_with(
+            instrument_id,
+            order.client_order_id,
+            (order.order_type, order.side, order.quantity, order.leaves_qty, price),
+        )
+
+    cdef Exposure _exposure_with(self, InstrumentId instrument_id, ClientOrderId excluded, tuple entry):
+        cdef list positions_open = self.cache.positions_open(
+            venue=self.id,
+            instrument_id=instrument_id,
+            strategy_id=None,
+            side=PositionSide.NO_POSITION_SIDE,
+            account_id=None,
+        )
+        cdef list orders = [
+            o for o in self.cache.orders_open(
+                venue=self.id,
+                instrument_id=instrument_id,
+                strategy_id=None,
+                side=OrderSide.NO_ORDER_SIDE,
+                account_id=None,
+            )
+            if o.client_order_id != excluded
+        ]
+        cdef list entries = order_entries(orders)
+        if entry is not None:
+            entries.append(entry)
+
+        return Exposure(
+            self.instruments[instrument_id],
+            positions_open,
+            entries,
+            self.cache.price(instrument_id, PriceType.MARK),
+        )
 
 # -- COMMANDS -------------------------------------------------------------------------------------
 
@@ -3885,14 +3977,19 @@ cdef class SimulatedExchange:
             Order order
             list[Order] orders
         if isinstance(command, SubmitOrder):
-            matching_engine.process_order(command.order, self.exec_client.account_id)
+            if self._admits_order(matching_engine, command.order):
+                matching_engine.process_order(command.order, self.exec_client.account_id)
         elif isinstance(command, SubmitOrderList):
             for order in command.order_list.orders:
                 matching_engine = self._matching_engines.get(order.instrument_id)
                 if matching_engine is None:
                     raise RuntimeError(f"Cannot process command: no matching engine for {order.instrument_id}")
-                matching_engine.process_order(order, self.exec_client.account_id)
+                if self._admits_order(matching_engine, order):
+                    matching_engine.process_order(order, self.exec_client.account_id)
         elif isinstance(command, ModifyOrder):
+            if not self._admits_modify(command):
+                return
+
             # Check if order is in SUBMITTED status or PENDING_UPDATE with previous SUBMITTED status
             # (bracket orders not yet at matching engine)
             order = self.cache.order(command.client_order_id)
@@ -3909,6 +4006,102 @@ cdef class SimulatedExchange:
             matching_engine.process_cancel_all(command, self.exec_client.account_id)
         elif isinstance(command, BatchCancelOrders):
             matching_engine.process_batch_cancel(command, self.exec_client.account_id)
+
+    cdef bint _admits_order(self, OrderMatchingEngine matching_engine, Order order):
+        cdef Account account = self.get_account()
+        if account is None or not account.checks_free_margin or order.is_reduce_only:
+            return True
+
+        cdef Exposure exposure = self.exposure_after(order.instrument_id, order)
+        if exposure.orders[-1][4] is None:
+            return True  # Not priceable here: the matching engine answers the order
+
+        cdef str reason = self._free_margin_refusal(account, order.instrument_id, exposure)
+        if reason is None:
+            return True
+
+        matching_engine._account_ids[order.trader_id] = self.exec_client.account_id
+        matching_engine._generate_order_rejected(order, reason)
+        return False
+
+    cdef bint _admits_modify(self, ModifyOrder command):
+        cdef Account account = self.get_account()
+        if account is None or not account.checks_free_margin:
+            return True
+
+        cdef Order order = self.cache.order(command.client_order_id)
+        if order is None or order.is_reduce_only:
+            return True
+
+        cdef Price price
+        if order.has_price_c():
+            price = command.price if command.price is not None else order.price
+        elif order.has_trigger_price_c():
+            price = command.trigger_price if command.trigger_price is not None else order.trigger_price
+        else:
+            return True
+
+        cdef Quantity quantity = command.quantity if command.quantity is not None else order.quantity
+        if quantity._mem.raw < order.filled_qty._mem.raw:
+            return True  # The matching engine answers a quantity below what has filled
+
+        cdef Quantity leaves = Quantity.from_raw_c(
+            quantity._mem.raw - order.filled_qty._mem.raw,
+            quantity._mem.precision,
+        )
+        cdef Exposure exposure = self._exposure_with(
+            order.instrument_id,
+            order.client_order_id,
+            (order.order_type, order.side, quantity, leaves, price),
+        )
+        cdef str reason = self._free_margin_refusal(account, order.instrument_id, exposure)
+        if reason is None:
+            return True
+
+        self._generate_order_modify_rejected(
+            command.trader_id,
+            command.strategy_id,
+            command.instrument_id,
+            command.client_order_id,
+            command.venue_order_id,
+            reason,
+            self.exec_client.account_id,
+        )
+        return False
+
+    cdef str _free_margin_refusal(self, Account account, InstrumentId instrument_id, Exposure exposure):
+        # An order adding margin beyond the account's free margin is refused; one adding none
+        # never is, whatever the sign of free margin
+        held = self._portfolio.exposure_margin(self.id, instrument_id, exposure, MarginBasis.HELD)
+        if held is None:
+            return None
+
+        cdef Currency currency = held.currency
+        standing = Decimal(0)
+        cdef Money margin = account.margin_init(instrument_id)
+        if margin is not None:
+            standing += margin.as_decimal()
+        margin = account.margin_maint(instrument_id)
+        if margin is not None:
+            standing += margin.as_decimal()
+
+        increment = held.as_decimal() - standing
+        if increment <= 0:
+            return None
+
+        cdef Money equity = self._portfolio.equity(self.id, account.id).get(currency)
+        free = (
+            (equity.as_decimal() if equity is not None else Decimal(0))
+            - account.total_margin_init(currency).as_decimal()
+            - account.total_margin_maint(currency).as_decimal()
+        )
+        if increment <= free:
+            return None
+
+        return (
+            f"INSUFFICIENT_FREE_MARGIN: "
+            f"increment {Money(increment, currency)}, free {Money(free, currency)}"
+        )
 
     cdef void _process_modify_submitted_order(self, ModifyOrder command):
         cdef Order order = self.cache.order(command.client_order_id)

@@ -41,6 +41,7 @@ from nautilus_trader.portfolio.config import PortfolioConfig
 from libc.stdint cimport uint64_t
 
 from nautilus_trader.accounting.accounts.base cimport Account
+from nautilus_trader.accounting.exposure cimport Exposure
 from nautilus_trader.accounting.factory cimport AccountFactory
 from nautilus_trader.accounting.manager cimport AccountsManager
 from nautilus_trader.cache.base cimport CacheFacade
@@ -211,6 +212,10 @@ cdef class Portfolio(PortfolioFacade):
         else:
             self._msgbus.subscribe(topic="data.quotes.*", handler=self.update_quote_tick, priority=10)
 
+        # A margin held in another currency than the account's moves with the rate, in every
+        # price mode
+        self._msgbus.subscribe(topic="data.quotes.*", handler=self.revalue_margin, priority=10)
+
         if config.bar_updates:
             self._msgbus.subscribe(topic="data.bars.*EXTERNAL", handler=self.update_bar, priority=10)
 
@@ -375,6 +380,11 @@ cdef class Portfolio(PortfolioFacade):
                 realized_pnl = self.realized_pnl(instrument_id, account_id)
                 unrealized_pnl = self.unrealized_pnl(instrument_id, price=None, account_id=account_id)
 
+                if account.margin_from_exposure:
+                    if not self._update_exposure_margins(account, instrument):
+                        self._add_pending_xrate(instrument.id)
+                    continue
+
                 if account.type != AccountType.MARGIN:
                     continue
 
@@ -423,6 +433,66 @@ cdef class Portfolio(PortfolioFacade):
                     xrate=(tick.bid_price.as_double() + tick.ask_price.as_double()) / 2.0,
                     instrument_id=tick.instrument_id,
                 )
+
+    cpdef void revalue_margin(self, QuoteTick tick):
+        """
+        Re-write the margin of every open exposure held in another currency than its account's,
+        where the tick's instrument quotes either currency.
+
+        Parameters
+        ----------
+        tick : QuoteTick
+            The quote tick to revalue with.
+
+        """
+        Condition.not_none(tick, "tick")
+
+        cdef:
+            Account account
+            Instrument tick_instrument
+            Instrument instrument
+            Currency margin_currency
+            set quoted = None
+            set instrument_ids
+            InstrumentId instrument_id
+            Position position
+            Order order
+        for account in self._cache.accounts():
+            if not account.margin_from_exposure or account.base_currency is None:
+                continue
+
+            if quoted is None:
+                tick_instrument = self._cache.instrument(tick.instrument_id)
+                if tick_instrument is None:
+                    return  # No instrument to read the quoted currencies from
+                quoted = {tick_instrument.get_base_currency(), tick_instrument.quote_currency}
+
+            instrument_ids = set()
+            for position in self._cache.positions_open(
+                venue=None,
+                instrument_id=None,
+                strategy_id=None,
+                side=PositionSide.NO_POSITION_SIDE,
+                account_id=account.id,
+            ):
+                instrument_ids.add(position.instrument_id)
+            for order in self._cache.orders_open(
+                venue=None,
+                instrument_id=None,
+                strategy_id=None,
+                side=OrderSide.NO_ORDER_SIDE,
+                account_id=account.id,
+            ):
+                instrument_ids.add(order.instrument_id)
+            for instrument_id in instrument_ids:
+                instrument = self._cache.instrument(instrument_id)
+                if instrument is None:
+                    continue
+                margin_currency = account.margin_currency(instrument)
+                if margin_currency is None or margin_currency == account.base_currency:
+                    continue
+                if margin_currency in quoted or account.base_currency in quoted:
+                    self._update_exposure_margins(account, instrument)
 
     cpdef void update_mark_price(self, object mark_price):
         """
@@ -739,6 +809,11 @@ cdef class Portfolio(PortfolioFacade):
                         )
                         self._add_pending_xrate(event.instrument_id)
 
+        if account.margin_from_exposure:
+            if self._update_exposure_margins(account, instrument):
+                self._update_account(self._accounts.generate_account_state(account, event.ts_event))
+            return
+
         if account.type != AccountType.MARGIN or not account.calculate_account_state:
             return  # Nothing to calculate
 
@@ -946,7 +1021,7 @@ cdef class Portfolio(PortfolioFacade):
 
         """
         cdef Account account = self._get_account(venue, account_id, "initial (order) margins", "'venue' or 'account_id' must be provided")
-        if account is None or account.is_cash_account:
+        if account is None:
             return None
 
         return account.margins_init()
@@ -968,7 +1043,7 @@ cdef class Portfolio(PortfolioFacade):
 
         """
         cdef Account account = self._get_account(venue, account_id, "maintenance (position) margins", "'venue' or 'account_id' must be provided")
-        if account is None or account.is_cash_account:
+        if account is None:
             return None
 
         return account.margins_maint()
@@ -1250,6 +1325,50 @@ cdef class Portfolio(PortfolioFacade):
             self._venues_missing_price.pop(venue, None)
 
         return {c: Money(v, c) for c, v in values.items()}
+
+    cpdef Money exposure_margin(
+        self,
+        Venue venue,
+        InstrumentId instrument_id,
+        Exposure exposure,
+        basis,
+    ):
+        """
+        Return the margin the venue's account would hold for the given exposure of an
+        instrument, converted as the account converts its own margin.
+
+        Parameters
+        ----------
+        venue : Venue
+            The venue for the account.
+        instrument_id : InstrumentId
+            The instrument of the exposure.
+        exposure : Exposure
+            The positions, open orders and mark to value.
+        basis : MarginBasis
+            ``HELD`` for positions and orders, ``MAINTENANCE`` for positions alone.
+
+        Returns
+        -------
+        Money or ``None``
+            ``None`` for an account whose margin is not valued from exposures, or where a
+            conversion rate is not yet available.
+
+        """
+        Condition.not_none(venue, "venue")
+        Condition.not_none(instrument_id, "instrument_id")
+        Condition.not_none(exposure, "exposure")
+
+        cdef Account account = self._cache.account_for_venue(venue)
+        if account is None or not account.margin_from_exposure:
+            return None
+
+        cdef Instrument instrument = self._cache.instrument(instrument_id)
+        if instrument is None:
+            self._log.error(f"Cannot calculate exposure margin: no instrument found for {instrument_id}")
+            return None
+
+        return self._accounts._calculate_exposure_margin(account, instrument, exposure, basis)
 
     cpdef dict equity(self, Venue venue=None, AccountId account_id=None):
         """
@@ -1972,6 +2091,30 @@ cdef class Portfolio(PortfolioFacade):
 
         return account, instrument
 
+    cdef bint _update_exposure_margins(self, Account account, Instrument instrument):
+        cdef list positions_open = self._cache.positions_open(
+            venue=None,  # Faster query filtering
+            instrument_id=instrument.id,
+            strategy_id=None,
+            side=PositionSide.NO_POSITION_SIDE,
+            account_id=account.id,
+        )
+        cdef list orders_open = self._cache.orders_open(
+            venue=None,  # Faster query filtering
+            instrument_id=instrument.id,
+            strategy_id=None,
+            side=OrderSide.NO_ORDER_SIDE,
+            account_id=account.id,
+        )
+        cdef Order o
+        return self._accounts.update_positions(
+            account=account,
+            instrument=instrument,
+            positions_open=positions_open,
+            ts_event=account.last_event_c().ts_event,
+            orders_open=[o for o in orders_open if o.is_passive_c()],
+        )
+
     cdef void _update_account(self, AccountState event):
         cdef Account account = self._cache.account(event.account_id)
         if account is None:
@@ -2121,7 +2264,9 @@ cdef class Portfolio(PortfolioFacade):
 
             result_init = True
             result_maint = True
-            if awaits_xrate:
+            if awaits_xrate and account.margin_from_exposure:
+                result_init = self._update_exposure_margins(account, instrument)
+            elif awaits_xrate:
                 if account_orders:
                     # Initialize initial (order) margin
                     result_init = self._accounts.update_orders(

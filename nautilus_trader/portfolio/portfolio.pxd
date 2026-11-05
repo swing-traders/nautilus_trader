@@ -16,6 +16,7 @@
 from libc.stdint cimport uint64_t
 
 from nautilus_trader.accounting.accounts.base cimport Account
+from nautilus_trader.accounting.exposure cimport Exposure
 from nautilus_trader.accounting.manager cimport AccountsManager
 from nautilus_trader.cache.cache cimport Cache
 from nautilus_trader.common.component cimport Clock
@@ -84,6 +85,7 @@ cdef class Portfolio(PortfolioFacade):
     cpdef void initialize_orders(self)
     cpdef void initialize_positions(self)
     cpdef void update_quote_tick(self, QuoteTick tick)
+    cpdef void revalue_margin(self, QuoteTick tick)
     cpdef void update_mark_price(self, object mark_price)
     cpdef void update_bar(self, Bar bar)
     cpdef void update_account(self, AccountState event)
@@ -95,6 +97,9 @@ cdef class Portfolio(PortfolioFacade):
 
     # -- INTERNAL -------------------------------------------------------------------------------------
 
+    cpdef Money exposure_margin(self, Venue venue, InstrumentId instrument_id, Exposure exposure, basis)
+
+    cdef bint _update_exposure_margins(self, Account account, Instrument instrument)
     cdef void _update_account(self, AccountState event)
     cdef Account _get_account(self, Venue venue, AccountId account_id, str caller_name, str message=*)
     cdef Venue _accumulate_mark_values(self, Venue venue, AccountId account_id, dict values, set unpriced)

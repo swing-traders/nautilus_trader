@@ -15,9 +15,12 @@
 
 from decimal import Decimal
 
+from nautilus_trader.accounting.exposure cimport Exposure
 from nautilus_trader.core.correctness cimport Condition
 from nautilus_trader.core.rust.model cimport PositionSide
+from nautilus_trader.core.rust.model cimport PriceType
 from nautilus_trader.model.instruments.base cimport Instrument
+from nautilus_trader.model.objects cimport Currency
 from nautilus_trader.model.objects cimport Money
 from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
@@ -30,7 +33,121 @@ cdef class MarginModel:
     Different venues and instrument types may have varying approaches to
     calculating margin requirements. This abstraction allows for flexible
     margin calculation strategies.
+
+    A model that declares `margin_from_exposure` is valued through `calculate_exposure_margin`
+    alone, and its scalar calculations raise.
     """
+
+    @property
+    def margin_from_exposure(self):
+        """
+        If the model values an instrument's whole exposure through `calculate_exposure_margin`.
+
+        Returns
+        -------
+        bool
+
+        """
+        return False
+
+    @property
+    def checks_free_margin(self):
+        """
+        If the venue refuses an order whose margin exceeds the account's free margin.
+
+        Returns
+        -------
+        bool
+
+        """
+        return False
+
+    @property
+    def buy_price_type(self):
+        """
+        The price a buy's margin converts into the account currency at.
+
+        Returns
+        -------
+        PriceType
+
+        """
+        return PriceType.BID
+
+    @property
+    def sell_price_type(self):
+        """
+        The price a sell's margin converts into the account currency at.
+
+        Returns
+        -------
+        PriceType
+
+        """
+        return PriceType.ASK
+
+    cpdef Currency margin_currency(self, Instrument instrument):
+        """
+        Return the currency the instrument's margin is stated in, or ``None`` when the instrument
+        carries no margin.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument for the margin.
+
+        Returns
+        -------
+        Currency or ``None``
+
+        """
+        Condition.not_none(instrument, "instrument")
+
+        if instrument.is_inverse:
+            return instrument.get_base_currency()
+        return instrument.quote_currency
+
+    cpdef Money calculate_exposure_margin(
+        self,
+        Instrument instrument,
+        Exposure exposure,
+        basis,
+        leverage: Decimal,
+        Currency to_currency,
+        xrate_buy: Decimal,
+        xrate_sell: Decimal,
+        bint use_quote_for_inverse=False,
+    ):
+        """
+        Calculate the margin of an instrument's exposure in `to_currency`.
+
+        Each side converts at its own rate before any comparison, and the sum is rounded once.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument for the calculation.
+        exposure : Exposure
+            The positions, open orders and mark to value.
+        basis : MarginBasis
+            ``HELD`` for positions and orders, ``MAINTENANCE`` for positions alone.
+        leverage : Decimal
+            The account leverage for this instrument.
+        to_currency : Currency
+            The currency of the figure.
+        xrate_buy : Decimal
+            The rate a buy's margin converts at.
+        xrate_sell : Decimal
+            The rate a sell's margin converts at.
+        use_quote_for_inverse : bool, default False
+            If inverse instrument calculations use quote currency (instead of base).
+
+        Returns
+        -------
+        Money
+
+        """
+        raise NotImplementedError("method must be implemented in the subclass")  # pragma: no cover
 
     cpdef Money calculate_margin_init(
         self,

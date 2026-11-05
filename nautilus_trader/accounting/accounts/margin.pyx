@@ -30,6 +30,7 @@ The account calculates PnL differently based on instrument type:
 """
 from decimal import Decimal
 
+from nautilus_trader.accounting.exposure cimport Exposure
 from nautilus_trader.accounting.margin_models cimport LeveragedMarginModel
 from nautilus_trader.accounting.margin_models cimport MarginModel
 from nautilus_trader.core.correctness cimport Condition
@@ -38,6 +39,7 @@ from nautilus_trader.core.rust.model cimport InstrumentClass
 from nautilus_trader.core.rust.model cimport LiquiditySide
 from nautilus_trader.core.rust.model cimport MoneyRaw
 from nautilus_trader.core.rust.model cimport OrderSide
+from nautilus_trader.core.rust.model cimport PriceType
 from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.events.order cimport OrderFilled
 from nautilus_trader.model.functions cimport liquidity_side_to_str
@@ -419,6 +421,72 @@ cdef class MarginAccount(Account):
             if margin.currency == currency:
                 raw += margin.maintenance._mem.raw
         return Money.from_raw_c(raw, currency)
+
+    @property
+    def checks_free_margin(self):
+        """
+        If the venue refuses an order whose margin exceeds this account's free margin: the margin
+        model's declaration while the account's state is calculated.
+
+        Returns
+        -------
+        bool
+
+        """
+        return self.calculate_account_state and self._margin_model.checks_free_margin
+
+    @property
+    def margin_from_exposure(self):
+        """
+        If this account's margin is valued from each instrument's whole exposure: the margin
+        model's declaration while the account's state is calculated.
+
+        Returns
+        -------
+        bool
+
+        """
+        return self.calculate_account_state and self._margin_model.margin_from_exposure
+
+    @property
+    def buy_price_type(self):
+        """
+        The price a buy's margin converts into the account currency at.
+
+        Returns
+        -------
+        PriceType
+
+        """
+        return self._margin_model.buy_price_type
+
+    @property
+    def sell_price_type(self):
+        """
+        The price a sell's margin converts into the account currency at.
+
+        Returns
+        -------
+        PriceType
+
+        """
+        return self._margin_model.sell_price_type
+
+    cpdef Currency margin_currency(self, Instrument instrument):
+        """
+        Return the currency the instrument's margin is stated in, as the margin model declares it.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument for the margin.
+
+        Returns
+        -------
+        Currency or ``None``
+
+        """
+        return self._margin_model.margin_currency(instrument)
 
     cpdef bint books_pnl(self, Instrument instrument):
         # The account books a fill's PnL for every class but the premium ones, whose
@@ -936,6 +1004,65 @@ cdef class MarginAccount(Account):
             quantity=quantity,
             price=price,
             leverage=leverage,
+            use_quote_for_inverse=use_quote_for_inverse,
+        )
+
+    cpdef Money calculate_exposure_margin(
+        self,
+        Instrument instrument,
+        Exposure exposure,
+        basis,
+        Currency to_currency,
+        xrate_buy,
+        xrate_sell,
+        bint use_quote_for_inverse=False,
+    ):
+        """
+        Calculate the margin of an instrument's exposure in `to_currency` through the margin
+        model, at the leverage the account holds for the instrument.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument for the calculation.
+        exposure : Exposure
+            The positions, open orders and mark to value.
+        basis : MarginBasis
+            ``HELD`` for positions and orders, ``MAINTENANCE`` for positions alone.
+        to_currency : Currency
+            The currency of the figure.
+        xrate_buy : Decimal
+            The rate a buy's margin converts at.
+        xrate_sell : Decimal
+            The rate a sell's margin converts at.
+        use_quote_for_inverse : bool, default False
+            If inverse instrument calculations use quote currency (instead of base).
+
+        Returns
+        -------
+        Money
+
+        Raises
+        ------
+        ValueError
+            If the account holds no leverage for the instrument.
+
+        """
+        Condition.not_none(instrument, "instrument")
+        Condition.not_none(exposure, "exposure")
+
+        leverage = self.leverage(instrument.id)
+        if leverage is None:
+            raise ValueError(f"no leverage for {instrument.id}")
+
+        return self._margin_model.calculate_exposure_margin(
+            instrument=instrument,
+            exposure=exposure,
+            basis=basis,
+            leverage=leverage,
+            to_currency=to_currency,
+            xrate_buy=xrate_buy,
+            xrate_sell=xrate_sell,
             use_quote_for_inverse=use_quote_for_inverse,
         )
 

@@ -1602,7 +1602,7 @@ class TestActor:
         # Assert
         assert self.data_engine.command_count == 0
         assert (
-            actor.msgbus.subscriptions()[4].topic
+            actor.msgbus.subscriptions()[5].topic
             == "data.NewsEvent.type=NEWS_WIRE.topic=Earthquake"
         )
 
@@ -1624,7 +1624,7 @@ class TestActor:
         # Assert
         assert self.data_engine.command_count == 1
         assert (
-            actor.msgbus.subscriptions()[4].topic
+            actor.msgbus.subscriptions()[5].topic
             == "data.NewsEvent.type=NEWS_WIRE.topic=Earthquake"
         )
 
@@ -1646,7 +1646,7 @@ class TestActor:
 
         # Assert
         assert self.data_engine.command_count == 0
-        assert len(actor.msgbus.subscriptions()) == 4  # Portfolio subscriptions only
+        assert len(actor.msgbus.subscriptions()) == 5  # Portfolio subscriptions only
 
     def test_unsubscribe_custom_data_with_client_id(self) -> None:
         # Arrange
@@ -1666,7 +1666,7 @@ class TestActor:
 
         # Assert
         assert self.data_engine.command_count == 2
-        assert len(actor.msgbus.subscriptions()) == 4  # Portfolio subscriptions only
+        assert len(actor.msgbus.subscriptions()) == 5  # Portfolio subscriptions only
 
     def test_subscribe_order_book_deltas(self) -> None:
         # Arrange
@@ -2003,7 +2003,7 @@ class TestActor:
 
         # Assert
         assert self.data_engine.command_count == 0
-        assert actor.msgbus.subscriptions()[4].topic == "data.SignalTest*"
+        assert actor.msgbus.subscriptions()[5].topic == "data.SignalTest*"
 
     def test_subscribe_all_signals(self) -> None:
         # Arrange
@@ -2020,7 +2020,7 @@ class TestActor:
 
         # Assert
         assert self.data_engine.command_count == 0
-        assert actor.msgbus.subscriptions()[4].topic == "data.Signal*"
+        assert actor.msgbus.subscriptions()[5].topic == "data.Signal*"
 
     def test_publish_data_persist(self) -> None:
         # Arrange
