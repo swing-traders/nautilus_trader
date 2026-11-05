@@ -1513,11 +1513,12 @@ cdef class BacktestEngine:
         if self._kernel.emulator.is_running:
             self._kernel.emulator.stop()
 
-        try:
-            # Process remaining messages
-            self._process_and_settle_venues(self._kernel.clock.timestamp_ns())
-        except AccountError:
-            pass
+        if self._kernel.is_running():
+            try:
+                # Process remaining messages
+                self._process_and_settle_venues(self._kernel.clock.timestamp_ns())
+            except AccountError:
+                pass
 
         self._run_finished = pd.Timestamp.utcnow()
         self._backtest_end = self._kernel.clock.utc_now()
@@ -1799,6 +1800,9 @@ cdef class BacktestEngine:
                     raw_handlers = self._advance_time(data.ts_init)
                     raw_handlers_count = raw_handlers.len
 
+                    if FORCE_STOP:
+                        break
+
                 # Process data through exchange
                 if isinstance(data, Instrument):
                     exchange = self._venues[data.id.venue]
@@ -1886,6 +1890,11 @@ cdef class BacktestEngine:
             PyObject *raw_callback
             object callback
             SimulatedExchange exchange
+            CVec empty_vec
+        empty_vec.ptr = NULL
+        empty_vec.len = 0
+        empty_vec.cap = 0
+
         for clock in clocks:
             time_event_accumulator_advance_clock(
                 &self._accumulator,
@@ -1913,6 +1922,10 @@ cdef class BacktestEngine:
             # Settle previous timestamp batch before advancing
             if ts_event != ts_last and ts_last != 0:
                 self._process_and_settle_venues(ts_last)
+                # A stop at ts_last ends the run there, so nothing stamped later may run
+                if FORCE_STOP:
+                    time_event_handler_drop(handler)
+                    return empty_vec
 
             ts_last = ts_event
             set_logging_clock_static_time(ts_event)
@@ -1942,6 +1955,10 @@ cdef class BacktestEngine:
         if ts_last != 0:
             self._process_and_settle_venues(ts_last)
 
+        # A stop at ts_last holds every clock there
+        if FORCE_STOP:
+            return empty_vec
+
         set_logging_clock_static_time(ts_now)
 
         if LOGGING_PYO3:
@@ -1950,10 +1967,6 @@ cdef class BacktestEngine:
         for clock in clocks:
             clock.set_time(ts_now)
 
-        cdef CVec empty_vec
-        empty_vec.ptr = NULL
-        empty_vec.len = 0
-        empty_vec.cap = 0
         return empty_vec
 
     cdef bint _process_next_timer(self):
@@ -2074,6 +2087,10 @@ cdef class BacktestEngine:
             # Settle previous timestamp batch before advancing
             if ts_event != ts_last and ts_last != 0:
                 self._process_and_settle_venues(ts_last)
+                # A stop at ts_last ends the run there, so nothing stamped later may run
+                if FORCE_STOP:
+                    time_event_handler_drop(handler)
+                    return
 
             ts_last = ts_event
             set_logging_clock_static_time(ts_event)
@@ -2143,6 +2160,10 @@ cdef class BacktestEngine:
             # Settle previous timestamp batch before advancing
             if ts_event != ts_last and ts_last != 0:
                 self._process_and_settle_venues(ts_last)
+                # A stop at ts_last ends the run there, so nothing stamped later may run
+                if FORCE_STOP:
+                    time_event_handler_drop(handler)
+                    return
 
             ts_last = ts_event
             set_logging_clock_static_time(ts_event)
