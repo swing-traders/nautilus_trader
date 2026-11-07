@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from nautilus_trader.adapters.hyperliquid.enums import HyperliquidProductType
 from nautilus_trader.common.config import PositiveInt
 from nautilus_trader.config import LiveDataClientConfig
@@ -106,6 +108,9 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     include_builder_attribution : bool, default True
         If True, eligible mainnet orders include the zero-fee Nautilus builder code.
         Set False to opt out of builder attribution.
+    leverages : dict[str, Decimal], default {}
+        The leverage the account is on for each symbol, written to the account at connect and
+        kept by every later account state. Nothing is set at the venue.
 
     Warnings
     --------
@@ -128,3 +133,4 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     ws_post_timeout_secs: PositiveInt = 10
     normalize_prices: bool = True
     include_builder_attribution: bool = True
+    leverages: dict[str, Decimal] = {}

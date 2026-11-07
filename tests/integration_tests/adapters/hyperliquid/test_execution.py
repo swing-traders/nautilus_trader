@@ -511,6 +511,51 @@ async def test_account_query_reply_with_no_push_since_its_send_is_applied(
 
 
 @pytest.mark.asyncio
+async def test_connect_gives_the_account_each_configured_leverage(
+    exec_client_builder,
+    monkeypatch,
+    cache,
+):
+    # Arrange
+    client, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"leverages": {"BTC-USD-PERP": Decimal(20), "ETH-USD-PERP": Decimal(5)}},
+    )
+
+    # Act
+    await client._connect()
+
+    try:
+        # Assert
+        account = cache.account(client.account_id)
+        assert account.leverages() == {
+            InstrumentId.from_str("BTC-USD-PERP.HYPERLIQUID"): Decimal(20),
+            InstrumentId.from_str("ETH-USD-PERP.HYPERLIQUID"): Decimal(5),
+        }
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_with_no_leverages_configured_gives_the_account_none(
+    exec_client_builder,
+    monkeypatch,
+    cache,
+):
+    # Arrange
+    client, _, _, _ = exec_client_builder(monkeypatch)
+
+    # Act
+    await client._connect()
+
+    try:
+        # Assert
+        assert cache.account(client.account_id).leverages() == {}
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
 async def test_disconnect_success(exec_client_builder, monkeypatch):
     # Arrange
     client, ws_client, http_client, instrument_provider = exec_client_builder(

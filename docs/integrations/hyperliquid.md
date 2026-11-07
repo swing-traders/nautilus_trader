@@ -1260,26 +1260,27 @@ match the venue limit.
 
 ### Execution client configuration options
 
-| Option                         | Default   | Description                                                                                                                                      |
-| ------------------------------ | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `private_key`                  | `None`    | EVM private key; loaded from `HYPERLIQUID_PK` or `HYPERLIQUID_TESTNET_PK` when omitted.                                                          |
-| `vault_address`                | `None`    | Vault address; loaded from `HYPERLIQUID_VAULT` or `HYPERLIQUID_TESTNET_VAULT` if omitted.                                                        |
-| `account_address`              | `None`    | Main account address for agent wallet trading; loaded from `HYPERLIQUID_ACCOUNT_ADDRESS`.                                                        |
-| `environment`                  | `None`    | Environment enum (`MAINNET` or `TESTNET`); resolves to `MAINNET` when unset.                                                                     |
-| `base_url_ws`                  | `None`    | Override for the WebSocket base URL.                                                                                                             |
-| `base_url_http`                | `None`    | Override for the HTTP info base URL.                                                                                                             |
-| `base_url_exchange`            | `None`    | Override for the exchange API base URL.                                                                                                          |
-| `max_retries`                  | `3`       | Maximum retry attempts for submit, cancel, or modify order requests.                                                                             |
-| `retry_delay_initial_ms`       | `100`     | Initial delay (milliseconds) between retries.                                                                                                    |
-| `retry_delay_max_ms`           | `5000`    | Maximum delay (milliseconds) between retries.                                                                                                    |
-| `http_timeout_secs`            | `60`      | Timeout (seconds) applied to REST calls.                                                                                                         |
-| `ws_post_timeout_secs`         | `10`      | Timeout (seconds) applied to WebSocket post trading requests.                                                                                    |
-| `normalize_prices`             | `True`    | Normalize order prices to 5 significant figures before submission.                                                                               |
-| `include_builder_attribution`  | `True`    | Include zero‑fee Nautilus builder attribution on eligible mainnet orders.                                                                        |
-| `market_order_slippage_bps`    | `50`      | Slippage buffer (bps) applied to MARKET and stop trigger derivations. Overridable per‑order via `SubmitOrder.params`.                            |
-| `outcome_settlement_poll_secs` | `0`       | HIP‑4 `outcomeMeta` settlement poll interval (seconds). Rust‑only; venue `Settlement` fills cover settlement, so polling is disabled by default. |
-| `proxy_url`                    | `None`    | Optional proxy URL for HTTP and WebSocket transports.                                                                                            |
-| `transport_backend`            | `Sockudo` | WebSocket transport backend.                                                                                                                     |
+| Option                         | Default   | Description                                                                                                                                                          |
+| ------------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `private_key`                  | `None`    | EVM private key; loaded from `HYPERLIQUID_PK` or `HYPERLIQUID_TESTNET_PK` when omitted.                                                                              |
+| `vault_address`                | `None`    | Vault address; loaded from `HYPERLIQUID_VAULT` or `HYPERLIQUID_TESTNET_VAULT` if omitted.                                                                            |
+| `account_address`              | `None`    | Main account address for agent wallet trading; loaded from `HYPERLIQUID_ACCOUNT_ADDRESS`.                                                                            |
+| `environment`                  | `None`    | Environment enum (`MAINNET` or `TESTNET`); resolves to `MAINNET` when unset.                                                                                         |
+| `base_url_ws`                  | `None`    | Override for the WebSocket base URL.                                                                                                                                 |
+| `base_url_http`                | `None`    | Override for the HTTP info base URL.                                                                                                                                 |
+| `base_url_exchange`            | `None`    | Override for the exchange API base URL.                                                                                                                              |
+| `max_retries`                  | `3`       | Maximum retry attempts for submit, cancel, or modify order requests.                                                                                                 |
+| `retry_delay_initial_ms`       | `100`     | Initial delay (milliseconds) between retries.                                                                                                                        |
+| `retry_delay_max_ms`           | `5000`    | Maximum delay (milliseconds) between retries.                                                                                                                        |
+| `http_timeout_secs`            | `60`      | Timeout (seconds) applied to REST calls.                                                                                                                             |
+| `ws_post_timeout_secs`         | `10`      | Timeout (seconds) applied to WebSocket post trading requests.                                                                                                        |
+| `normalize_prices`             | `True`    | Normalize order prices to 5 significant figures before submission.                                                                                                   |
+| `include_builder_attribution`  | `True`    | Include zero‑fee Nautilus builder attribution on eligible mainnet orders.                                                                                            |
+| `leverages`                    | `{}`      | Mapping of symbol to the leverage the account is on, written to the NautilusTrader account at connect and kept by later account states; nothing is set at the venue. |
+| `market_order_slippage_bps`    | `50`      | Slippage buffer (bps) applied to MARKET and stop trigger derivations. Overridable per‑order via `SubmitOrder.params`.                                                |
+| `outcome_settlement_poll_secs` | `0`       | HIP‑4 `outcomeMeta` settlement poll interval (seconds). Rust‑only; venue `Settlement` fills cover settlement, so polling is disabled by default.                     |
+| `proxy_url`                    | `None`    | Optional proxy URL for HTTP and WebSocket transports.                                                                                                                |
+| `transport_backend`            | `Sockudo` | WebSocket transport backend.                                                                                                                                         |
 
 :::note
 `outcome_settlement_poll_secs` is the only Rust-only option: it is not exposed on the

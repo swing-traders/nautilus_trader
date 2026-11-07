@@ -70,6 +70,8 @@ from nautilus_trader.model.functions import time_in_force_to_pyo3
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
@@ -303,6 +305,13 @@ class HyperliquidExecutionClient(LiveExecutionClient):
     async def _update_account_state(self) -> None:
         pyo3_account_state = await self._client.request_account_state()
         self._generate_queried_account_state(pyo3_account_state)
+
+        if self._config.leverages:
+            # The account state carries no leverage, so the account is given the configured one
+            await self._await_account_registered(log_registered=False)
+            account = self.get_account()
+            for symbol, leverage in self._config.leverages.items():
+                account.set_leverage(InstrumentId(Symbol(symbol), HYPERLIQUID_VENUE), leverage)
 
     def _generate_queried_account_state(
         self,

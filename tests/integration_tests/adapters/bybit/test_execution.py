@@ -4823,3 +4823,85 @@ async def test_query_account_no_action_updates_account_state(
         update_state_mock.assert_awaited_once()
     finally:
         await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_gives_the_account_each_configured_leverage(
+    monkeypatch,
+    exec_client_builder,
+    cache,
+):
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"futures_leverages": {"BTCUSDT-LINEAR": 20, "ETHUSDT-LINEAR": 10}},
+    )
+    http_client.set_leverage = AsyncMock()
+
+    # Act
+    await client._connect()
+
+    try:
+        # Assert
+        account = cache.account(client.account_id)
+        assert account.leverages() == {
+            InstrumentId.from_str("BTCUSDT-LINEAR.BYBIT"): Decimal(20),
+            InstrumentId.from_str("ETHUSDT-LINEAR.BYBIT"): Decimal(10),
+        }
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_account_query_rewrites_each_configured_leverage(
+    monkeypatch,
+    exec_client_builder,
+    cache,
+):
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"futures_leverages": {"BTCUSDT-LINEAR": 20}},
+    )
+    http_client.set_leverage = AsyncMock()
+    await client._connect()
+    instrument_id = InstrumentId.from_str("BTCUSDT-LINEAR.BYBIT")
+    account = cache.account(client.account_id)
+    account.set_leverage(instrument_id, Decimal(5))
+
+    command = QueryAccount(
+        trader_id=TestIdStubs.trader_id(),
+        account_id=client.account_id,
+        command_id=TestIdStubs.uuid(),
+        client_id=client.id,
+        ts_init=0,
+    )
+
+    try:
+        # Act
+        await client._query_account(command)
+
+        # Assert
+        assert account.leverage(instrument_id) == Decimal(20)
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_with_no_leverages_configured_gives_the_account_none(
+    monkeypatch,
+    exec_client_builder,
+    cache,
+):
+    # Arrange
+    client, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    # Act
+    await client._connect()
+
+    try:
+        # Assert
+        assert cache.account(client.account_id).leverages() == {}
+        http_client.set_leverage.assert_not_called()
+    finally:
+        await client._disconnect()

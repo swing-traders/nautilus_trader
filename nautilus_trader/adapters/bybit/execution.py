@@ -79,6 +79,7 @@ from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import PositionId
+from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 
@@ -343,6 +344,13 @@ class BybitExecutionClient(LiveExecutionClient):
         )
 
         await self._apply_account_configuration()
+
+        if self._futures_leverages:
+            # The account state carries no leverage, so the account is given the one set above
+            await self._await_account_registered(log_registered=False)
+            account = self.get_account()
+            for symbol, leverage in self._futures_leverages.items():
+                account.set_leverage(InstrumentId(Symbol(symbol), BYBIT_VENUE), Decimal(leverage))
 
     async def _apply_account_configuration(self) -> None:
         if self._futures_leverages:
