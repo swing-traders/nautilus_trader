@@ -2795,6 +2795,15 @@ class LiveExecutionEngine(ExecutionEngine):
 
         self._log.debug(f"Reconciling {report}", color=LogColor.BLUE)
 
+        # Runtime fill evidence invalidates position snapshots just as a received fill
+        # event does, before reconciliation can infer an exposure change from it.
+        if isinstance(report, FillReport) or (
+            isinstance(report, OrderStatusReport) and report.filled_qty.as_decimal() > 0
+        ):
+            self._position_local_activity_ns[(report.instrument_id, report.account_id)] = (
+                self._clock.timestamp_ns()
+            )
+
         if isinstance(report, OrderStatusReport):
             result = self._reconcile_order_report(report, [])  # No trades to reconcile
         elif isinstance(report, FillReport):
@@ -4649,7 +4658,8 @@ class LiveExecutionEngine(ExecutionEngine):
                 # Stamp application time: a venue ts_event ahead of this clock would make
                 # the grace delta negative and suppress the position check. Reconciliation's
                 # own fills never stamp it, since a pass is a diff of venue state against
-                # the cache and its own output is not evidence which defers the next one.
+                # the cache and its own output is not evidence which defers the next one;
+                # runtime reports carrying fills already stamp at the report boundary.
                 self._position_local_activity_ns[(event.instrument_id, event.account_id)] = ts_now
         elif isinstance(event, OrderUpdated):
             # An overfill rejection was judged against the order's quantity, so a change

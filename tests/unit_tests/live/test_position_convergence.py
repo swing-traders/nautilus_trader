@@ -513,6 +513,285 @@ async def test_local_activity_during_query_discards_repair(env):
     assert env.residuals() == {}
 
 
+# -- Runtime report activity ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def external_close_env(event_loop):
+    env = ConvergenceEnv(event_loop, oms_type=OmsType.NETTING)
+    strategy_id = StrategyId("S-CLAIM")
+    position_id = PositionId(f"{BTCUSD_SIM.id}-{strategy_id}")
+    env.engine._external_order_claims[BTCUSD_SIM.id] = strategy_id
+    env.add_position(
+        BTCUSD_SIM,
+        OrderSide.BUY,
+        "0.006",
+        position_id,
+        strategy_id=strategy_id,
+    )
+    env.add_report(
+        BTCUSD_SIM,
+        PositionSide.LONG,
+        "0.006",
+        avg_px_open=Decimal("1.0"),
+    )
+    return env, position_id
+
+
+def _external_close_order_report(
+    env,
+    client_order_id: str = "EXT-FLATTEN-1",
+    venue_order_id: str = "V-EXT-1",
+    order_type: OrderType = OrderType.MARKET,
+    order_status: OrderStatus = OrderStatus.FILLED,
+) -> OrderStatusReport:
+    ts_now = env.clock.timestamp_ns()
+    return OrderStatusReport(
+        account_id=env.account_id,
+        instrument_id=BTCUSD_SIM.id,
+        client_order_id=ClientOrderId(client_order_id),
+        venue_order_id=VenueOrderId(venue_order_id),
+        order_side=OrderSide.SELL,
+        order_type=order_type,
+        time_in_force=TimeInForce.GTC,
+        order_status=order_status,
+        price=BTCUSD_SIM.make_price(Decimal("1.0")) if order_type == OrderType.LIMIT else None,
+        quantity=BTCUSD_SIM.make_qty(Decimal("0.006")),
+        filled_qty=BTCUSD_SIM.make_qty(
+            Decimal("0.006") if order_status == OrderStatus.FILLED else Decimal(0),
+        ),
+        avg_px=Decimal("1.0") if order_status == OrderStatus.FILLED else None,
+        reduce_only=True,
+        report_id=UUID4(),
+        ts_accepted=ts_now,
+        ts_last=ts_now,
+        ts_init=ts_now,
+    )
+
+
+def _assert_external_close_deferred(env, position_id, client_order_id="EXT-FLATTEN-1"):
+    assert env.open_positions(BTCUSD_SIM) == []
+    assert env.cache.position(position_id).is_closed
+    assert [o.client_order_id.value for o in env.reconciliation_orders()] == [client_order_id]
+    assert dict(env.engine._position_recon_retries) == {}
+    assert env.residuals() == {}
+    assert (BTCUSD_SIM.id, env.account_id) in env.engine._position_local_activity_ns
+
+
+@pytest.mark.asyncio
+async def test_external_close_inferred_during_query_defers_the_stale_snapshot(external_close_env):
+    # Arrange
+    env, position_id = external_close_env
+    original = env.client.generate_position_status_reports
+
+    async def close_then_report(command):
+        reports = await original(command)
+        assert env.engine.reconcile_execution_report(_external_close_order_report(env))
+        return reports
+
+    env.client.generate_position_status_reports = close_then_report
+
+    # Act
+    await env.engine._check_positions_consistency()
+
+    # Assert
+    _assert_external_close_deferred(env, position_id)
+
+
+@pytest.mark.asyncio
+async def test_external_close_inferred_before_the_pass_holds_it_for_the_grace(external_close_env):
+    # Arrange
+    env, position_id = external_close_env
+    _arm_activity_threshold(env)
+    assert env.engine.reconcile_execution_report(_external_close_order_report(env))
+
+    # Act
+    await env.engine._check_positions_consistency()
+
+    # Assert
+    _assert_external_close_deferred(env, position_id)
+
+
+@pytest.mark.asyncio
+async def test_grace_expiry_lets_the_pass_repair_a_venue_position_the_cache_lacks(
+    external_close_env,
+):
+    # Arrange
+    env, position_id = external_close_env
+    _arm_activity_threshold(env)
+    assert env.engine.reconcile_execution_report(_external_close_order_report(env))
+
+    # Act
+    await env.engine._check_positions_consistency()
+
+    # Assert
+    _assert_external_close_deferred(env, position_id)
+
+    # Arrange - the next query still reports a genuine venue position after the grace
+    key = (BTCUSD_SIM.id, env.account_id)
+    env.engine._position_local_activity_ns[key] = (
+        env.clock.timestamp_ns() - env.engine._position_check_threshold_ns - 1
+    )
+
+    # Act
+    await env.engine._check_positions_consistency()
+
+    # Assert
+    positions = env.open_positions(BTCUSD_SIM)
+    assert len(positions) == 1
+    assert positions[0].id == position_id
+    assert positions[0].is_open
+    assert positions[0].side == PositionSide.LONG
+    assert positions[0].quantity == BTCUSD_SIM.make_qty(Decimal("0.006"))
+    assert positions[0].strategy_id == StrategyId("S-CLAIM")
+    repairs = [o for o in env.reconciliation_orders() if o.client_order_id.value != "EXT-FLATTEN-1"]
+    assert len(repairs) == 1
+    assert repairs[0].side == OrderSide.BUY
+    assert repairs[0].order_type == OrderType.LIMIT
+    assert repairs[0].quantity == BTCUSD_SIM.make_qty(Decimal("0.006"))
+    assert repairs[0].tags == ["RECONCILIATION"]
+    assert dict(env.engine._position_recon_retries) == {}
+    assert env.residuals() == {}
+
+
+@pytest.mark.asyncio
+async def test_external_close_filled_by_report_during_query_defers_the_stale_snapshot(
+    external_close_env,
+):
+    # Arrange
+    env, position_id = external_close_env
+    assert env.engine.reconcile_execution_report(
+        _external_close_order_report(
+            env,
+            client_order_id="EXT-CLOSE-1",
+            venue_order_id="V-EXT-CLOSE-1",
+            order_type=OrderType.LIMIT,
+            order_status=OrderStatus.ACCEPTED,
+        ),
+    )
+    assert (BTCUSD_SIM.id, env.account_id) not in env.engine._position_local_activity_ns
+    original = env.client.generate_position_status_reports
+
+    async def fill_then_report(command):
+        reports = await original(command)
+        ts_now = env.clock.timestamp_ns()
+        assert env.engine.reconcile_execution_report(
+            FillReport(
+                account_id=env.account_id,
+                instrument_id=BTCUSD_SIM.id,
+                client_order_id=ClientOrderId("EXT-CLOSE-1"),
+                venue_order_id=VenueOrderId("V-EXT-CLOSE-1"),
+                trade_id=TradeId("T-EXT-CLOSE-1"),
+                order_side=OrderSide.SELL,
+                last_qty=BTCUSD_SIM.make_qty(Decimal("0.006")),
+                last_px=BTCUSD_SIM.make_price(Decimal("1.0")),
+                commission=Money(0, USD),
+                liquidity_side=LiquiditySide.TAKER,
+                report_id=UUID4(),
+                ts_event=ts_now,
+                ts_init=ts_now,
+            ),
+        )
+        return reports
+
+    env.client.generate_position_status_reports = fill_then_report
+
+    # Act
+    await env.engine._check_positions_consistency()
+
+    # Assert
+    _assert_external_close_deferred(env, position_id, "EXT-CLOSE-1")
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_order_report_stamps_nothing(external_close_env):
+    # Arrange
+    env, position_id = external_close_env
+    original = env.client.generate_position_status_reports
+
+    async def cancel_then_report(command):
+        reports = await original(command)
+        assert env.engine.reconcile_execution_report(
+            _external_close_order_report(
+                env,
+                client_order_id="EXT-CANCEL-1",
+                venue_order_id="V-EXT-CANCEL-1",
+                order_type=OrderType.LIMIT,
+                order_status=OrderStatus.CANCELED,
+            ),
+        )
+        return reports
+
+    env.client.generate_position_status_reports = cancel_then_report
+
+    # Act
+    await env.engine._check_positions_consistency()
+
+    # Assert
+    positions = env.open_positions(BTCUSD_SIM)
+    assert len(positions) == 1
+    assert positions[0].id == position_id
+    assert positions[0].side == PositionSide.LONG
+    assert positions[0].quantity == BTCUSD_SIM.make_qty(Decimal("0.006"))
+    orders = env.reconciliation_orders()
+    assert [o.client_order_id.value for o in orders] == ["EXT-CANCEL-1"]
+    assert orders[0].status == OrderStatus.CANCELED
+    assert (BTCUSD_SIM.id, env.account_id) not in env.engine._position_local_activity_ns
+    assert dict(env.engine._position_recon_retries) == {}
+    assert env.residuals() == {}
+
+
+@pytest.mark.asyncio
+async def test_external_open_inferred_during_query_defers_the_stale_flat_snapshot(event_loop):
+    # Arrange
+    env = ConvergenceEnv(event_loop, oms_type=OmsType.NETTING)
+    strategy_id = StrategyId("S-CLAIM")
+    position_id = PositionId(f"{BTCUSD_SIM.id}-{strategy_id}")
+    env.engine._external_order_claims[BTCUSD_SIM.id] = strategy_id
+    env.add_report(BTCUSD_SIM, PositionSide.FLAT, "0.000")
+    original = env.client.generate_position_status_reports
+
+    async def open_then_report(command):
+        reports = await original(command)
+        ts_now = env.clock.timestamp_ns()
+        assert env.engine.reconcile_execution_report(
+            OrderStatusReport(
+                account_id=env.account_id,
+                instrument_id=BTCUSD_SIM.id,
+                client_order_id=ClientOrderId("EXT-OPEN-1"),
+                venue_order_id=VenueOrderId("V-EXT-OPEN-1"),
+                order_side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                time_in_force=TimeInForce.GTC,
+                order_status=OrderStatus.FILLED,
+                quantity=BTCUSD_SIM.make_qty(Decimal("0.006")),
+                filled_qty=BTCUSD_SIM.make_qty(Decimal("0.006")),
+                avg_px=Decimal("1.0"),
+                report_id=UUID4(),
+                ts_accepted=ts_now,
+                ts_last=ts_now,
+                ts_init=ts_now,
+            ),
+        )
+        return reports
+
+    env.client.generate_position_status_reports = open_then_report
+
+    # Act
+    await env.engine._check_positions_consistency()
+
+    # Assert
+    positions = env.open_positions(BTCUSD_SIM)
+    assert len(positions) == 1
+    assert positions[0].id == position_id
+    assert positions[0].side == PositionSide.LONG
+    assert positions[0].quantity == BTCUSD_SIM.make_qty(Decimal("0.006"))
+    assert [o.client_order_id.value for o in env.reconciliation_orders()] == ["EXT-OPEN-1"]
+    assert dict(env.engine._position_recon_retries) == {}
+    assert env.residuals() == {}
+    assert (BTCUSD_SIM.id, env.account_id) in env.engine._position_local_activity_ns
+
+
 # -- Net-granular trim ordering ------------------------------------------------------------------
 
 
