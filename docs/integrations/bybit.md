@@ -847,12 +847,10 @@ The product types for each client must be specified in the configurations.
 | `auto_repay_spot_borrows`               | `True`    | Automatically repay Spot margin borrows after BUY orders fully fill (Spot only).                                |
 | `repay_queue_interval_secs`             | `1.0`     | Interval (seconds) between processing repayment queues for spot borrows.                                        |
 | `ignore_uncached_instrument_executions` | `False`   | Ignore execution messages for instruments not yet cached.                                                       |
-| `max_retries`                           | `None`    | Maximum retry attempts for order submission/cancel/modify calls.                                                |
+| `max_retries`                           | `None`    | Maximum retry attempts for HTTP reads. State-changing requests are sent once.                                    |
 | `retry_delay_initial_ms`                | `None`    | Initial delay (milliseconds) between retries.                                                                   |
 | `retry_delay_max_ms`                    | `None`    | Maximum delay (milliseconds) between retries.                                                                   |
 | `recv_window_ms`                        | `5,000`   | Receive window (milliseconds) for signed REST requests.                                                         |
-| `ws_trade_timeout_secs`                 | `5.0`     | Timeout (seconds) waiting for trade WebSocket acknowledgements.                                                 |
-| `ws_auth_timeout_secs`                  | `5.0`     | Timeout (seconds) waiting for auth WebSocket acknowledgements.                                                  |
 | `futures_leverages`                     | `None`    | Mapping of `BybitSymbol` to leverage settings.                                                                  |
 | `position_mode`                         | `None`    | Mapping of `BybitSymbol` to position mode. See [Hedge mode](#hedge-mode-bothsides).                             |
 | `margin_mode`                           | `None`    | Margin mode setting for the account.                                                                            |

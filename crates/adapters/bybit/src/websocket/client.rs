@@ -56,8 +56,8 @@ use crate::{
         credential::Credential,
         enums::{
             BybitBboSideType, BybitEnvironment, BybitOrderSide, BybitOrderType, BybitPositionIdx,
-            BybitProductType, BybitTimeInForce, BybitTpSlMode, BybitTriggerType,
-            BybitWsOrderRequestOp, resolve_trigger_type,
+            BybitProductType, BybitTimeInForce, BybitTpSlMode, BybitWsOrderRequestOp,
+            resolve_trigger_type,
         },
         parse::{
             bar_spec_to_bybit_interval, extract_base_coin, extract_raw_symbol, map_time_in_force,
@@ -192,6 +192,19 @@ impl BybitWebSocketClient {
     /// authenticated operation. Defaults to `AUTH_WAIT_TIMEOUT` (5s).
     pub fn set_auth_wait_timeout(&mut self, timeout: Duration) {
         self.auth_wait_timeout = timeout;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_order_commands(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<HandlerCommand> {
+        self.connection_mode
+            .store(Arc::new(AtomicU8::new(ConnectionMode::Active as u8)));
+        drop(self.auth_tracker.begin());
+        self.auth_tracker.succeed();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self.cmd_tx.write().await = sender;
+        receiver
     }
 
     /// Creates a new Bybit public WebSocket client targeting the specified product/environment.
@@ -1310,9 +1323,17 @@ impl BybitWebSocketClient {
     ///
     /// Returns an error if the order request fails or if not authenticated.
     pub async fn place_order(&self, params: BybitWsPlaceOrderParams) -> BybitWsResult<String> {
-        self.require_authenticated().await?;
+        self.place_order_with_id(params, UUID4::new().to_string())
+            .await
+    }
 
-        let req_id = UUID4::new().to_string();
+    /// Sends the order command with a caller-supplied correlation ID.
+    pub(crate) async fn place_order_with_id(
+        &self,
+        params: BybitWsPlaceOrderParams,
+        req_id: String,
+    ) -> BybitWsResult<String> {
+        self.require_authenticated().await?;
 
         let referer = if self.include_referer_header(params.time_in_force) {
             Some(BYBIT_NAUTILUS_BROKER_ID.to_string())
@@ -1328,7 +1349,7 @@ impl BybitWebSocketClient {
         };
 
         let payload = serde_json::to_string(&request).map_err(BybitWsError::from)?;
-        self.send_text(&payload).await?;
+        self.send_order_text(&payload).await?;
 
         Ok(req_id)
     }
@@ -1339,9 +1360,17 @@ impl BybitWebSocketClient {
     ///
     /// Returns an error if the amend request fails or if not authenticated.
     pub async fn amend_order(&self, params: BybitWsAmendOrderParams) -> BybitWsResult<String> {
-        self.require_authenticated().await?;
+        self.amend_order_with_id(params, UUID4::new().to_string())
+            .await
+    }
 
-        let req_id = UUID4::new().to_string();
+    /// Sends the order command with a caller-supplied correlation ID.
+    pub(crate) async fn amend_order_with_id(
+        &self,
+        params: BybitWsAmendOrderParams,
+        req_id: String,
+    ) -> BybitWsResult<String> {
+        self.require_authenticated().await?;
 
         let request = BybitWsRequest {
             req_id: Some(req_id.clone()),
@@ -1351,7 +1380,7 @@ impl BybitWebSocketClient {
         };
 
         let payload = serde_json::to_string(&request).map_err(BybitWsError::from)?;
-        self.send_text(&payload).await?;
+        self.send_order_text(&payload).await?;
 
         Ok(req_id)
     }
@@ -1362,9 +1391,17 @@ impl BybitWebSocketClient {
     ///
     /// Returns an error if the cancel request fails or if not authenticated.
     pub async fn cancel_order(&self, params: BybitWsCancelOrderParams) -> BybitWsResult<String> {
-        self.require_authenticated().await?;
+        self.cancel_order_with_id(params, UUID4::new().to_string())
+            .await
+    }
 
-        let req_id = UUID4::new().to_string();
+    /// Sends the order command with a caller-supplied correlation ID.
+    pub(crate) async fn cancel_order_with_id(
+        &self,
+        params: BybitWsCancelOrderParams,
+        req_id: String,
+    ) -> BybitWsResult<String> {
+        self.require_authenticated().await?;
 
         let request = BybitWsRequest {
             req_id: Some(req_id.clone()),
@@ -1374,7 +1411,7 @@ impl BybitWebSocketClient {
         };
 
         let payload = serde_json::to_string(&request).map_err(BybitWsError::from)?;
-        self.send_text(&payload).await?;
+        self.send_order_text(&payload).await?;
 
         Ok(req_id)
     }
@@ -1388,6 +1425,18 @@ impl BybitWebSocketClient {
         &self,
         orders: Vec<BybitWsPlaceOrderParams>,
     ) -> BybitWsResult<Vec<String>> {
+        let req_ids = orders
+            .chunks(BATCH_PROCESSING_LIMIT)
+            .map(|_| UUID4::new().to_string())
+            .collect();
+        self.batch_place_orders_with_ids(orders, req_ids).await
+    }
+
+    pub(crate) async fn batch_place_orders_with_ids(
+        &self,
+        orders: Vec<BybitWsPlaceOrderParams>,
+        req_ids: Vec<String>,
+    ) -> BybitWsResult<Vec<String>> {
         self.require_authenticated().await?;
 
         if orders.is_empty() {
@@ -1395,11 +1444,14 @@ impl BybitWebSocketClient {
             return Ok(vec![]);
         }
 
-        let mut req_ids = Vec::new();
-
-        for chunk in orders.chunks(BATCH_PROCESSING_LIMIT) {
-            let req_id = self.batch_place_orders_chunk(chunk.to_vec()).await?;
-            req_ids.push(req_id);
+        for (written, (chunk, req_id)) in orders
+            .chunks(BATCH_PROCESSING_LIMIT)
+            .zip(&req_ids)
+            .enumerate()
+        {
+            self.batch_place_orders_chunk(chunk.to_vec(), req_id.clone())
+                .await
+                .map_err(|error| classify_batch_send_error(error, written, req_ids.len()))?;
         }
 
         Ok(req_ids)
@@ -1408,9 +1460,9 @@ impl BybitWebSocketClient {
     async fn batch_place_orders_chunk(
         &self,
         orders: Vec<BybitWsPlaceOrderParams>,
+        batch_req_id: String,
     ) -> BybitWsResult<String> {
         let category = orders[0].category;
-        let batch_req_id = UUID4::new().to_string();
 
         let mm_level = self.mm_level.load(Ordering::Relaxed);
         let has_non_post_only = orders
@@ -1471,7 +1523,7 @@ impl BybitWebSocketClient {
         };
 
         let payload = serde_json::to_string(&request).map_err(BybitWsError::from)?;
-        self.send_text(&payload).await?;
+        self.send_order_text(&payload).await?;
 
         Ok(batch_req_id)
     }
@@ -1485,6 +1537,18 @@ impl BybitWebSocketClient {
         &self,
         orders: Vec<BybitWsAmendOrderParams>,
     ) -> BybitWsResult<Vec<String>> {
+        let req_ids = orders
+            .chunks(BATCH_PROCESSING_LIMIT)
+            .map(|_| UUID4::new().to_string())
+            .collect();
+        self.batch_amend_orders_with_ids(orders, req_ids).await
+    }
+
+    pub(crate) async fn batch_amend_orders_with_ids(
+        &self,
+        orders: Vec<BybitWsAmendOrderParams>,
+        req_ids: Vec<String>,
+    ) -> BybitWsResult<Vec<String>> {
         self.require_authenticated().await?;
 
         if orders.is_empty() {
@@ -1492,11 +1556,14 @@ impl BybitWebSocketClient {
             return Ok(vec![]);
         }
 
-        let mut req_ids = Vec::new();
-
-        for chunk in orders.chunks(BATCH_PROCESSING_LIMIT) {
-            let req_id = self.batch_amend_orders_chunk(chunk.to_vec()).await?;
-            req_ids.push(req_id);
+        for (written, (chunk, req_id)) in orders
+            .chunks(BATCH_PROCESSING_LIMIT)
+            .zip(&req_ids)
+            .enumerate()
+        {
+            self.batch_amend_orders_chunk(chunk.to_vec(), req_id.clone())
+                .await
+                .map_err(|error| classify_batch_send_error(error, written, req_ids.len()))?;
         }
 
         Ok(req_ids)
@@ -1505,9 +1572,9 @@ impl BybitWebSocketClient {
     async fn batch_amend_orders_chunk(
         &self,
         orders: Vec<BybitWsAmendOrderParams>,
+        batch_req_id: String,
     ) -> BybitWsResult<String> {
         let category = orders[0].category;
-        let batch_req_id = UUID4::new().to_string();
 
         let request_items: Vec<BybitWsBatchAmendItem> = orders
             .into_iter()
@@ -1540,7 +1607,7 @@ impl BybitWebSocketClient {
         };
 
         let payload = serde_json::to_string(&request).map_err(BybitWsError::from)?;
-        self.send_text(&payload).await?;
+        self.send_order_text(&payload).await?;
 
         Ok(batch_req_id)
     }
@@ -1554,6 +1621,18 @@ impl BybitWebSocketClient {
         &self,
         orders: Vec<BybitWsCancelOrderParams>,
     ) -> BybitWsResult<Vec<String>> {
+        let req_ids = orders
+            .chunks(BATCH_PROCESSING_LIMIT)
+            .map(|_| UUID4::new().to_string())
+            .collect();
+        self.batch_cancel_orders_with_ids(orders, req_ids).await
+    }
+
+    pub(crate) async fn batch_cancel_orders_with_ids(
+        &self,
+        orders: Vec<BybitWsCancelOrderParams>,
+        req_ids: Vec<String>,
+    ) -> BybitWsResult<Vec<String>> {
         self.require_authenticated().await?;
 
         if orders.is_empty() {
@@ -1561,11 +1640,14 @@ impl BybitWebSocketClient {
             return Ok(vec![]);
         }
 
-        let mut req_ids = Vec::new();
-
-        for chunk in orders.chunks(BATCH_PROCESSING_LIMIT) {
-            let req_id = self.batch_cancel_orders_chunk(chunk.to_vec()).await?;
-            req_ids.push(req_id);
+        for (written, (chunk, req_id)) in orders
+            .chunks(BATCH_PROCESSING_LIMIT)
+            .zip(&req_ids)
+            .enumerate()
+        {
+            self.batch_cancel_orders_chunk(chunk.to_vec(), req_id.clone())
+                .await
+                .map_err(|error| classify_batch_send_error(error, written, req_ids.len()))?;
         }
 
         Ok(req_ids)
@@ -1574,13 +1656,13 @@ impl BybitWebSocketClient {
     async fn batch_cancel_orders_chunk(
         &self,
         orders: Vec<BybitWsCancelOrderParams>,
+        batch_req_id: String,
     ) -> BybitWsResult<String> {
         if orders.is_empty() {
             return Ok(String::new());
         }
 
         let category = orders[0].category;
-        let batch_req_id = UUID4::new().to_string();
 
         let request_items: Vec<BybitWsBatchCancelItem> = orders
             .into_iter()
@@ -1604,122 +1686,9 @@ impl BybitWebSocketClient {
         };
 
         let payload = serde_json::to_string(&request).map_err(BybitWsError::from)?;
-        self.send_text(&payload).await?;
+        self.send_order_text(&payload).await?;
 
         Ok(batch_req_id)
-    }
-
-    /// Submits an order using Nautilus domain objects.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if order submission fails or if not authenticated.
-    #[expect(clippy::too_many_arguments)]
-    pub async fn submit_order(
-        &self,
-        product_type: BybitProductType,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
-        order_side: OrderSide,
-        order_type: OrderType,
-        quantity: Quantity,
-        is_quote_quantity: bool,
-        time_in_force: Option<TimeInForce>,
-        price: Option<Price>,
-        trigger_price: Option<Price>,
-        trigger_type: Option<TriggerType>,
-        post_only: Option<bool>,
-        reduce_only: Option<bool>,
-        is_leverage: bool,
-        position_idx: Option<BybitPositionIdx>,
-        bbo_side_type: Option<BybitBboSideType>,
-        bbo_level: Option<String>,
-    ) -> BybitWsResult<String> {
-        let params = self.build_place_order_params(
-            product_type,
-            instrument_id,
-            client_order_id,
-            order_side,
-            order_type,
-            quantity,
-            is_quote_quantity,
-            time_in_force,
-            price,
-            trigger_price,
-            trigger_type,
-            post_only,
-            reduce_only,
-            is_leverage,
-            None,
-            None,
-            position_idx,
-            bbo_side_type,
-            bbo_level,
-        )?;
-
-        self.place_order(params).await
-    }
-
-    /// Modifies an existing order using Nautilus domain objects.
-    ///
-    /// The take-profit and stop-loss fields reach the venue as given: `None` leaves the order's
-    /// attached level unchanged, and `"0"` cancels it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if modification fails or if not authenticated.
-    #[expect(clippy::too_many_arguments)]
-    pub async fn modify_order(
-        &self,
-        product_type: BybitProductType,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
-        venue_order_id: Option<VenueOrderId>,
-        quantity: Option<Quantity>,
-        price: Option<Price>,
-        tpsl_mode: Option<BybitTpSlMode>,
-        take_profit: Option<String>,
-        stop_loss: Option<String>,
-        tp_trigger_by: Option<BybitTriggerType>,
-        sl_trigger_by: Option<BybitTriggerType>,
-    ) -> BybitWsResult<String> {
-        let mut params = self.build_amend_order_params(
-            product_type,
-            instrument_id,
-            venue_order_id,
-            Some(client_order_id),
-            quantity,
-            price,
-        )?;
-        params.tpsl_mode = tpsl_mode;
-        params.take_profit = take_profit;
-        params.stop_loss = stop_loss;
-        params.tp_trigger_by = tp_trigger_by;
-        params.sl_trigger_by = sl_trigger_by;
-
-        self.amend_order(params).await
-    }
-
-    /// Cancels an order using Nautilus domain objects.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if cancellation fails or if not authenticated.
-    pub async fn cancel_order_by_id(
-        &self,
-        product_type: BybitProductType,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
-        venue_order_id: Option<VenueOrderId>,
-    ) -> BybitWsResult<String> {
-        let params = self.build_cancel_order_params(
-            product_type,
-            instrument_id,
-            venue_order_id,
-            Some(client_order_id),
-        )?;
-
-        self.cancel_order(params).await
     }
 
     /// Builds order params for placing an order.
@@ -1980,12 +1949,16 @@ impl BybitWebSocketClient {
         Ok(())
     }
 
-    async fn send_text(&self, text: &str) -> BybitWsResult<()> {
-        let cmd = HandlerCommand::SendText {
+    async fn send_order_text(&self, text: &str) -> BybitWsResult<()> {
+        let (completion, result) = tokio::sync::oneshot::channel();
+        self.send_cmd(HandlerCommand::SendOrder {
             payload: text.to_string(),
-        };
-
-        self.send_cmd(cmd).await
+            completion,
+        })
+        .await?;
+        result
+            .await
+            .map_err(|_| BybitWsError::ClientError("WebSocket handler gone".into()))?
     }
 
     async fn send_cmd(&self, cmd: HandlerCommand) -> BybitWsResult<()> {
@@ -1994,6 +1967,17 @@ impl BybitWebSocketClient {
             .await
             .send(cmd)
             .map_err(|e| BybitWsError::Send(e.to_string()))
+    }
+}
+
+fn classify_batch_send_error(error: BybitWsError, written: usize, total: usize) -> BybitWsError {
+    if written == 0 {
+        error
+    } else {
+        BybitWsError::WriteUndetermined(format!(
+            "chunk {} of {total} failed after {written} were written: {error}",
+            written + 1,
+        ))
     }
 }
 
@@ -2335,5 +2319,23 @@ mod tests {
         assert_eq!(params.price, None);
         assert_eq!(params.bbo_side_type, Some(BybitBboSideType::Queue));
         assert_eq!(params.bbo_level.as_deref(), Some("2"));
+    }
+
+    #[rstest]
+    #[case(0, false)]
+    #[case(1, true)]
+    fn test_partly_written_batch_is_undetermined(#[case] written: usize, #[case] unknown: bool) {
+        let error = classify_batch_send_error(
+            BybitWsError::ClientError("WebSocket not active".into()),
+            written,
+            2,
+        );
+        if unknown {
+            assert!(matches!(error, BybitWsError::WriteUndetermined(message)
+                if message == "chunk 2 of 2 failed after 1 were written: Client error: WebSocket not active"));
+        } else {
+            assert!(matches!(error, BybitWsError::ClientError(message)
+                if message == "WebSocket not active"));
+        }
     }
 }

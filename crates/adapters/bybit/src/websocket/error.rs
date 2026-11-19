@@ -47,6 +47,10 @@ pub enum BybitWsError {
     /// Client-side validation or logic error.
     #[error("Client error: {0}")]
     ClientError(String),
+
+    /// A write started, but its delivery could not be determined.
+    #[error("WebSocket write undetermined: {0}")]
+    WriteUndetermined(String),
 }
 
 impl From<SendError> for BybitWsError {
@@ -86,11 +90,27 @@ pub(crate) fn should_retry_bybit_error(error: &BybitWsError) -> bool {
                 || msg_lower.contains("network")
         }
         BybitWsError::NotConnected => true,
-        BybitWsError::Authentication(_) | BybitWsError::Json(_) => false,
+        BybitWsError::Authentication(_)
+        | BybitWsError::Json(_)
+        | BybitWsError::WriteUndetermined(_) => false,
     }
 }
 
 /// Creates a timeout error for Bybit operations.
 pub(crate) fn create_bybit_timeout_error(msg: String) -> BybitWsError {
     BybitWsError::ClientError(msg)
+}
+
+#[cfg(test)]
+mod order_shape_tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_write_undetermined_never_retries() {
+        assert!(!should_retry_bybit_error(&BybitWsError::WriteUndetermined(
+            "write timeout".into(),
+        )));
+    }
 }

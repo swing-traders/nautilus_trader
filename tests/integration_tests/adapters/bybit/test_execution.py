@@ -33,6 +33,7 @@ from nautilus_trader.adapters.bybit.execution import _is_post_cancel_lookup_erro
 from nautilus_trader.adapters.bybit.execution import _parse_bybit_tp_sl_params
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.core import nautilus_pyo3
+from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateFillReports
@@ -130,6 +131,211 @@ def exec_client_builder(
         return client, ws_private_client, mock_http_client, mock_instrument_provider
 
     return builder
+
+
+def _order_shape_order(index=0):
+    return LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=create_bybit_linear_perpetual().id,
+        client_order_id=ClientOrderId(f"O-SHAPE-{index}"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.100"),
+        price=Price.from_str("50000.00"),
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_trade_client_auth_wait_is_zero_and_private_client_keeps_default(
+    exec_client_builder,
+    monkeypatch,
+):
+    client, private, _, _ = exec_client_builder(monkeypatch)
+    client._ws_trade_client.set_auth_wait_timeout.assert_called_once_with(0.0)
+    private.set_auth_wait_timeout.assert_not_called()
+
+    # A re-authenticating trade endpoint cannot accept the current order.
+    client._ws_trade_client.submit_order.side_effect = nautilus_pyo3.BybitOrderNotSentError(
+        "Authentication error: Must be authenticated"
+    )
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+    order = _order_shape_order()
+    await asyncio.wait_for(
+        client._submit_order(
+            SubmitOrder(
+                trader_id=order.trader_id,
+                strategy_id=order.strategy_id,
+                order=order,
+                command_id=TestIdStubs.uuid(),
+                ts_init=0,
+            ),
+        ),
+        timeout=0.1,
+    )
+    client.generate_order_rejected.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("demo", [False, True])
+@pytest.mark.parametrize("order_count", [1, 3])
+async def test_submit_order_shape_not_sent(
+    exec_client_builder,
+    monkeypatch,
+    demo,
+    order_count,
+):
+    config = {
+        "position_mode": {
+            create_bybit_linear_perpetual().id.symbol.value: (
+                nautilus_pyo3.BybitPositionMode.BOTH_SIDES
+            ),
+        },
+    }
+    if demo:
+        config["environment"] = nautilus_pyo3.BybitEnvironment.DEMO
+    client, _, http, _ = exec_client_builder(monkeypatch, config_kwargs=config)
+    endpoint = http if demo else client._ws_trade_client
+    message = "Authentication error: Must be authenticated"
+    error = nautilus_pyo3.BybitOrderNotSentError(message)
+    endpoint.submit_order = AsyncMock(side_effect=error)
+    endpoint.batch_place_orders = AsyncMock(side_effect=error)
+    client.generate_order_submitted = MagicMock()
+    client.generate_order_rejected = MagicMock()
+    orders = [_order_shape_order(index) for index in range(order_count)]
+    if order_count == 1:
+        command = SubmitOrder(
+            trader_id=orders[0].trader_id,
+            strategy_id=orders[0].strategy_id,
+            order=orders[0],
+            command_id=TestIdStubs.uuid(),
+            ts_init=0,
+        )
+        await client._submit_order(command)
+    else:
+        command = SubmitOrderList(
+            trader_id=orders[0].trader_id,
+            strategy_id=orders[0].strategy_id,
+            order_list=OrderList(TestIdStubs.order_list_id(), orders),
+            command_id=TestIdStubs.uuid(),
+            ts_init=0,
+        )
+        await client._submit_order_list(command)
+    assert client.generate_order_submitted.call_count == order_count
+    assert client.generate_order_rejected.call_count == order_count
+    for order in orders:
+        client.generate_order_rejected.assert_any_call(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            reason=f"not sent: {message}",
+            ts_event=ANY,
+            due_post_only=False,
+        )
+        assert order.client_order_id not in client._order_position_ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "demo", "failure", "expected"),
+    [
+        ("modify", False, "not_sent", "not sent: Client error: WebSocket client is closed"),
+        ("cancel", False, "not_sent", "not sent: Client error: WebSocket client is closed"),
+        ("modify", False, "unknown", None),
+        ("cancel", False, "unknown", None),
+        ("batch_cancel", False, "unknown", None),
+        ("cancel", True, "lookup", None),
+        ("modify", True, "network", None),
+        ("modify", True, "validation", "not sent: Parameter validation error: bad quantity"),
+        ("cancel", True, "gone", "Bybit error 110001: order not exists"),
+    ],
+)
+async def test_modify_cancel_order_shape(
+    exec_client_builder,
+    monkeypatch,
+    cache,
+    operation,
+    demo,
+    failure,
+    expected,
+):
+    config = {}
+    if demo:
+        config["environment"] = nautilus_pyo3.BybitEnvironment.DEMO
+    client, _, http, _ = exec_client_builder(monkeypatch, config_kwargs=config)
+    endpoint = http if demo else client._ws_trade_client
+    if failure == "not_sent":
+        error = nautilus_pyo3.BybitOrderNotSentError("Client error: WebSocket client is closed")
+    elif failure == "validation":
+        error = nautilus_pyo3.BybitOrderNotSentError(
+            "Parameter validation error: bad quantity",
+        )
+    elif failure == "gone":
+        error = ValueError("Bybit error 110001: order not exists")
+    elif failure == "lookup":
+        error = RuntimeError("Order lookup failed after cancellation: connection closed")
+    elif failure == "network":
+        error = RuntimeError("Network error: connection closed")
+    else:
+        error = RuntimeError("WebSocket write undetermined: write timeout")
+    order = _order_shape_order()
+    cache.add_order(order, None)
+    client.generate_order_modify_rejected = MagicMock()
+    client.generate_order_cancel_rejected = MagicMock()
+    if operation == "modify":
+        endpoint.modify_order = AsyncMock(side_effect=error)
+        command = ModifyOrder(
+            trader_id=order.trader_id,
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=None,
+            quantity=Quantity.from_str("0.200"),
+            price=Price.from_str("51000.00"),
+            trigger_price=None,
+            command_id=TestIdStubs.uuid(),
+            ts_init=0,
+        )
+        await client._modify_order(command)
+        rejected = client.generate_order_modify_rejected
+    else:
+        cancel = CancelOrder(
+            trader_id=order.trader_id,
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=None,
+            command_id=TestIdStubs.uuid(),
+            ts_init=0,
+        )
+        if operation == "batch_cancel":
+            endpoint.batch_cancel_orders = AsyncMock(side_effect=error)
+            command = BatchCancelOrders(
+                trader_id=order.trader_id,
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                cancels=[cancel],
+                command_id=TestIdStubs.uuid(),
+                ts_init=0,
+            )
+            await client._batch_cancel_orders(command)
+        else:
+            endpoint.cancel_order = AsyncMock(side_effect=error)
+            await client._cancel_order(cancel)
+        rejected = client.generate_order_cancel_rejected
+    if expected is None:
+        rejected.assert_not_called()
+    else:
+        rejected.assert_called_once_with(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            reason=expected,
+            ts_event=ANY,
+        )
 
 
 @pytest.mark.asyncio
@@ -2188,7 +2394,7 @@ async def test_submit_order_demo_confirmed_rejection_emits_order_rejected(
 
 
 @pytest.mark.asyncio
-async def test_submit_order_live_ws_failure_waits_for_reconciliation(
+async def test_submit_order_live_ws_write_undetermined_waits_for_reconciliation(
     exec_client_builder,
     monkeypatch,
 ):
@@ -2204,7 +2410,9 @@ async def test_submit_order_live_ws_failure_waits_for_reconciliation(
 
     ws_trade_client = client._ws_trade_client
     ws_trade_client.submit_order = AsyncMock(
-        side_effect=RuntimeError("Network error: connection closed"),
+        side_effect=RuntimeError(
+            "WebSocket write undetermined: send failed: timed out writing to transport, delivery undetermined",
+        ),
     )
     client.generate_order_submitted = MagicMock()
     client.generate_order_rejected = MagicMock()
@@ -2344,7 +2552,7 @@ async def test_submit_order_list_demo_confirmed_rejection_emits_order_rejected(
 
 
 @pytest.mark.asyncio
-async def test_submit_order_list_live_ws_failure_waits_for_reconciliation(
+async def test_submit_order_list_live_ws_write_undetermined_waits_for_reconciliation(
     exec_client_builder,
     monkeypatch,
 ):
@@ -2361,7 +2569,9 @@ async def test_submit_order_list_live_ws_failure_waits_for_reconciliation(
     ws_trade_client = client._ws_trade_client
     ws_trade_client.build_place_order_params = MagicMock(return_value=MagicMock())
     ws_trade_client.batch_place_orders = AsyncMock(
-        side_effect=RuntimeError("Network error: connection closed"),
+        side_effect=RuntimeError(
+            "WebSocket write undetermined: send failed: timed out writing to transport, delivery undetermined",
+        ),
     )
     client.generate_order_submitted = MagicMock()
     client.generate_order_rejected = MagicMock()
@@ -3309,6 +3519,7 @@ async def test_modify_order_rejection(exec_client_builder, monkeypatch, instrume
     # Arrange
     client, ws_client, http_client, instrument_provider = exec_client_builder(
         monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
     )
     await client._connect()
 
@@ -3340,11 +3551,20 @@ async def test_modify_order_rejection(exec_client_builder, monkeypatch, instrume
         client_id=None,
     )
 
-    http_client.modify_order.side_effect = Exception("Order not found")
+    http_client.modify_order.side_effect = ValueError("Bybit error 110001: order not exists")
+    client.generate_order_modify_rejected = MagicMock()
 
     try:
         # Act/Assert - Should handle gracefully
         await client._modify_order(command)
+        client.generate_order_modify_rejected.assert_called_once_with(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            reason="Bybit error 110001: order not exists",
+            ts_event=ANY,
+        )
     finally:
         await client._disconnect()
 
@@ -3354,6 +3574,7 @@ async def test_cancel_order_rejection(exec_client_builder, monkeypatch, instrume
     # Arrange
     client, ws_client, http_client, instrument_provider = exec_client_builder(
         monkeypatch,
+        config_kwargs={"environment": nautilus_pyo3.BybitEnvironment.DEMO},
     )
     await client._connect()
 
@@ -3382,11 +3603,20 @@ async def test_cancel_order_rejection(exec_client_builder, monkeypatch, instrume
         client_id=None,
     )
 
-    http_client.cancel_order.side_effect = Exception("Order already filled")
+    http_client.cancel_order.side_effect = ValueError("Bybit error 110001: order not exists")
+    client.generate_order_cancel_rejected = MagicMock()
 
     try:
         # Act/Assert - Should handle gracefully
         await client._cancel_order(command)
+        client.generate_order_cancel_rejected.assert_called_once_with(
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            reason="Bybit error 110001: order not exists",
+            ts_event=ANY,
+        )
     finally:
         await client._disconnect()
 

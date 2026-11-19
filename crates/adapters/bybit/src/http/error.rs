@@ -90,6 +90,9 @@ pub enum BybitHttpError {
     /// Generic network error (for retries, cancellations, etc).
     #[error("Network error: {0}")]
     NetworkError(String),
+    /// The connection failed before a request could be sent.
+    #[error("HTTP connection failed: {0}")]
+    ConnectError(String),
     /// Any unknown HTTP status or unexpected response from Bybit.
     #[error("Unexpected HTTP status code {status}: {body}")]
     UnexpectedStatus { status: u16, body: String },
@@ -148,7 +151,10 @@ pub enum BybitModifyOrderError {
 
 impl From<HttpClientError> for BybitHttpError {
     fn from(error: HttpClientError) -> Self {
-        Self::NetworkError(error.to_string())
+        match error {
+            HttpClientError::ConnectError(message) => Self::ConnectError(message),
+            other => Self::NetworkError(other.to_string()),
+        }
     }
 }
 

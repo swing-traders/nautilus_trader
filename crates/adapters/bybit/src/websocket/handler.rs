@@ -21,6 +21,7 @@ use std::sync::{
 };
 
 use nautilus_network::{
+    error::SendError,
     retry::{RetryManager, create_websocket_retry_manager},
     websocket::{AuthTracker, SubscriptionState, WebSocketClient},
 };
@@ -40,10 +41,34 @@ use super::{
 pub enum HandlerCommand {
     SetClient(WebSocketClient),
     Disconnect,
-    Authenticate { payload: String },
-    Subscribe { topics: Vec<String> },
-    Unsubscribe { topics: Vec<String> },
-    SendText { payload: String },
+    Authenticate {
+        payload: String,
+    },
+    Subscribe {
+        topics: Vec<String>,
+    },
+    Unsubscribe {
+        topics: Vec<String>,
+    },
+    SendText {
+        payload: String,
+    },
+    SendOrder {
+        payload: String,
+        completion: tokio::sync::oneshot::Sender<Result<(), BybitWsError>>,
+    },
+}
+
+fn classify_order_send_error(error: SendError) -> BybitWsError {
+    match error {
+        SendError::Closed | SendError::Timeout | SendError::ConnectionChanged => {
+            BybitWsError::ClientError(format!("Order was not written: {error}"))
+        }
+        SendError::WriteTimeout => BybitWsError::WriteUndetermined(error.to_string()),
+        SendError::BrokenPipe(message) => {
+            BybitWsError::WriteUndetermined(SendError::BrokenPipe(message).to_string())
+        }
+    }
 }
 
 pub(super) struct BybitWsFeedHandler {
@@ -149,6 +174,18 @@ impl BybitWsFeedHandler {
                             if let Err(e) = self.send_with_retry(payload).await {
                                 log::error!("Error sending text with retry: {e}");
                             }
+                        }
+                        HandlerCommand::SendOrder { payload, completion } => {
+                            let result = match &self.inner {
+                                None => Err(BybitWsError::ClientError("No active WebSocket client".into())),
+                                Some(client) if !client.is_active() => {
+                                    Err(BybitWsError::ClientError("WebSocket not active".into()))
+                                }
+                                Some(client) => client.send_text_on_connection(
+                                    payload, None, client.connection_epoch(),
+                                ).await.map_err(classify_order_send_error),
+                            };
+                            let _ = completion.send(result);
                         }
                     }
                 }
@@ -439,6 +476,53 @@ mod tests {
     #[rstest]
     fn test_handler_initializes() {
         let _handler = create_test_handler();
+    }
+
+    #[rstest]
+    #[case(nautilus_network::error::SendError::Closed, false)]
+    #[case(nautilus_network::error::SendError::Timeout, false)]
+    #[case(nautilus_network::error::SendError::ConnectionChanged, false)]
+    #[case(nautilus_network::error::SendError::WriteTimeout, true)]
+    #[case(nautilus_network::error::SendError::BrokenPipe("write failed".into()), true)]
+    fn test_classify_order_send_error(
+        #[case] error: nautilus_network::error::SendError,
+        #[case] undetermined: bool,
+    ) {
+        let result = classify_order_send_error(error);
+        if undetermined {
+            assert!(matches!(result, BybitWsError::WriteUndetermined(_)));
+        } else {
+            assert!(matches!(result, BybitWsError::ClientError(message)
+                if message.starts_with("Order was not written")));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_order_without_inner_client_answers_not_sent() {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = BybitWsFeedHandler::new(
+            Arc::new(AtomicBool::new(false)),
+            cmd_rx,
+            raw_rx,
+            AuthTracker::new(),
+            SubscriptionState::new(BYBIT_WS_TOPIC_DELIMITER),
+        );
+        let (completion, result) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(HandlerCommand::SendOrder {
+                payload: "order".into(),
+                completion,
+            })
+            .unwrap();
+        tokio::select! {
+            _ = handler.next() => panic!("handler exited before completion"),
+            result = result => assert!(matches!(result.unwrap(),
+                Err(BybitWsError::ClientError(message)) if message == "No active WebSocket client")),
+            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => panic!("completion missing"),
+        }
+        assert!(handler.inner.is_none());
+        assert!(handler.cmd_rx.is_empty());
     }
 
     #[rstest]

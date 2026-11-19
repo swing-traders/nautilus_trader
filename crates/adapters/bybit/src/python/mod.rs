@@ -222,6 +222,10 @@ pub fn bybit(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::common::types::BybitMarginStatusResult>()?;
     m.add_class::<crate::websocket::client::BybitWebSocketClient>()?;
     m.add_class::<crate::websocket::messages::BybitWebSocketError>()?;
+    m.add(
+        "BybitOrderNotSentError",
+        m.py().get_type::<websocket::BybitOrderNotSentError>(),
+    )?;
     m.add_class::<params::BybitWsPlaceOrderParams>()?;
     m.add_class::<params::BybitWsAmendOrderParams>()?;
     m.add_class::<params::BybitWsCancelOrderParams>()?;

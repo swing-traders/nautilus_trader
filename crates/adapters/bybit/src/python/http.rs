@@ -712,21 +712,21 @@ impl BybitHttpClient {
         let bbo_side_type = bbo_side_type
             .map(|value| parse_bbo_side_type(&value))
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(crate::python::websocket::to_pyorder_not_sent)?;
         let bbo_level = bbo_level
             .map(parse_bbo_level)
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(crate::python::websocket::to_pyorder_not_sent)?;
         if bbo_side_type.is_some() != bbo_level.is_some() {
-            return Err(to_pyvalue_err(anyhow::anyhow!(
-                "'bbo_side_type' and 'bbo_level' must be provided together"
-            )));
+            return Err(crate::python::websocket::to_pyorder_not_sent(
+                anyhow::anyhow!("'bbo_side_type' and 'bbo_level' must be provided together"),
+            ));
         }
 
         let native_tp_sl: Option<RustNativeTpSlParams> = native_tp_sl
             .map(RustNativeTpSlParams::try_from)
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(crate::python::websocket::to_pyorder_not_sent)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = client
@@ -751,7 +751,7 @@ impl BybitHttpClient {
                     native_tp_sl.as_ref(),
                 )
                 .await
-                .map_err(to_pyvalue_err)?;
+                .map_err(to_pyorder_http_err)?;
 
             Python::attach(|py| report.into_py_any(py))
         })
@@ -806,15 +806,15 @@ impl BybitHttpClient {
         let tpsl_mode = tpsl_mode
             .map(|value| parse_tpsl_mode(&value))
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(crate::python::websocket::to_pyorder_not_sent)?;
         let tp_trigger_by = tp_trigger_by
             .map(|value| parse_trigger_type(&value))
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(crate::python::websocket::to_pyorder_not_sent)?;
         let sl_trigger_by = sl_trigger_by
             .map(|value| parse_trigger_type(&value))
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(crate::python::websocket::to_pyorder_not_sent)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = client
@@ -833,7 +833,7 @@ impl BybitHttpClient {
                     sl_trigger_by,
                 )
                 .await
-                .map_err(to_pyvalue_err)?;
+                .map_err(to_pyorder_http_err)?;
 
             Python::attach(|py| report.into_py_any(py))
         })
@@ -871,7 +871,7 @@ impl BybitHttpClient {
                     venue_order_id,
                 )
                 .await
-                .map_err(to_pyvalue_err)?;
+                .map_err(to_pyorder_http_err)?;
 
             Python::attach(|py| report.into_py_any(py))
         })
@@ -1417,12 +1417,42 @@ impl BybitHttpClient {
     }
 }
 
+fn to_pyorder_http_err(error: anyhow::Error) -> PyErr {
+    use crate::{
+        execution::{BybitCommandFailureKind, classify_http_failure},
+        http::error::{BybitCancelOrderError, BybitModifyOrderError, BybitSubmitOrderError},
+        python::websocket::to_pyorder_not_sent,
+    };
+
+    for cause in error.chain() {
+        if let Some(submit) = cause.downcast_ref::<BybitSubmitOrderError>() {
+            return match submit {
+                BybitSubmitOrderError::Rejected { .. } => to_pyvalue_err(error),
+                _ => to_pyruntime_err(error),
+            };
+        }
+        if cause.downcast_ref::<BybitCancelOrderError>().is_some()
+            || cause.downcast_ref::<BybitModifyOrderError>().is_some()
+        {
+            return to_pyruntime_err(error);
+        }
+    }
+    match classify_http_failure(&error) {
+        BybitCommandFailureKind::LocalValidation => to_pyorder_not_sent(error),
+        BybitCommandFailureKind::StructuredVenueRejection => to_pyvalue_err(error),
+        BybitCommandFailureKind::Ambiguous => to_pyruntime_err(error),
+    }
+}
+
 impl From<BybitHttpError> for PyErr {
     fn from(error: BybitHttpError) -> Self {
         match error {
             // Runtime/operational errors
             BybitHttpError::Canceled(msg) => to_pyruntime_err(format!("Request canceled: {msg}")),
             BybitHttpError::NetworkError(msg) => to_pyruntime_err(format!("Network error: {msg}")),
+            BybitHttpError::ConnectError(msg) => {
+                to_pyruntime_err(format!("HTTP connection failed: {msg}"))
+            }
             BybitHttpError::UnexpectedStatus { status, body } => {
                 to_pyruntime_err(format!("Unexpected HTTP status code {status}: {body}"))
             }
@@ -1440,5 +1470,61 @@ impl From<BybitHttpError> for PyErr {
                 message,
             } => to_pyvalue_err(format!("Bybit error {error_code}: {message}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod order_shape_tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{http::error::BybitSubmitOrderError, python::websocket::BybitOrderNotSentError};
+
+    #[rstest]
+    fn test_order_http_error_mapping() {
+        Python::initialize();
+        Python::attach(|py| {
+            let rejected = to_pyorder_http_err(
+                BybitSubmitOrderError::Rejected {
+                    reason: "EC_PostOnlyWillTakeLiquidity".into(),
+                }
+                .into(),
+            );
+            assert!(rejected.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert!(
+                rejected
+                    .value(py)
+                    .to_string()
+                    .starts_with("Order rejected: ")
+            );
+            let lookup = to_pyorder_http_err(
+                BybitSubmitOrderError::PostSubmitLookup {
+                    source: anyhow::anyhow!("lookup failed"),
+                }
+                .into(),
+            );
+            assert!(lookup.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert!(!lookup.is_instance_of::<BybitOrderNotSentError>(py));
+            let invalid =
+                to_pyorder_http_err(BybitHttpError::ValidationError("invalid side".into()).into());
+            assert!(invalid.is_instance_of::<BybitOrderNotSentError>(py));
+            let ambiguous = to_pyorder_http_err(
+                BybitHttpError::BybitError {
+                    error_code: 10006,
+                    message: "rate limit".into(),
+                }
+                .into(),
+            );
+            assert!(ambiguous.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert!(!ambiguous.is_instance_of::<BybitOrderNotSentError>(py));
+            let gone = to_pyorder_http_err(
+                BybitHttpError::BybitError {
+                    error_code: 110001,
+                    message: "order not exists".into(),
+                }
+                .into(),
+            );
+            assert!(gone.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        });
     }
 }

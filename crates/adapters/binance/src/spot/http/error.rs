@@ -99,7 +99,9 @@ impl From<HttpClientError> for BinanceSpotHttpError {
             HttpClientError::InvalidProxy(msg) | HttpClientError::ClientBuildError(msg) => {
                 Self::NetworkError(msg)
             }
-            HttpClientError::Error(msg) => Self::NetworkError(msg),
+            HttpClientError::Error(msg) | HttpClientError::ConnectError(msg) => {
+                Self::NetworkError(msg)
+            }
         }
     }
 }

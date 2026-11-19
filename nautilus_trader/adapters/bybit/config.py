@@ -147,17 +147,13 @@ class BybitExecClientConfig(LiveExecClientConfig, frozen=True):
     ignore_uncached_instrument_executions : bool, default False
         If True, execution message for instruments not contained in the cache are ignored instead of raising an error.
     max_retries : PositiveInt, optional
-        The maximum number of times a submit, cancel or modify order request will be retried.
+        The maximum number of retries for HTTP reads. State-changing requests are sent once.
     retry_delay_initial_ms : PositiveInt, optional
         The initial delay (milliseconds) between retries. Short delays with frequent retries may result in account bans.
     retry_delay_max_ms : PositiveInt, optional
         The maximum delay (milliseconds) between retries.
     recv_window_ms : PositiveInt, default 5000
         The receive window (milliseconds) for Bybit HTTP requests.
-    ws_trade_timeout_secs : PositiveFloat, default 5.0
-        The timeout for trade websocket messages.
-    ws_auth_timeout_secs : PositiveFloat, default 5.0
-        The timeout for auth websocket messages.
     futures_leverages : dict[str, PositiveInt], optional
         The leverages for futures.
     position_mode : dict[str, BybitPositionMode], optional
@@ -190,8 +186,6 @@ class BybitExecClientConfig(LiveExecClientConfig, frozen=True):
     retry_delay_initial_ms: PositiveInt | None = None
     retry_delay_max_ms: PositiveInt | None = None
     recv_window_ms: PositiveInt = 5_000
-    ws_trade_timeout_secs: PositiveFloat | None = 5.0
-    ws_auth_timeout_secs: PositiveFloat | None = 5.0
     futures_leverages: dict[str, PositiveInt] | None = None
     position_mode: dict[str, BybitPositionMode] | None = None
     margin_mode: BybitMarginMode | None = None

@@ -173,7 +173,6 @@ class BybitExecutionClient(LiveExecutionClient):
         self._log.info(f"{config.use_http_batch_api=}", LogColor.BLUE)
         self._log.info(f"{config.use_spot_position_reports=}", LogColor.BLUE)
         self._log.info(f"{config.ignore_uncached_instrument_executions=}", LogColor.BLUE)
-        self._log.info(f"{config.ws_trade_timeout_secs=}", LogColor.BLUE)
         self._log.info(f"{config.proxy_url=}", LogColor.BLUE)
 
         # Set account ID
@@ -213,6 +212,7 @@ class BybitExecutionClient(LiveExecutionClient):
                 proxy_url=config.proxy_url,
             )
         )
+        self._ws_trade_client.set_auth_wait_timeout(0.0)
         self._ws_client_futures: set[asyncio.Future] = set()
 
         # Hot caches for fill-side order context
@@ -1099,25 +1099,7 @@ class BybitExecutionClient(LiveExecutionClient):
                     bbo_level=tp_sl.get("bbo_level"),
                 )
         except Exception as e:
-            error_msg = str(e)
-            if not _is_confirmed_submit_rejection_error(e):
-                self._log.error(
-                    f"Submit failure without confirmed venue rejection for {order.client_order_id}: "
-                    f"{error_msg}; awaiting reconciliation",
-                )
-                return
-
-            self._log.error(f"Order rejected by venue {order.client_order_id}: {e}")
-            self._order_position_ids.pop(order.client_order_id, None)
-
-            self.generate_order_rejected(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                reason=error_msg,
-                ts_event=self._clock.timestamp_ns(),
-                due_post_only="EC_PostOnlyWillTakeLiquidity" in error_msg,
-            )
+            self._handle_submit_failure(order, e)
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
         if not command.order_list.orders:
@@ -1245,24 +1227,7 @@ class BybitExecutionClient(LiveExecutionClient):
                     native_tp_sl=_build_native_tp_sl_params(tp_sl),
                 )
             except Exception as e:
-                error_msg = str(e)
-                if not _is_confirmed_submit_rejection_error(e):
-                    self._log.error(
-                        f"Submit failure without confirmed venue rejection for {order.client_order_id}: "
-                        f"{error_msg}; awaiting reconciliation",
-                    )
-                    continue
-
-                self._log.error(f"Order rejected by venue {order.client_order_id}: {e}")
-                self._order_position_ids.pop(order.client_order_id, None)
-                self.generate_order_rejected(
-                    strategy_id=order.strategy_id,
-                    instrument_id=order.instrument_id,
-                    client_order_id=order.client_order_id,
-                    reason=error_msg,
-                    ts_event=self._clock.timestamp_ns(),
-                    due_post_only="EC_PostOnlyWillTakeLiquidity" in error_msg,
-                )
+                self._handle_submit_failure(order, e)
 
     async def _submit_order_list_ws(
         self,
@@ -1374,10 +1339,20 @@ class BybitExecutionClient(LiveExecutionClient):
                     pyo3_strategy_id,
                     order_params,
                 )
+            except nautilus_pyo3.BybitOrderNotSentError as e:
+                for order in orders:
+                    self._order_position_ids.pop(order.client_order_id, None)
+                    self.generate_order_rejected(
+                        strategy_id=order.strategy_id,
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        reason=f"not sent: {e}",
+                        ts_event=self._clock.timestamp_ns(),
+                        due_post_only=False,
+                    )
             except Exception as e:
-                self._log.error(
-                    f"Submit order list failure without confirmed venue rejection: {e}; "
-                    "awaiting reconciliation",
+                self._log.warning(
+                    f"Submit order list outcome unknown: {e}; awaiting reconciliation",
                 )
 
     async def _modify_order(self, command: ModifyOrder) -> None:
@@ -1489,15 +1464,7 @@ class BybitExecutionClient(LiveExecutionClient):
                     sl_trigger_by=params.get("sl_trigger_by"),
                 )
         except Exception as e:
-            self._log.error(f"Failed to modify order {command.client_order_id}: {e}")
-            self.generate_order_modify_rejected(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                venue_order_id=order.venue_order_id,
-                reason=str(e),
-                ts_event=self._clock.timestamp_ns(),
-            )
+            self._handle_modify_cancel_failure(order, e, is_cancel=False)
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         order: Order | None = self._cache.order(command.client_order_id)
@@ -1545,29 +1512,78 @@ class BybitExecutionClient(LiveExecutionClient):
                     venue_order_id=pyo3_venue_order_id,
                 )
         except Exception as e:
-            if self._is_demo and _is_post_cancel_lookup_error(e):
-                self._log.info(
-                    f"Cancel of {command.client_order_id} not confirmed by lookup: {e}; "
-                    "on demo the venue completed the cancel and the authoritative "
-                    "`OrderCanceled` follows over the private WebSocket",
-                )
-            elif self._is_demo and _is_gone_order_cancel_error(e):
-                self._log.info(
-                    f"Cancel of {command.client_order_id} found no order: {e}; "
-                    "on demo the venue had already removed the order and the authoritative "
-                    "terminal event follows over the private WebSocket",
-                )
-            else:
-                self._log.error(f"Failed to cancel order {command.client_order_id}: {e}")
+            self._handle_modify_cancel_failure(order, e, is_cancel=True)
 
-            self.generate_order_cancel_rejected(
+    def _handle_submit_failure(self, order: Order, error: Exception) -> None:
+        if isinstance(error, nautilus_pyo3.BybitOrderNotSentError):
+            reason = f"not sent: {error}"
+            due_post_only = False
+        elif self._is_demo and _is_confirmed_submit_rejection_error(error):
+            reason = str(error)
+            due_post_only = "EC_PostOnlyWillTakeLiquidity" in reason
+        else:
+            reason = None
+            due_post_only = False
+            self._log.warning(
+                f"Submit outcome unknown for {order.client_order_id}: "
+                f"{error}; awaiting reconciliation",
+            )
+
+        if reason is not None:
+            self._order_position_ids.pop(order.client_order_id, None)
+            self.generate_order_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
                 client_order_id=order.client_order_id,
-                venue_order_id=order.venue_order_id,
-                reason=str(e),
+                reason=reason,
                 ts_event=self._clock.timestamp_ns(),
+                due_post_only=due_post_only,
             )
+
+    def _handle_modify_cancel_failure(
+        self,
+        order: Order,
+        error: Exception,
+        *,
+        is_cancel: bool,
+    ) -> None:
+        if isinstance(error, nautilus_pyo3.BybitOrderNotSentError):
+            reason = f"not sent: {error}"
+        elif self._is_demo and isinstance(error, ValueError):
+            reason = str(error)
+            if is_cancel and _is_gone_order_cancel_error(error):
+                self._log.info(
+                    f"Cancel of {order.client_order_id} found no order: {error}; "
+                    "on demo the venue had already removed the order and the authoritative "
+                    "terminal event follows over the private WebSocket",
+                )
+        else:
+            reason = None
+            operation = "Cancel" if is_cancel else "Modify"
+            self._log.warning(
+                f"{operation} outcome unknown for {order.client_order_id}: "
+                f"{error}; awaiting reconciliation",
+            )
+
+        if reason is not None:
+            if is_cancel:
+                self.generate_order_cancel_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=order.venue_order_id,
+                    reason=reason,
+                    ts_event=self._clock.timestamp_ns(),
+                )
+            else:
+                self.generate_order_modify_rejected(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=order.venue_order_id,
+                    reason=reason,
+                    ts_event=self._clock.timestamp_ns(),
+                )
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
         if command.order_side != OrderSide.NO_ORDER_SIDE:
@@ -1630,29 +1646,31 @@ class BybitExecutionClient(LiveExecutionClient):
                         venue_order_id=pyo3_venue_order_id,
                     )
                 except Exception as e:
-                    if self._is_demo and _is_post_cancel_lookup_error(e):
-                        self._log.info(
-                            f"Cancel of {cancel.client_order_id} not confirmed by lookup: {e}; "
-                            "on demo the venue completed the cancel and the authoritative "
-                            "`OrderCanceled` follows over the private WebSocket",
-                        )
-                    elif self._is_demo and _is_gone_order_cancel_error(e):
-                        self._log.info(
-                            f"Cancel of {cancel.client_order_id} found no order: {e}; "
-                            "on demo the venue had already removed the order and the authoritative "
-                            "terminal event follows over the private WebSocket",
-                        )
+                    if isinstance(e, nautilus_pyo3.BybitOrderNotSentError):
+                        reason = f"not sent: {e}"
+                    elif isinstance(e, ValueError):
+                        reason = str(e)
+                        if _is_gone_order_cancel_error(e):
+                            self._log.info(
+                                f"Cancel of {cancel.client_order_id} found no order: {e}; "
+                                "on demo the venue had already removed the order and the authoritative "
+                                "terminal event follows over the private WebSocket",
+                            )
                     else:
-                        self._log.error(f"Failed to cancel order {cancel.client_order_id}: {e}")
+                        reason = None
+                        self._log.warning(
+                            f"Cancel outcome unknown for {cancel.client_order_id}: "
+                            f"{e}; awaiting reconciliation",
+                        )
 
                     order = self._cache.order(cancel.client_order_id)
-                    if order and not order.is_closed:
+                    if reason is not None and order and not order.is_closed:
                         self.generate_order_cancel_rejected(
                             strategy_id=order.strategy_id,
                             instrument_id=order.instrument_id,
                             client_order_id=order.client_order_id,
                             venue_order_id=order.venue_order_id,
-                            reason=str(e),
+                            reason=reason,
                             ts_event=self._clock.timestamp_ns(),
                         )
             return
@@ -1690,8 +1708,7 @@ class BybitExecutionClient(LiveExecutionClient):
                     pyo3_strategy_id,
                     order_params,
                 )
-            except Exception as e:
-                self._log.error(f"Failed to batch cancel orders: {e}")
+            except nautilus_pyo3.BybitOrderNotSentError as e:
                 for cancel in command.cancels:
                     order = self._cache.order(cancel.client_order_id)
                     if order and not order.is_closed:
@@ -1700,9 +1717,13 @@ class BybitExecutionClient(LiveExecutionClient):
                             instrument_id=order.instrument_id,
                             client_order_id=order.client_order_id,
                             venue_order_id=order.venue_order_id,
-                            reason=str(e),
+                            reason=f"not sent: {e}",
                             ts_event=self._clock.timestamp_ns(),
                         )
+            except Exception as e:
+                self._log.warning(
+                    f"Batch cancel outcome unknown: {e}; awaiting reconciliation",
+                )
 
     # -- MESSAGE HANDLERS -------------------------------------------------------------------------
 

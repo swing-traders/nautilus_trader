@@ -544,11 +544,14 @@ impl BybitRawHttpClient {
         };
 
         let should_retry = |error: &BybitHttpError| -> bool {
-            match error {
-                BybitHttpError::NetworkError(_) => true,
-                BybitHttpError::UnexpectedStatus { status, .. } => *status == 429 || *status >= 500,
-                _ => false,
-            }
+            matches!(method, Method::GET | Method::HEAD)
+                && match error {
+                    BybitHttpError::NetworkError(_) | BybitHttpError::ConnectError(_) => true,
+                    BybitHttpError::UnexpectedStatus { status, .. } => {
+                        *status == 429 || *status >= 500
+                    }
+                    _ => false,
+                }
         };
 
         let create_error = |msg: String| -> BybitHttpError {
@@ -5095,5 +5098,46 @@ mod tests {
         );
 
         assert_eq!(warning, expected);
+    }
+
+    #[rstest]
+    #[case(Method::GET, "/v5/market/time", 3)]
+    #[case(Method::POST, "/v5/order/create", 1)]
+    #[case(Method::POST, "/v5/account/set-margin-mode", 1)]
+    #[case(Method::POST, "/v5/position/set-leverage", 1)]
+    #[case(Method::POST, "/v5/position/switch-mode", 1)]
+    #[tokio::test]
+    async fn test_order_posts_are_single_shot_and_gets_retry(
+        #[case] method: Method,
+        #[case] endpoint: &str,
+        #[case] expected: usize,
+    ) {
+        use std::sync::atomic::AtomicUsize;
+
+        use axum::{Router, http::StatusCode, routing::any};
+
+        {
+            let count = Arc::new(AtomicUsize::new(0));
+            let received = Arc::clone(&count);
+            let router = Router::new().route(
+                endpoint,
+                any(move || {
+                    received.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::INTERNAL_SERVER_ERROR }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let client =
+                BybitRawHttpClient::new(Some(format!("http://{address}")), 5, 2, 1, 1, 5_000, None)
+                    .unwrap();
+            let result: Result<BybitServerTimeResponse, _> = client
+                .send_request::<_, ()>(method, endpoint, None, None, false)
+                .await;
+            server.abort();
+            assert!(result.is_err());
+            assert_eq!(count.load(Ordering::SeqCst), expected);
+        }
     }
 }

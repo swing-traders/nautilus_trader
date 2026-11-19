@@ -15,7 +15,7 @@
 
 //! Python bindings for the Bybit WebSocket client.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use ahash::AHashMap;
 use dashmap::DashMap;
@@ -70,6 +70,45 @@ use crate::{
         },
     },
 };
+
+pyo3::create_exception!(
+    nautilus_pyo3,
+    BybitOrderNotSentError,
+    pyo3::exceptions::PyRuntimeError
+);
+
+pub(crate) fn to_pyorder_not_sent(error: impl std::fmt::Display) -> PyErr {
+    BybitOrderNotSentError::new_err(error.to_string())
+}
+
+fn to_pyorder_err(error: crate::websocket::error::BybitWsError) -> PyErr {
+    if matches!(
+        error,
+        crate::websocket::error::BybitWsError::WriteUndetermined(_)
+    ) {
+        to_pyruntime_err(error)
+    } else {
+        to_pyorder_not_sent(error)
+    }
+}
+
+fn finish_py_order<T>(
+    result: crate::websocket::error::BybitWsResult<T>,
+    req_ids: &[String],
+    pending: &DashMap<String, Vec<PendingPyRequest>>,
+) -> PyResult<T> {
+    result.map_err(|error| {
+        if !matches!(
+            error,
+            crate::websocket::error::BybitWsError::WriteUndetermined(_)
+        ) {
+            for req_id in req_ids {
+                pending.remove(req_id);
+            }
+        }
+        to_pyorder_err(error)
+    })
+}
 
 fn validate_bar_type(bar_type: &BarType) -> anyhow::Result<()> {
     let spec = bar_type.spec();
@@ -257,6 +296,12 @@ impl BybitWebSocketClient {
     #[pyo3(name = "set_mm_level")]
     fn py_set_mm_level(&self, mm_level: u8) {
         self.set_mm_level(mm_level);
+    }
+
+    /// Sets the authentication wait for subsequent operations.
+    #[pyo3(name = "set_auth_wait_timeout")]
+    fn py_set_auth_wait_timeout(&mut self, secs: f64) {
+        self.set_auth_wait_timeout(Duration::from_secs_f64(secs));
     }
 
     /// Sets whether bar timestamps use the close time.
@@ -923,20 +968,20 @@ impl BybitWebSocketClient {
         let bbo_side_type = bbo_side_type
             .map(|value| parse_bbo_side_type(&value))
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(to_pyorder_not_sent)?;
         let bbo_level = bbo_level
             .map(parse_bbo_level)
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(to_pyorder_not_sent)?;
         if bbo_side_type.is_some() != bbo_level.is_some() {
-            return Err(to_pyvalue_err(anyhow::anyhow!(
+            return Err(to_pyorder_not_sent(anyhow::anyhow!(
                 "'bbo_side_type' and 'bbo_level' must be provided together"
             )));
         }
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let req_id = client
-                .submit_order(
+            let params = client
+                .build_place_order_params(
                     product_type,
                     instrument_id,
                     client_order_id,
@@ -951,14 +996,16 @@ impl BybitWebSocketClient {
                     post_only,
                     reduce_only,
                     is_leverage,
+                    None,
+                    None,
                     position_idx,
                     bbo_side_type,
                     bbo_level,
                 )
-                .await
-                .map_err(to_pyruntime_err)?;
+                .map_err(to_pyorder_err)?;
+            let req_id = UUID4::new().to_string();
             pending_py_requests.insert(
-                req_id,
+                req_id.clone(),
                 vec![PendingPyRequest {
                     client_order_id,
                     operation: PendingOperation::Place,
@@ -968,6 +1015,8 @@ impl BybitWebSocketClient {
                     venue_order_id: None,
                 }],
             );
+            let result = client.place_order_with_id(params, req_id.clone()).await;
+            finish_py_order(result, std::slice::from_ref(&req_id), &pending_py_requests)?;
             Ok(())
         })
     }
@@ -1019,35 +1068,35 @@ impl BybitWebSocketClient {
         let tpsl_mode = tpsl_mode
             .map(|value| parse_tpsl_mode(&value))
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(to_pyorder_not_sent)?;
         let tp_trigger_by = tp_trigger_by
             .map(|value| parse_trigger_type(&value))
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(to_pyorder_not_sent)?;
         let sl_trigger_by = sl_trigger_by
             .map(|value| parse_trigger_type(&value))
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(to_pyorder_not_sent)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let req_id = client
-                .modify_order(
+            let mut params = client
+                .build_amend_order_params(
                     product_type,
                     instrument_id,
-                    client_order_id,
                     venue_order_id,
+                    Some(client_order_id),
                     quantity,
                     price,
-                    tpsl_mode,
-                    take_profit,
-                    stop_loss,
-                    tp_trigger_by,
-                    sl_trigger_by,
                 )
-                .await
-                .map_err(to_pyruntime_err)?;
+                .map_err(to_pyorder_err)?;
+            params.tpsl_mode = tpsl_mode;
+            params.take_profit = take_profit;
+            params.stop_loss = stop_loss;
+            params.tp_trigger_by = tp_trigger_by;
+            params.sl_trigger_by = sl_trigger_by;
+            let req_id = UUID4::new().to_string();
             pending_py_requests.insert(
-                req_id,
+                req_id.clone(),
                 vec![PendingPyRequest {
                     client_order_id,
                     operation: PendingOperation::Amend,
@@ -1057,6 +1106,8 @@ impl BybitWebSocketClient {
                     venue_order_id,
                 }],
             );
+            let result = client.amend_order_with_id(params, req_id.clone()).await;
+            finish_py_order(result, std::slice::from_ref(&req_id), &pending_py_requests)?;
             Ok(())
         })
     }
@@ -1090,12 +1141,17 @@ impl BybitWebSocketClient {
         let pending_py_requests = Arc::clone(self.pending_py_requests());
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let req_id = client
-                .cancel_order_by_id(product_type, instrument_id, client_order_id, venue_order_id)
-                .await
-                .map_err(to_pyruntime_err)?;
+            let params = client
+                .build_cancel_order_params(
+                    product_type,
+                    instrument_id,
+                    venue_order_id,
+                    Some(client_order_id),
+                )
+                .map_err(to_pyorder_err)?;
+            let req_id = UUID4::new().to_string();
             pending_py_requests.insert(
-                req_id,
+                req_id.clone(),
                 vec![PendingPyRequest {
                     client_order_id,
                     operation: PendingOperation::Cancel,
@@ -1105,6 +1161,8 @@ impl BybitWebSocketClient {
                     venue_order_id,
                 }],
             );
+            let result = client.cancel_order_with_id(params, req_id.clone()).await;
+            finish_py_order(result, std::slice::from_ref(&req_id), &pending_py_requests)?;
             Ok(())
         })
     }
@@ -1158,13 +1216,13 @@ impl BybitWebSocketClient {
         let bbo_side_type = bbo_side_type
             .map(|value| parse_bbo_side_type(&value))
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(to_pyorder_not_sent)?;
         let bbo_level = bbo_level
             .map(parse_bbo_level)
             .transpose()
-            .map_err(to_pyvalue_err)?;
+            .map_err(to_pyorder_not_sent)?;
         if bbo_side_type.is_some() != bbo_level.is_some() {
-            return Err(to_pyvalue_err(anyhow::anyhow!(
+            return Err(to_pyorder_not_sent(anyhow::anyhow!(
                 "'bbo_side_type' and 'bbo_level' must be provided together"
             )));
         }
@@ -1191,7 +1249,7 @@ impl BybitWebSocketClient {
                 bbo_side_type,
                 bbo_level,
             )
-            .map_err(to_pyruntime_err)?;
+            .map_err(to_pyorder_not_sent)?;
         Ok(params.into())
     }
 
@@ -1216,7 +1274,7 @@ impl BybitWebSocketClient {
                 .into_iter()
                 .map(|p| p.try_into())
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(to_pyruntime_err)?;
+                .map_err(to_pyorder_not_sent)?;
 
             let per_order = build_pending_entries(
                 &order_params,
@@ -1225,12 +1283,15 @@ impl BybitWebSocketClient {
                 strategy_id,
             );
 
-            let req_ids = client
-                .batch_cancel_orders(order_params)
-                .await
-                .map_err(to_pyruntime_err)?;
-
-            register_batch_pending(req_ids, &per_order, &pending_py_requests);
+            let req_ids: Vec<String> = per_order
+                .chunks(BATCH_PROCESSING_LIMIT)
+                .map(|_| UUID4::new().to_string())
+                .collect();
+            register_batch_pending(req_ids.clone(), &per_order, &pending_py_requests);
+            let result = client
+                .batch_cancel_orders_with_ids(order_params, req_ids.clone())
+                .await;
+            finish_py_order(result, &req_ids, &pending_py_requests)?;
             Ok(())
         })
     }
@@ -1255,7 +1316,7 @@ impl BybitWebSocketClient {
                 quantity,
                 price,
             )
-            .map_err(to_pyruntime_err)?;
+            .map_err(to_pyorder_not_sent)?;
         Ok(params.into())
     }
 
@@ -1275,7 +1336,7 @@ impl BybitWebSocketClient {
     ) -> PyResult<crate::python::params::BybitWsCancelOrderParams> {
         let params = self
             .build_cancel_order_params(product_type, instrument_id, venue_order_id, client_order_id)
-            .map_err(to_pyruntime_err)?;
+            .map_err(to_pyorder_not_sent)?;
         Ok(params.into())
     }
 
@@ -1295,7 +1356,7 @@ impl BybitWebSocketClient {
                 .into_iter()
                 .map(|p| p.try_into())
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(to_pyruntime_err)?;
+                .map_err(to_pyorder_not_sent)?;
 
             let per_order = build_pending_entries(
                 &order_params,
@@ -1304,12 +1365,15 @@ impl BybitWebSocketClient {
                 strategy_id,
             );
 
-            let req_ids = client
-                .batch_amend_orders(order_params)
-                .await
-                .map_err(to_pyruntime_err)?;
-
-            register_batch_pending(req_ids, &per_order, &pending_py_requests);
+            let req_ids: Vec<String> = per_order
+                .chunks(BATCH_PROCESSING_LIMIT)
+                .map(|_| UUID4::new().to_string())
+                .collect();
+            register_batch_pending(req_ids.clone(), &per_order, &pending_py_requests);
+            let result = client
+                .batch_amend_orders_with_ids(order_params, req_ids.clone())
+                .await;
+            finish_py_order(result, &req_ids, &pending_py_requests)?;
             Ok(())
         })
     }
@@ -1335,7 +1399,7 @@ impl BybitWebSocketClient {
                 .into_iter()
                 .map(|p| p.try_into())
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(to_pyruntime_err)?;
+                .map_err(to_pyorder_not_sent)?;
 
             let per_order = build_pending_entries(
                 &order_params,
@@ -1344,12 +1408,15 @@ impl BybitWebSocketClient {
                 strategy_id,
             );
 
-            let req_ids = client
-                .batch_place_orders(order_params)
-                .await
-                .map_err(to_pyruntime_err)?;
-
-            register_batch_pending(req_ids, &per_order, &pending_py_requests);
+            let req_ids: Vec<String> = per_order
+                .chunks(BATCH_PROCESSING_LIMIT)
+                .map(|_| UUID4::new().to_string())
+                .collect();
+            register_batch_pending(req_ids.clone(), &per_order, &pending_py_requests);
+            let result = client
+                .batch_place_orders_with_ids(order_params, req_ids.clone())
+                .await;
+            finish_py_order(result, &req_ids, &pending_py_requests)?;
             Ok(())
         })
     }
@@ -2044,10 +2111,27 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
     use crate::{
         common::enums::BybitWsOrderRequestOp, http::error::BybitHttpError,
         websocket::messages::BybitWsOrderResponse,
     };
+
+    #[rstest]
+    fn test_order_error_mapping() {
+        Python::initialize();
+        Python::attach(|py| {
+            let unknown = to_pyorder_err(crate::websocket::error::BybitWsError::WriteUndetermined(
+                "write timeout".into(),
+            ));
+            assert!(unknown.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert!(!unknown.is_instance_of::<BybitOrderNotSentError>(py));
+            let not_sent = to_pyorder_err(crate::websocket::error::BybitWsError::Authentication(
+                "Must be authenticated".into(),
+            ));
+            assert!(not_sent.is_instance_of::<BybitOrderNotSentError>(py));
+        });
+    }
 
     const REQ_ID: &str = "req-1";
     const RET_MSG: &str = "trigger price is past the last price";

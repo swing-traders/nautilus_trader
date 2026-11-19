@@ -37,7 +37,7 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    UnixNanos,
+    UUID4, UnixNanos,
     env::get_or_env_var,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
@@ -81,7 +81,7 @@ use crate::{
         },
     },
     websocket::{
-        client::BybitWebSocketClient,
+        client::{BATCH_PROCESSING_LIMIT, BybitWebSocketClient},
         dispatch::{
             OrderIdentity, OrderStateSnapshot, PendingOperation, WsDispatchState,
             dispatch_ws_message,
@@ -1312,21 +1312,23 @@ impl ExecutionClient for BybitExecutionClient {
         let dispatch_state = Arc::clone(&self.dispatch_state);
 
         self.spawn_task("submit_order", async move {
-            match ws_trade.place_order(params).await {
-                Ok(req_id) => {
-                    dispatch_state.pending_requests.insert(
-                        req_id,
-                        (vec![client_order_id], vec![None], PendingOperation::Place),
+            let req_id = UUID4::new().to_string();
+            dispatch_state.pending_requests.insert(
+                req_id.clone(), (vec![client_order_id], vec![None], PendingOperation::Place),
+            );
+            if let Err(error) = ws_trade.place_order_with_id(params, req_id.clone()).await {
+                if is_bybit_ws_local_command_failure(&error) {
+                    dispatch_state.pending_requests.remove(&req_id);
+                    dispatch_state.order_identities.remove(&client_order_id);
+                    dispatch_state.order_snapshots.remove(&client_order_id);
+                    emitter.emit_order_rejected_event(
+                        strategy_id, instrument_id, client_order_id,
+                        &format!("not sent: {error}"), clock.get_time_ns(), false,
                     );
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Submit failure without confirmed venue rejection for {client_order_id}: \
-                         {e}; awaiting reconciliation",
-                    );
+                } else {
+                    log::warn!("Submit outcome unknown for {client_order_id}: {error}; awaiting reconciliation");
                 }
             }
-
             Ok(())
         });
 
@@ -1632,22 +1634,46 @@ impl ExecutionClient for BybitExecutionClient {
         let dispatch_state = Arc::clone(&self.dispatch_state);
 
         self.spawn_task("submit_order_list", async move {
-            match ws_trade.batch_place_orders(order_params).await {
-                Ok(req_ids) => {
-                    for (req_id, chunk_cids) in req_ids
-                        .into_iter()
-                        .zip(client_order_ids.chunks(20).map(|c| c.to_vec()))
-                    {
-                        let chunk_voids = vec![None; chunk_cids.len()];
-                        dispatch_state
-                            .pending_requests
-                            .insert(req_id, (chunk_cids, chunk_voids, PendingOperation::Place));
+            let req_ids: Vec<String> = client_order_ids
+                .chunks(BATCH_PROCESSING_LIMIT)
+                .map(|_| UUID4::new().to_string())
+                .collect();
+            for (req_id, chunk) in req_ids
+                .iter()
+                .zip(client_order_ids.chunks(BATCH_PROCESSING_LIMIT))
+            {
+                dispatch_state.pending_requests.insert(
+                    req_id.clone(),
+                    (
+                        chunk.to_vec(),
+                        vec![None; chunk.len()],
+                        PendingOperation::Place,
+                    ),
+                );
+            }
+            if let Err(error) = ws_trade
+                .batch_place_orders_with_ids(order_params, req_ids.clone())
+                .await
+            {
+                if is_bybit_ws_local_command_failure(&error) {
+                    for req_id in req_ids {
+                        dispatch_state.pending_requests.remove(&req_id);
                     }
-                }
-                Err(e) => {
+                    for client_order_id in client_order_ids {
+                        dispatch_state.order_identities.remove(&client_order_id);
+                        dispatch_state.order_snapshots.remove(&client_order_id);
+                        emitter.emit_order_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            &format!("not sent: {error}"),
+                            clock.get_time_ns(),
+                            false,
+                        );
+                    }
+                } else {
                     log::warn!(
-                        "Submit order list failure without confirmed venue rejection: {e}; \
-                         awaiting reconciliation",
+                        "Submit order list outcome unknown: {error}; awaiting reconciliation"
                     );
                 }
             }
@@ -1773,22 +1799,29 @@ impl ExecutionClient for BybitExecutionClient {
         let dispatch_state = Arc::clone(&self.dispatch_state);
 
         self.spawn_task("modify_order", async move {
-            match ws_trade.amend_order(params).await {
-                Ok(req_id) => {
-                    dispatch_state.pending_requests.insert(
-                        req_id,
-                        (
-                            vec![client_order_id],
-                            vec![venue_order_id],
-                            PendingOperation::Amend,
-                        ),
+            let req_id = UUID4::new().to_string();
+            dispatch_state.pending_requests.insert(
+                req_id.clone(),
+                (
+                    vec![client_order_id],
+                    vec![venue_order_id],
+                    PendingOperation::Amend,
+                ),
+            );
+            if let Err(error) = ws_trade.amend_order_with_id(params, req_id.clone()).await {
+                log_modify_ws_failure(client_order_id, &error);
+                if is_bybit_ws_local_command_failure(&error) {
+                    dispatch_state.pending_requests.remove(&req_id);
+                    emitter.emit_order_modify_rejected_event(
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        venue_order_id,
+                        &format!("not sent: {error}"),
+                        clock.get_time_ns(),
                     );
                 }
-                Err(e) => {
-                    log_modify_ws_failure(client_order_id, &e);
-                }
             }
-
             Ok(())
         });
 
@@ -1865,22 +1898,29 @@ impl ExecutionClient for BybitExecutionClient {
         let dispatch_state = Arc::clone(&self.dispatch_state);
 
         self.spawn_task("cancel_order", async move {
-            match ws_trade.cancel_order(params).await {
-                Ok(req_id) => {
-                    dispatch_state.pending_requests.insert(
-                        req_id,
-                        (
-                            vec![client_order_id],
-                            vec![venue_order_id],
-                            PendingOperation::Cancel,
-                        ),
+            let req_id = UUID4::new().to_string();
+            dispatch_state.pending_requests.insert(
+                req_id.clone(),
+                (
+                    vec![client_order_id],
+                    vec![venue_order_id],
+                    PendingOperation::Cancel,
+                ),
+            );
+            if let Err(error) = ws_trade.cancel_order_with_id(params, req_id.clone()).await {
+                log_cancel_ws_failure(client_order_id, &error);
+                if is_bybit_ws_local_command_failure(&error) {
+                    dispatch_state.pending_requests.remove(&req_id);
+                    emitter.emit_order_cancel_rejected_event(
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        venue_order_id,
+                        &format!("not sent: {error}"),
+                        clock.get_time_ns(),
                     );
                 }
-                Err(e) => {
-                    log_cancel_ws_failure(client_order_id, &e);
-                }
             }
-
             Ok(())
         });
 
@@ -1985,6 +2025,9 @@ impl ExecutionClient for BybitExecutionClient {
             return Ok(());
         }
 
+        let strategy_id = cmd.strategy_id;
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
         let raw_symbol = Ustr::from(extract_raw_symbol(instrument_id.symbol.as_str()));
 
         let mut cancel_params = Vec::with_capacity(cmd.cancels.len());
@@ -2003,31 +2046,42 @@ impl ExecutionClient for BybitExecutionClient {
         let dispatch_state = Arc::clone(&self.dispatch_state);
 
         self.spawn_task("batch_cancel_orders", async move {
-            match ws_trade.batch_cancel_orders(cancel_params).await {
-                Ok(req_ids) => {
-                    for (req_id, (chunk_cids, chunk_voids)) in req_ids.into_iter().zip(
-                        client_order_ids
-                            .chunks(20)
-                            .map(|c| c.to_vec())
-                            .zip(venue_order_ids.chunks(20).map(|c| c.to_vec())),
-                    ) {
-                        dispatch_state
-                            .pending_requests
-                            .insert(req_id, (chunk_cids, chunk_voids, PendingOperation::Cancel));
+            let req_ids: Vec<String> = client_order_ids
+                .chunks(BATCH_PROCESSING_LIMIT)
+                .map(|_| UUID4::new().to_string())
+                .collect();
+            for (req_id, (ids, venue_ids)) in req_ids.iter().zip(
+                client_order_ids
+                    .chunks(BATCH_PROCESSING_LIMIT)
+                    .zip(venue_order_ids.chunks(BATCH_PROCESSING_LIMIT)),
+            ) {
+                dispatch_state.pending_requests.insert(
+                    req_id.clone(),
+                    (ids.to_vec(), venue_ids.to_vec(), PendingOperation::Cancel),
+                );
+            }
+            if let Err(error) = ws_trade
+                .batch_cancel_orders_with_ids(cancel_params, req_ids.clone())
+                .await
+            {
+                if is_bybit_ws_local_command_failure(&error) {
+                    for req_id in req_ids {
+                        dispatch_state.pending_requests.remove(&req_id);
                     }
-                }
-                Err(e) => {
-                    if is_bybit_ws_local_command_failure(&e) {
-                        log::warn!(
-                            "Batch cancel command failed local validation for {} orders: {e}",
-                            client_order_ids.len()
-                        );
-                    } else {
-                        log::warn!(
-                            "Ambiguous batch cancel failure for {} orders, awaiting reconciliation: {e}",
-                            client_order_ids.len()
+                    for (client_order_id, venue_order_id) in
+                        client_order_ids.into_iter().zip(venue_order_ids)
+                    {
+                        emitter.emit_order_cancel_rejected_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            venue_order_id,
+                            &format!("not sent: {error}"),
+                            clock.get_time_ns(),
                         );
                     }
+                } else {
+                    log::warn!("Batch cancel outcome unknown: {error}; awaiting reconciliation");
                 }
             }
             Ok(())
@@ -2038,7 +2092,7 @@ impl ExecutionClient for BybitExecutionClient {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BybitCommandFailureKind {
+pub(crate) enum BybitCommandFailureKind {
     StructuredVenueRejection,
     LocalValidation,
     Ambiguous,
@@ -2066,7 +2120,7 @@ fn classify_modify_http_failure(error: &anyhow::Error) -> BybitCommandFailureKin
     classify_http_failure(error)
 }
 
-fn classify_http_failure(error: &anyhow::Error) -> BybitCommandFailureKind {
+pub(crate) fn classify_http_failure(error: &anyhow::Error) -> BybitCommandFailureKind {
     for cause in error.chain() {
         let Some(http_error) = cause.downcast_ref::<BybitHttpError>() else {
             continue;
@@ -2080,6 +2134,7 @@ fn classify_http_failure(error: &anyhow::Error) -> BybitCommandFailureKind {
             }
             BybitHttpError::BybitError { .. } => BybitCommandFailureKind::StructuredVenueRejection,
             BybitHttpError::MissingCredentials
+            | BybitHttpError::ConnectError(_)
             | BybitHttpError::ValidationError(_)
             | BybitHttpError::BuildError(_) => BybitCommandFailureKind::LocalValidation,
             BybitHttpError::JsonError(_)
@@ -2113,18 +2168,7 @@ fn log_modify_ws_failure(client_order_id: ClientOrderId, error: &BybitWsError) {
 }
 
 fn is_bybit_ws_local_command_failure(error: &BybitWsError) -> bool {
-    matches!(
-        error,
-        BybitWsError::Authentication(_) | BybitWsError::Json(_)
-    ) || matches!(error, BybitWsError::ClientError(message) if !is_bybit_ws_ambiguous_client_error_message(message))
-}
-
-fn is_bybit_ws_ambiguous_client_error_message(message: &str) -> bool {
-    let message = message.to_lowercase();
-    message.contains("timeout")
-        || message.contains("timed out")
-        || message.contains("connection")
-        || message.contains("network")
+    !matches!(error, BybitWsError::WriteUndetermined(_))
 }
 
 impl BybitExecutionClient {
@@ -2229,15 +2273,6 @@ mod tests {
             matches!(event, ExecutionEvent::Order(OrderEventAny::Submitted(ref submitted)) if submitted.client_order_id == client_order_id),
             "expected OrderSubmitted for {client_order_id}, was {event:?}",
         );
-    }
-
-    fn assert_no_order_rejected(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>) {
-        while let Ok(event) = rx.try_recv() {
-            assert!(
-                !matches!(event, ExecutionEvent::Order(OrderEventAny::Rejected(_))),
-                "unexpected OrderRejected event: {event:?}",
-            );
-        }
     }
 
     fn assert_no_order_cancel_rejected(
@@ -2387,17 +2422,100 @@ mod tests {
         assert!(is_bybit_ws_local_command_failure(
             &BybitWsError::ClientError("invalid category".to_string())
         ));
-        assert!(!is_bybit_ws_local_command_failure(
+        assert!(is_bybit_ws_local_command_failure(
             &BybitWsError::ClientError("operation timed out".to_string())
         ));
-        assert!(!is_bybit_ws_local_command_failure(&BybitWsError::Send(
+        assert!(is_bybit_ws_local_command_failure(&BybitWsError::Send(
             "channel closed".to_string()
         )));
+        assert!(!is_bybit_ws_local_command_failure(
+            &BybitWsError::WriteUndetermined("write timeout".into(),)
+        ));
     }
 
     #[rstest]
     #[tokio::test]
-    async fn test_ws_cancel_failure_keeps_outcome_unresolved() {
+    async fn test_connect_failure_keeps_not_sent_classification() {
+        let error = BybitHttpError::from(nautilus_network::http::HttpClientError::ConnectError(
+            "TCP refused".into(),
+        ));
+        assert!(
+            matches!(&error, BybitHttpError::ConnectError(message) if message == "TCP refused")
+        );
+        assert_eq!(
+            classify_http_failure(&anyhow::Error::from(error).context("order request")),
+            BybitCommandFailureKind::LocalValidation,
+        );
+    }
+
+    #[rstest]
+    #[case(Ok(()), true)]
+    #[case(Err(BybitWsError::ClientError("Order was not written: connection changed".into())), false)]
+    #[case(Err(BybitWsError::WriteUndetermined("write timeout".into())), true)]
+    #[tokio::test]
+    async fn test_submit_registers_correlation_before_the_write(
+        #[case] write_result: Result<(), BybitWsError>,
+        #[case] keep: bool,
+    ) {
+        let (mut client, cache) = test_execution_client();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(tx);
+        let mut commands = client.ws_trade.test_order_commands().await;
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTCUSDT-LINEAR.BYBIT"))
+            .client_order_id(ClientOrderId::from("O-CORRELATION"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1"))
+            .price(Price::from("10000.00"))
+            .build();
+        let command = SubmitOrder::new(
+            order.trader_id(),
+            Some(*BYBIT_CLIENT_ID),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            order.init_event().clone(),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+        cache
+            .borrow_mut()
+            .add_order(order, None, Some(*BYBIT_CLIENT_ID), false)
+            .unwrap();
+        client.submit_order(command).unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(5), commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::websocket::handler::HandlerCommand::SendOrder {
+            payload,
+            completion,
+        } = command
+        else {
+            panic!("expected SendOrder, was {command:?}")
+        };
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let req_id = payload["reqId"].as_str().unwrap();
+        let registered = client.dispatch_state.pending_requests.contains_key(req_id);
+        completion.send(write_result).unwrap();
+        wait_for_spawned_tasks(&client).await;
+        assert!(
+            registered,
+            "correlation must exist before the write completes"
+        );
+        assert_eq!(
+            client.dispatch_state.pending_requests.contains_key(req_id),
+            keep
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ws_cancel_not_sent_emits_cancel_rejected() {
         let (mut client, _cache) = test_execution_client();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(tx);
@@ -2408,12 +2526,16 @@ mod tests {
             .unwrap();
         wait_for_spawned_tasks(&client).await;
 
-        assert_no_order_cancel_rejected(&mut rx);
+        let event = rx.try_recv().expect("expected OrderCancelRejected");
+        assert!(
+            matches!(event, ExecutionEvent::Order(OrderEventAny::CancelRejected(ref rejected))
+            if rejected.reason == "not sent: Client error: WebSocket client is closed")
+        );
     }
 
     #[rstest]
     #[tokio::test]
-    async fn test_ws_modify_failure_keeps_outcome_unresolved() {
+    async fn test_ws_modify_not_sent_emits_modify_rejected() {
         let (mut client, _cache) = test_execution_client();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(tx);
@@ -2427,7 +2549,11 @@ mod tests {
             .unwrap();
         wait_for_spawned_tasks(&client).await;
 
-        assert_no_order_modify_rejected(&mut rx);
+        let event = rx.try_recv().expect("expected OrderModifyRejected");
+        assert!(
+            matches!(event, ExecutionEvent::Order(OrderEventAny::ModifyRejected(ref rejected))
+            if rejected.reason == "not sent: Client error: WebSocket client is closed")
+        );
     }
 
     #[rstest]
@@ -2470,7 +2596,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_ws_submit_failure_keeps_order_in_flight_for_reconciliation() {
+    async fn test_ws_submit_not_sent_emits_order_rejected() {
         let (mut client, cache) = test_execution_client();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(tx);
@@ -2515,23 +2641,31 @@ mod tests {
         wait_for_spawned_tasks(&client).await;
 
         assert!(
-            client
+            !client
                 .dispatch_state
                 .order_identities
                 .contains_key(&client_order_id)
         );
         assert!(
-            client
+            !client
                 .dispatch_state
                 .order_snapshots
                 .contains_key(&client_order_id)
         );
-        assert_no_order_rejected(&mut rx);
+        let event = rx
+            .try_recv()
+            .expect("expected immediate OrderRejected event");
+        assert!(matches!(
+            event,
+            ExecutionEvent::Order(OrderEventAny::Rejected(ref rejected))
+                if rejected.client_order_id == client_order_id
+                    && rejected.reason == "not sent: Client error: WebSocket client is closed"
+        ));
     }
 
     #[rstest]
     #[tokio::test]
-    async fn test_ws_submit_order_list_failure_keeps_orders_in_flight_for_reconciliation() {
+    async fn test_ws_submit_order_list_not_sent_emits_orders_rejected() {
         let (mut client, cache) = test_execution_client();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(tx);
@@ -2602,19 +2736,27 @@ mod tests {
 
         for client_order_id in [client_order_id_1, client_order_id_2] {
             assert!(
-                client
+                !client
                     .dispatch_state
                     .order_identities
                     .contains_key(&client_order_id)
             );
             assert!(
-                client
+                !client
                     .dispatch_state
                     .order_snapshots
                     .contains_key(&client_order_id)
             );
+            let event = rx
+                .try_recv()
+                .expect("expected immediate OrderRejected event");
+            assert!(matches!(
+                event,
+                ExecutionEvent::Order(OrderEventAny::Rejected(ref rejected))
+                    if rejected.client_order_id == client_order_id
+                        && rejected.reason == "not sent: Client error: WebSocket client is closed"
+            ));
         }
-        assert_no_order_rejected(&mut rx);
     }
 
     fn sample_order_status_report(

@@ -51,7 +51,7 @@ impl HttpClientError {
     #[must_use]
     pub fn into_py_err(self) -> PyErr {
         match self {
-            Self::Error(e) => PyErr::new::<HttpError, _>(e),
+            Self::Error(e) | Self::ConnectError(e) => PyErr::new::<HttpError, _>(e),
             Self::TimeoutError(e) => PyErr::new::<HttpTimeoutError, _>(e),
             Self::InvalidProxy(e) => PyErr::new::<HttpInvalidProxyError, _>(e),
             Self::ClientBuildError(e) => PyErr::new::<HttpClientBuildError, _>(e),
