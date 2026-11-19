@@ -1481,6 +1481,22 @@ mod order_shape_tests {
     use crate::{http::error::BybitSubmitOrderError, python::websocket::BybitOrderNotSentError};
 
     #[rstest]
+    fn test_untyped_post_send_failure_is_unknown() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = anyhow::anyhow!("invalid quantity in accepted order report")
+                .context("parsing status report after order lookup");
+            assert_eq!(
+                crate::execution::classify_http_failure(&error),
+                crate::execution::BybitCommandFailureKind::Ambiguous,
+            );
+            let mapped = to_pyorder_http_err(error);
+            assert!(mapped.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert!(!mapped.is_instance_of::<BybitOrderNotSentError>(py));
+        });
+    }
+
+    #[rstest]
     fn test_order_http_error_mapping() {
         Python::initialize();
         Python::attach(|py| {

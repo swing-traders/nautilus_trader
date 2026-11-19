@@ -5116,28 +5116,26 @@ mod tests {
 
         use axum::{Router, http::StatusCode, routing::any};
 
-        {
-            let count = Arc::new(AtomicUsize::new(0));
-            let received = Arc::clone(&count);
-            let router = Router::new().route(
-                endpoint,
-                any(move || {
-                    received.fetch_add(1, Ordering::SeqCst);
-                    async { StatusCode::INTERNAL_SERVER_ERROR }
-                }),
-            );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-            let client =
-                BybitRawHttpClient::new(Some(format!("http://{address}")), 5, 2, 1, 1, 5_000, None)
-                    .unwrap();
-            let result: Result<BybitServerTimeResponse, _> = client
-                .send_request::<_, ()>(method, endpoint, None, None, false)
-                .await;
-            server.abort();
-            assert!(result.is_err());
-            assert_eq!(count.load(Ordering::SeqCst), expected);
-        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let received = Arc::clone(&count);
+        let router = Router::new().route(
+            endpoint,
+            any(move || {
+                received.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::INTERNAL_SERVER_ERROR }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client =
+            BybitRawHttpClient::new(Some(format!("http://{address}")), 5, 2, 1, 1, 5_000, None)
+                .unwrap();
+        let result: Result<BybitServerTimeResponse, _> = client
+            .send_request::<_, ()>(method, endpoint, None, None, false)
+            .await;
+        server.abort();
+        assert!(result.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), expected);
     }
 }

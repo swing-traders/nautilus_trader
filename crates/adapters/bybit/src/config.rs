@@ -216,8 +216,8 @@ pub struct BybitExecClientConfig {
     /// Heartbeat interval in seconds for WebSocket clients.
     #[builder(default = 5)]
     pub heartbeat_interval_secs: u64,
-    /// Optional WebSocket authentication wait timeout (seconds), defaulting to
-    /// the client default when unset.
+    /// Optional private-stream WebSocket authentication wait timeout (seconds),
+    /// defaulting to the client default when unset.
     pub auth_timeout_secs: Option<u64>,
     /// Receive window in milliseconds for signed requests.
     #[builder(default = 5_000)]

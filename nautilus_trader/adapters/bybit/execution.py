@@ -2142,17 +2142,6 @@ def _is_confirmed_submit_rejection_error(exc: BaseException) -> bool:
     )
 
 
-# Anchored to the `BybitCancelOrderError::PostCancelLookup` display shape
-# "Order lookup failed after cancellation: {source}", which is the only shape carrying the
-# lookup which follows a cancel the venue has already accepted, so sibling submit and amend
-# lookup variants and every other cancel failure are excluded.
-_BYBIT_POST_CANCEL_LOOKUP_PREFIX = "Order lookup failed after cancellation"
-
-
-def _is_post_cancel_lookup_error(exc: BaseException) -> bool:
-    return str(exc).startswith(_BYBIT_POST_CANCEL_LOOKUP_PREFIX)
-
-
 # Anchored to the `BybitHttpError::BybitError` display shape "Bybit error {error_code}: {message}"
 # carrying code 110001, which Bybit returns for an order it no longer holds, so a reason which
 # merely embeds the shape leaves the order possibly live at the venue and must not be read as

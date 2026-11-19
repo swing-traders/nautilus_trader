@@ -156,9 +156,7 @@ impl BybitExecutionClient {
             config.proxy_url.clone(),
         );
 
-        if let Some(secs) = config.auth_timeout_secs {
-            ws_trade.set_auth_wait_timeout(Duration::from_secs(secs));
-        }
+        ws_trade.set_auth_wait_timeout(Duration::ZERO);
 
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
@@ -2144,12 +2142,12 @@ pub(crate) fn classify_http_failure(error: &anyhow::Error) -> BybitCommandFailur
         };
     }
 
-    BybitCommandFailureKind::LocalValidation
+    BybitCommandFailureKind::Ambiguous
 }
 
 fn log_cancel_ws_failure(client_order_id: ClientOrderId, error: &BybitWsError) {
     if is_bybit_ws_local_command_failure(error) {
-        log::warn!("Cancel command failed local validation for {client_order_id}: {error}");
+        log::warn!("Cancel command not sent for {client_order_id}: {error}");
     } else {
         log::warn!(
             "Ambiguous cancel failure for {client_order_id}, awaiting reconciliation: {error}"
@@ -2159,7 +2157,7 @@ fn log_cancel_ws_failure(client_order_id: ClientOrderId, error: &BybitWsError) {
 
 fn log_modify_ws_failure(client_order_id: ClientOrderId, error: &BybitWsError) {
     if is_bybit_ws_local_command_failure(error) {
-        log::warn!("Modify command failed local validation for {client_order_id}: {error}");
+        log::warn!("Modify command not sent for {client_order_id}: {error}");
     } else {
         log::warn!(
             "Ambiguous modify failure for {client_order_id}, awaiting reconciliation: {error}"
@@ -2250,6 +2248,26 @@ mod tests {
         };
 
         (BybitExecutionClient::new(core, config).unwrap(), cache)
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(17))]
+    fn test_native_trade_auth_wait_is_zero(#[case] auth_timeout_secs: Option<u64>) {
+        let (client, _cache) = test_execution_client();
+        let config = BybitExecClientConfig {
+            api_key: Some("test_key".to_string()),
+            api_secret: Some("test_secret".to_string()),
+            auth_timeout_secs,
+            ..Default::default()
+        };
+        let client = BybitExecutionClient::new(client.core, config).unwrap();
+
+        assert_eq!(client.ws_trade.test_auth_wait_timeout(), Duration::ZERO);
+        assert_eq!(
+            client.ws_private.test_auth_wait_timeout(),
+            Duration::from_secs(auth_timeout_secs.unwrap_or(5)),
+        );
     }
 
     async fn wait_for_spawned_tasks(client: &BybitExecutionClient) {

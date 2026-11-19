@@ -189,9 +189,14 @@ impl BybitWebSocketClient {
     }
 
     /// Sets the timeout for waiting on (re)authentication before failing an
-    /// authenticated operation. Defaults to `AUTH_WAIT_TIMEOUT` (5s).
+    /// authenticated operation.
     pub fn set_auth_wait_timeout(&mut self, timeout: Duration) {
         self.auth_wait_timeout = timeout;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_auth_wait_timeout(&self) -> Duration {
+        self.auth_wait_timeout
     }
 
     #[cfg(test)]
@@ -336,7 +341,7 @@ impl BybitWebSocketClient {
             requires_auth: true,
             auth_tracker: AuthTracker::new(),
             heartbeat: Some(heartbeat),
-            auth_wait_timeout: AUTH_WAIT_TIMEOUT,
+            auth_wait_timeout: Duration::ZERO,
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
@@ -1991,6 +1996,19 @@ mod tests {
         websocket::{messages::BybitWsFrame, parse_bybit_ws_frame},
     };
 
+    #[rstest]
+    fn test_trade_auth_wait_defaults_to_zero() {
+        let client = BybitWebSocketClient::new_trade(
+            BybitEnvironment::Mainnet,
+            Some("test_key".into()),
+            Some("test_secret".into()),
+            None,
+            20,
+            TransportBackend::default(),
+            None,
+        );
+        assert_eq!(client.auth_wait_timeout, Duration::ZERO);
+    }
     #[rstest]
     fn classify_orderbook_snapshot() {
         let json: Value = serde_json::from_str(&load_test_json("ws_orderbook_snapshot.json"))

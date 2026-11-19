@@ -29,7 +29,6 @@ from nautilus_trader.adapters.bybit.constants import BYBIT_VENUE
 from nautilus_trader.adapters.bybit.execution import BybitExecutionClient
 from nautilus_trader.adapters.bybit.execution import _is_confirmed_submit_rejection_error
 from nautilus_trader.adapters.bybit.execution import _is_gone_order_cancel_error
-from nautilus_trader.adapters.bybit.execution import _is_post_cancel_lookup_error
 from nautilus_trader.adapters.bybit.execution import _parse_bybit_tp_sl_params
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.core import nautilus_pyo3
@@ -156,27 +155,6 @@ async def test_trade_client_auth_wait_is_zero_and_private_client_keeps_default(
     client._ws_trade_client.set_auth_wait_timeout.assert_called_once_with(0.0)
     private.set_auth_wait_timeout.assert_not_called()
 
-    # A re-authenticating trade endpoint cannot accept the current order.
-    client._ws_trade_client.submit_order.side_effect = nautilus_pyo3.BybitOrderNotSentError(
-        "Authentication error: Must be authenticated"
-    )
-    client.generate_order_submitted = MagicMock()
-    client.generate_order_rejected = MagicMock()
-    order = _order_shape_order()
-    await asyncio.wait_for(
-        client._submit_order(
-            SubmitOrder(
-                trader_id=order.trader_id,
-                strategy_id=order.strategy_id,
-                order=order,
-                command_id=TestIdStubs.uuid(),
-                ts_init=0,
-            ),
-        ),
-        timeout=0.1,
-    )
-    client.generate_order_rejected.assert_called_once()
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("demo", [False, True])
@@ -239,17 +217,42 @@ async def test_submit_order_shape_not_sent(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("operation", "demo", "failure", "expected"),
+    ("operation", "demo", "error", "expected"),
     [
-        ("modify", False, "not_sent", "not sent: Client error: WebSocket client is closed"),
-        ("cancel", False, "not_sent", "not sent: Client error: WebSocket client is closed"),
-        ("modify", False, "unknown", None),
-        ("cancel", False, "unknown", None),
-        ("batch_cancel", False, "unknown", None),
-        ("cancel", True, "lookup", None),
-        ("modify", True, "network", None),
-        ("modify", True, "validation", "not sent: Parameter validation error: bad quantity"),
-        ("cancel", True, "gone", "Bybit error 110001: order not exists"),
+        (
+            "modify",
+            False,
+            nautilus_pyo3.BybitOrderNotSentError("Client error: WebSocket client is closed"),
+            "not sent: Client error: WebSocket client is closed",
+        ),
+        (
+            "cancel",
+            False,
+            nautilus_pyo3.BybitOrderNotSentError("Client error: WebSocket client is closed"),
+            "not sent: Client error: WebSocket client is closed",
+        ),
+        ("modify", False, RuntimeError("WebSocket write undetermined: write timeout"), None),
+        ("cancel", False, RuntimeError("WebSocket write undetermined: write timeout"), None),
+        ("batch_cancel", False, RuntimeError("WebSocket write undetermined: write timeout"), None),
+        (
+            "cancel",
+            True,
+            RuntimeError("Order lookup failed after cancellation: connection closed"),
+            None,
+        ),
+        ("modify", True, RuntimeError("Network error: connection closed"), None),
+        (
+            "modify",
+            True,
+            nautilus_pyo3.BybitOrderNotSentError("Parameter validation error: bad quantity"),
+            "not sent: Parameter validation error: bad quantity",
+        ),
+        (
+            "cancel",
+            True,
+            ValueError("Bybit error 110001: order not exists"),
+            "Bybit error 110001: order not exists",
+        ),
     ],
 )
 async def test_modify_cancel_order_shape(
@@ -258,7 +261,7 @@ async def test_modify_cancel_order_shape(
     cache,
     operation,
     demo,
-    failure,
+    error,
     expected,
 ):
     config = {}
@@ -266,20 +269,6 @@ async def test_modify_cancel_order_shape(
         config["environment"] = nautilus_pyo3.BybitEnvironment.DEMO
     client, _, http, _ = exec_client_builder(monkeypatch, config_kwargs=config)
     endpoint = http if demo else client._ws_trade_client
-    if failure == "not_sent":
-        error = nautilus_pyo3.BybitOrderNotSentError("Client error: WebSocket client is closed")
-    elif failure == "validation":
-        error = nautilus_pyo3.BybitOrderNotSentError(
-            "Parameter validation error: bad quantity",
-        )
-    elif failure == "gone":
-        error = ValueError("Bybit error 110001: order not exists")
-    elif failure == "lookup":
-        error = RuntimeError("Order lookup failed after cancellation: connection closed")
-    elif failure == "network":
-        error = RuntimeError("Network error: connection closed")
-    else:
-        error = RuntimeError("WebSocket write undetermined: write timeout")
     order = _order_shape_order()
     cache.add_order(order, None)
     client.generate_order_modify_rejected = MagicMock()
@@ -2661,48 +2650,6 @@ async def test_submit_order_list_live_ws_write_undetermined_waits_for_reconcilia
 )
 def test_is_confirmed_submit_rejection_error(exc, expected):
     assert _is_confirmed_submit_rejection_error(exc) is expected
-
-
-@pytest.mark.parametrize(
-    ("exc", "expected"),
-    [
-        (
-            ValueError(
-                "Order lookup failed after cancellation: No order returned after cancellation",
-            ),
-            True,
-        ),
-        # Any source behind the same variant is still the post-cancel lookup shape
-        (
-            ValueError("Order lookup failed after cancellation: Bybit error 10001: Request error"),
-            True,
-        ),
-        # Sibling lookup variants of other request paths must not match
-        (
-            ValueError(
-                "Order lookup failed after submission: No order returned after submission",
-            ),
-            False,
-        ),
-        (
-            ValueError("Order lookup failed after amendment: No order returned after amendment"),
-            False,
-        ),
-        # The gone-order cancel shape is a different variant, matched by its own predicate
-        (ValueError("Bybit error 110001: order does not exist"), False),
-        (ValueError("No order_id in cancel response"), False),
-        (RuntimeError("Network error: Timed out after 60000ms"), False),
-        # The prefix only counts at the start of the reason
-        (
-            ValueError(
-                "Batch cancel failed: Order lookup failed after cancellation: No order returned",
-            ),
-            False,
-        ),
-    ],
-)
-def test_is_post_cancel_lookup_error(exc, expected):
-    assert _is_post_cancel_lookup_error(exc) is expected
 
 
 @pytest.mark.parametrize(
