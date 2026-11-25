@@ -1,15 +1,16 @@
 # Publishes a PEP 503 simple index on GitHub Pages, regenerated from the repo's releases.
 # Wheels stay as release assets; the index links to them with #sha256= fragments taken
 # from each wheel's published .sha256 sibling, so pip verifies what it downloads.
-# Called from the release workflow only: the index derives from releases alone, and an
-# independent branch-push publish races the release's own deployment. Re-run the last
-# run to republish after infrastructure-only changes.
+# Called from the release workflow, or dispatched by hand to rebuild the index from the
+# existing releases; never on a branch push, which would race the release's own deployment.
 name: publish-index
 
 on:
   workflow_call:
+  workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
   pages: write
   id-token: write
@@ -55,4 +56,41 @@ jobs:
         with:
           path: site
 
-      - uses: actions/deploy-pages@v4
+      # deploy-pages can look the artifact up before the run lists it and then fails with
+      # "No artifacts named github-pages", so the deploy waits for the listing and retries.
+      - name: Wait until the run lists the Pages artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            count=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?name=github-pages" -q '.total_count')
+            if [[ "$count" -ge 1 ]]; then
+              echo "github-pages listed after the upload"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::the run did not list the github-pages artifact within 60 s"
+          exit 1
+
+      - id: deploy-1
+        uses: actions/deploy-pages@v4
+        continue-on-error: true
+
+      - if: steps.deploy-1.outcome == 'failure'
+        run: sleep 20
+
+      - id: deploy-2
+        if: steps.deploy-1.outcome == 'failure'
+        uses: actions/deploy-pages@v4
+        continue-on-error: true
+
+      - if: steps.deploy-2.outcome == 'failure'
+        run: sleep 40
+
+      - id: deploy-3
+        if: steps.deploy-2.outcome == 'failure'
+        uses: actions/deploy-pages@v4
