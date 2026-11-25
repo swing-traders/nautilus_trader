@@ -34,11 +34,13 @@
 //! automatically to avoid stalling the worker thread.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fmt::{Debug, Write as _},
-    ops::ControlFlow,
     pin::Pin,
-    sync::mpsc::{self, SyncSender},
+    sync::{
+        Arc,
+        mpsc::{self, SyncSender},
+    },
     time::Duration,
 };
 
@@ -76,12 +78,20 @@ use nautilus_model::{
     position::Position,
     types::{Currency, Money},
 };
-use redis::{AsyncCommands, Pipeline, aio::ConnectionManager};
+use redis::{
+    AsyncCommands, AsyncConnectionConfig, Pipeline,
+    aio::{ConnectionManager, MultiplexedConnection},
+};
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{REDIS_DELIMITER, REDIS_FLUSHDB, get_index_key};
-use crate::redis::{RedisConnectionConfig, create_redis_connection, queries::DatabaseQueries};
+use super::{
+    CountRequest, REDIS_DELIMITER, REDIS_FLUSHDB, WriterState, await_writer, check_redis_version,
+    get_index_key, info_field, is_retryable_error, retry_delay,
+};
+use crate::redis::{
+    RedisConnectionConfig, create_redis_connection, get_redis_url, queries::DatabaseQueries,
+};
 
 // Task and connection names
 const CACHE_READ: &str = "cache-read";
@@ -300,6 +310,7 @@ pub struct RedisCacheDatabase {
     pub bulk_read_batch_size: Option<usize>,
     tx: tokio::sync::mpsc::UnboundedSender<DatabaseCommand>,
     handle: Option<tokio::task::JoinHandle<()>>,
+    writer: Arc<WriterState>,
 }
 
 impl Debug for RedisCacheDatabase {
@@ -335,10 +346,19 @@ impl RedisCacheDatabase {
         let trader_key_clone = trader_key.clone();
         let encoding = config.encoding;
         let bulk_read_batch_size = config.bulk_read_batch_size;
+        let (writer, count_requests) = WriterState::new();
+        let writer_state = writer.clone();
 
         let handle = get_runtime().spawn(async move {
-            if let Err(e) =
-                process_commands(rx, trader_key_clone, config.clone(), database.clone()).await
+            if let Err(e) = process_commands(
+                rx,
+                trader_key_clone,
+                config.clone(),
+                database.clone(),
+                writer_state,
+                count_requests,
+            )
+            .await
             {
                 log::error!("Error in task '{CACHE_PROCESS}': {e}");
             }
@@ -352,6 +372,7 @@ impl RedisCacheDatabase {
             bulk_read_batch_size,
             tx,
             handle: Some(handle),
+            writer,
         })
     }
 
@@ -380,11 +401,10 @@ impl RedisCacheDatabase {
         log_task_awaiting(CACHE_PROCESS);
 
         let (tx, rx) = mpsc::sync_channel(1);
+        let writer = self.writer.clone();
 
         get_runtime().spawn(async move {
-            if let Err(e) = handle.await {
-                log::error!("Error awaiting task '{CACHE_PROCESS}': {e:?}");
-            }
+            await_writer(handle, CACHE_PROCESS, &writer).await;
             let _ = tx.send(());
         });
         let _ = blocking_recv(&rx);
@@ -644,14 +664,24 @@ fn blocking_recv<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
 }
 
 async fn process_commands(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<DatabaseCommand>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<DatabaseCommand>,
     trader_key: String,
     config: CacheConfig,
     database: RedisCacheConfig,
+    state: Arc<WriterState>,
+    count_requests: tokio::sync::mpsc::UnboundedReceiver<CountRequest>,
 ) -> anyhow::Result<()> {
     log_task_started(CACHE_PROCESS);
 
-    let mut con = create_redis_connection(CACHE_WRITE, &database).await?;
+    let mut writer = CacheWriter::new(
+        rx,
+        count_requests,
+        trader_key,
+        config.encoding,
+        database,
+        state,
+    )?;
+    writer.set_up().await?;
 
     // Buffering
     let mut buffer: VecDeque<DatabaseCommand> = VecDeque::new();
@@ -663,39 +693,21 @@ async fn process_commands(
     let flush_timer = tokio::time::sleep(buffer_interval);
     tokio::pin!(flush_timer);
 
-    // Continue to receive and handle messages until channel is hung up
-    loop {
+    // Continue to receive and handle messages until closed or the channel is hung up
+    while !writer.closing {
         tokio::select! {
-            maybe_cmd = rx.recv() => {
-                let result = handle_command(
-                    maybe_cmd,
-                    &mut buffer,
-                    buffer_interval,
-                    &mut con,
-                    &trader_key,
-                    config.encoding,
-                ).await;
-
-                if result.is_break() {
-                    break;
-                }
+            maybe_cmd = writer.rx.recv() => {
+                handle_command(&mut writer, maybe_cmd, &mut buffer, buffer_interval).await;
             }
             () = &mut flush_timer, if !buffer_interval.is_zero() => {
-                flush_buffer(
-                    &mut buffer,
-                    &mut con,
-                    &trader_key,
-                    config.encoding,
-                    &mut flush_timer,
-                    buffer_interval,
-                ).await;
+                flush_buffer(&mut writer, &mut buffer, &mut flush_timer, buffer_interval).await;
             }
         }
     }
 
     // Drain any remaining messages
     if !buffer.is_empty() {
-        drain_buffer(&mut con, &trader_key, config.encoding, &mut buffer).await;
+        writer.drain_buffer(&mut buffer).await;
     }
 
     log_task_stopped(CACHE_PROCESS);
@@ -703,137 +715,727 @@ async fn process_commands(
 }
 
 async fn handle_command(
+    writer: &mut CacheWriter,
     maybe_cmd: Option<DatabaseCommand>,
     buffer: &mut VecDeque<DatabaseCommand>,
     buffer_interval: Duration,
-    con: &mut ConnectionManager,
-    trader_key: &str,
-    encoding: SerializationEncoding,
-) -> ControlFlow<()> {
+) {
     let Some(cmd) = maybe_cmd else {
         log::debug!("Command channel closed");
-        return ControlFlow::Break(());
+        writer.closing = true;
+        return;
     };
 
     log::trace!("Received {cmd:?}");
 
     match cmd.op_type {
-        DatabaseOperation::Close => {
-            if !buffer.is_empty() {
-                drain_buffer(con, trader_key, encoding, buffer).await;
-            }
-            return ControlFlow::Break(());
+        DatabaseOperation::Close => writer.closing = true,
+        DatabaseOperation::Flush(_) => {
+            buffer.push_back(cmd);
+            writer.drain_buffer(buffer).await;
         }
-        DatabaseOperation::Flush(reply_tx) => {
-            if !buffer.is_empty() {
-                drain_buffer(con, trader_key, encoding, buffer).await;
+        _ => {
+            buffer.push_back(cmd);
+            if buffer_interval.is_zero() {
+                writer.drain_buffer(buffer).await;
             }
-
-            if let Err(e) = redis::cmd(REDIS_FLUSHDB).query_async::<()>(con).await {
-                log::error!("Failed to flush database: {e:?}");
-            }
-            let _ = reply_tx.send(());
-            return ControlFlow::Continue(());
         }
-        _ => {}
     }
-
-    buffer.push_back(cmd);
-
-    if buffer_interval.is_zero() {
-        drain_buffer(con, trader_key, encoding, buffer).await;
-    }
-
-    ControlFlow::Continue(())
 }
 
 async fn flush_buffer(
+    writer: &mut CacheWriter,
     buffer: &mut VecDeque<DatabaseCommand>,
-    con: &mut ConnectionManager,
-    trader_key: &str,
-    encoding: SerializationEncoding,
     flush_timer: &mut Pin<&mut tokio::time::Sleep>,
     buffer_interval: Duration,
 ) {
     if !buffer.is_empty() {
-        drain_buffer(con, trader_key, encoding, buffer).await;
+        writer.drain_buffer(buffer).await;
     }
     flush_timer
         .as_mut()
         .reset(tokio::time::Instant::now() + buffer_interval);
 }
 
-async fn drain_buffer(
-    conn: &mut ConnectionManager,
-    trader_key: &str,
-    encoding: SerializationEncoding,
-    buffer: &mut VecDeque<DatabaseCommand>,
-) {
-    let mut pipe = redis::pipe();
-    pipe.atomic();
-    let mut has_pending_ops = false;
+/// The cache writer's connection, owned by the writer so that a connection it replaces can be
+/// fenced off.
+struct WriteConnection {
+    con: MultiplexedConnection,
+    run_id: String,
+    client_id: i64,
+}
 
-    for msg in buffer.drain(..) {
-        let Some(key) = msg.key else {
-            log::error!("Null key found for message: {msg:?}");
-            continue;
+/// A trader key's one cache writer: it delivers its commands in order, retrying until Redis
+/// answers. While a delivery fails it takes newer commands in as they arrive, holding for each
+/// replacing write only the latest to its target, and every append.
+struct CacheWriter {
+    rx: tokio::sync::mpsc::UnboundedReceiver<DatabaseCommand>,
+    count_requests: tokio::sync::mpsc::UnboundedReceiver<CountRequest>,
+    trader_key: String,
+    encoding: SerializationEncoding,
+    database: RedisCacheConfig,
+    state: Arc<WriterState>,
+    client: redis::Client,
+    connection: Option<WriteConnection>,
+    /// The server run and client id of every connection replaced since the last fence.
+    replaced: Vec<(String, i64)>,
+    held: Held,
+    /// The transaction last sent whose answer never came.
+    unanswered: Option<Attempt>,
+    /// Consecutive unanswered requests, for the backoff.
+    failures: usize,
+    /// Whether a delivery is failing: from the start until the first delivery, and from any
+    /// unanswered request until a delivery.
+    failing: bool,
+    /// Whether newer commands are taken in while the writer waits: from an unanswered request
+    /// until a delivery.
+    retrying: bool,
+    closing: bool,
+}
+
+impl CacheWriter {
+    fn new(
+        rx: tokio::sync::mpsc::UnboundedReceiver<DatabaseCommand>,
+        count_requests: tokio::sync::mpsc::UnboundedReceiver<CountRequest>,
+        trader_key: String,
+        encoding: SerializationEncoding,
+        database: RedisCacheConfig,
+        state: Arc<WriterState>,
+    ) -> anyhow::Result<Self> {
+        let (redis_url, _) = get_redis_url(&database);
+        let client = redis::Client::open(redis_url)?;
+        Ok(Self {
+            rx,
+            count_requests,
+            held: Held::new(trader_key.clone()),
+            trader_key,
+            encoding,
+            database,
+            state,
+            client,
+            connection: None,
+            replaced: Vec::new(),
+            unanswered: None,
+            failures: 0,
+            failing: true,
+            retrying: false,
+            closing: false,
+        })
+    }
+
+    fn held_count(&self) -> usize {
+        self.held.len() + self.rx.len()
+    }
+
+    /// Connects, then delivers what was taken in while connecting.
+    async fn set_up(&mut self) -> redis::RedisResult<()> {
+        self.connected().await?;
+        self.deliver_held().await;
+        Ok(())
+    }
+
+    /// Delivers the buffered commands in order, each run of writes as one transaction.
+    async fn drain_buffer(&mut self, buffer: &mut VecDeque<DatabaseCommand>) {
+        for cmd in buffer.drain(..) {
+            self.held.push_command(cmd, false);
+        }
+        self.deliver_held().await;
+    }
+
+    /// Delivers everything held, in order; holding nothing, no delivery is failing.
+    async fn deliver_held(&mut self) {
+        while let Some((&id, op)) = self.held.ops.first_key_value() {
+            match op {
+                Op::Write(_) => self.deliver_writes().await,
+                Op::UpdateOrder { .. } => self.read_order(id).await,
+                Op::IndexOrder { .. } => self.index_order(id),
+                Op::Flush(_) => self.flush(id).await,
+            }
+        }
+        self.delivered();
+    }
+
+    /// Delivers the front run of writes as one transaction until Redis answers it. After a failure
+    /// it first asks whether the unanswered transaction landed, then sends what it still holds,
+    /// which includes what was taken in meanwhile.
+    async fn deliver_writes(&mut self) {
+        loop {
+            if self.held.front_run().next().is_none() {
+                self.unanswered = None;
+                return;
+            }
+
+            // A transaction appending no event cannot tell whether it landed, and is sent again
+            let provable = self
+                .unanswered
+                .take()
+                .filter(|attempt| !attempt.proofs.is_empty());
+            if let Some(attempt) = provable {
+                match self.landed(&attempt).await {
+                    Ok(landed) => {
+                        self.answered();
+                        if landed {
+                            self.held.remove_through(attempt.last_id);
+                            self.delivered();
+                        }
+                    }
+                    Err(e) if is_retryable_error(&e) => {
+                        self.unanswered = Some(attempt);
+                        self.retry_after(&e).await;
+                    }
+                    Err(e) => {
+                        log::error!("{e}");
+                        self.held.remove_through(attempt.last_id);
+                        self.failed();
+                    }
+                }
+            } else {
+                let (pipe, attempt) = self.held.transaction();
+                match self.send::<()>(pipe).await {
+                    Ok(()) => {
+                        self.answered();
+                        self.held.remove_through(attempt.last_id);
+                        self.delivered();
+                    }
+                    Err(e) if is_retryable_error(&e) => {
+                        self.unanswered = Some(attempt);
+                        self.retry_after(&e).await;
+                    }
+                    Err(e) => {
+                        log::error!("{e}");
+                        self.held.remove_through(attempt.last_id);
+                        self.failed();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `attempt` landed: true when any list it appended an event to, and did not replace
+    /// after, ends with that event, since no event repeats another and the writer is its trader
+    /// key's only one.
+    async fn landed(&mut self, attempt: &Attempt) -> redis::RedisResult<bool> {
+        let mut pipe = redis::pipe();
+        for (key, _) in &attempt.proofs {
+            pipe.lrange(key, -1, -1);
+        }
+        let tails: Vec<Vec<Bytes>> = self.send(pipe).await?;
+        Ok(attempt
+            .proofs
+            .iter()
+            .zip(&tails)
+            .any(|((_, event), tail)| tail.first() == Some(event)))
+    }
+
+    /// Reads the stored events of the order update `id`, then holds in its place its event's
+    /// append and the order's re-index.
+    async fn read_order(&mut self, id: i64) {
+        let Some(Op::UpdateOrder { key, payload }) = self.held.ops.get(&id) else {
+            panic!("held op {id} is not an order update");
+        };
+        let key = key.clone();
+        let payload = payload.clone();
+        if let Err(e) = check_slice_not_empty(&payload, stringify!(payload)) {
+            log::error!("{e}");
+            self.held.remove(id);
+            return;
+        }
+
+        let mut pipe = redis::pipe();
+        pipe.lrange(&key, 0, -1);
+        let read = self.until_answered::<(Vec<Bytes>,)>(pipe).await;
+        self.held.remove(id);
+        match read {
+            Ok((stored,)) if stored.is_empty() => {
+                log::warn!("Cannot update order in Redis, no existing state at {key}");
+            }
+            Ok((stored,)) => {
+                let appended = payload[0].clone();
+                let append = Write::Append {
+                    key: key.clone(),
+                    value: appended.clone(),
+                    if_exists: true,
+                    unique: true,
+                };
+                self.held.push_front(Op::IndexOrder {
+                    key,
+                    stored,
+                    appended,
+                });
+                self.held.push_front(Op::Write(append));
+            }
+            Err(e) => {
+                log::error!("{e}");
+                self.failed();
+            }
+        }
+    }
+
+    fn index_order(&mut self, id: i64) {
+        let Some(Op::IndexOrder {
+            key,
+            stored,
+            appended,
+        }) = self.held.remove(id)
+        else {
+            panic!("held op {id} is not an order re-index");
+        };
+        match order_from_events(self.encoding, &key, &stored, &appended) {
+            Ok(order) => {
+                let mut writes = Vec::new();
+                update_order_indexes(&mut writes, &self.trader_key, &order);
+                for write in writes.into_iter().rev() {
+                    self.held.push_front(Op::Write(write));
+                }
+            }
+            Err(e) => log::error!("{e}"),
+        }
+    }
+
+    async fn flush(&mut self, id: i64) {
+        let mut pipe = redis::pipe();
+        pipe.cmd(REDIS_FLUSHDB);
+        let flushed = self.until_answered::<()>(pipe).await;
+        let Some(Op::Flush(reply_tx)) = self.held.remove(id) else {
+            panic!("held op {id} is not a flush");
+        };
+        match flushed {
+            Ok(()) => self.delivered(),
+            Err(e) => {
+                log::error!("Failed to flush database: {e:?}");
+                self.failed();
+            }
+        }
+        let _ = reply_tx.send(());
+    }
+
+    /// Sends `pipe`, which is safe to repeat, until Redis answers it.
+    async fn until_answered<T: redis::FromRedisValue>(
+        &mut self,
+        pipe: Pipeline,
+    ) -> redis::RedisResult<T> {
+        loop {
+            match self.send(pipe.clone()).await {
+                Err(e) if is_retryable_error(&e) => self.retry_after(&e).await,
+                result => {
+                    self.answered();
+                    return result;
+                }
+            }
+        }
+    }
+
+    /// Sends `pipe` once on the write connection.
+    async fn send<T: redis::FromRedisValue>(&mut self, pipe: Pipeline) -> redis::RedisResult<T> {
+        let mut con = self.connected().await?;
+        self.draining(async move { pipe.query_async::<T>(&mut con).await })
+            .await
+    }
+
+    /// The write connection, connected first when there is none. A new connection kills every
+    /// connection replaced since the last fence before it carries anything, so a write still in
+    /// flight on one either ran before the kill, where the new connection's reads see it, or never
+    /// runs.
+    async fn connected(&mut self) -> redis::RedisResult<MultiplexedConnection> {
+        loop {
+            if let Some(connection) = &self.connection {
+                return Ok(connection.con.clone());
+            }
+
+            let opened = open_write_connection(
+                self.client.clone(),
+                write_connection_config(&self.database),
+                self.replaced.clone(),
+            );
+            match self.draining(opened).await {
+                Ok(connection) => {
+                    self.answered();
+                    self.replaced.clear();
+                    self.connection = Some(connection);
+                }
+                Err(e) if is_retryable_error(&e) => self.retry_after(&e).await,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Waits the config's backoff after a retryable failure, first replacing the connection when
+    /// the failure is one a connection does not recover from. Entering retry compacts what is
+    /// held to the latest value of each target.
+    async fn retry_after(&mut self, error: &redis::RedisError) {
+        log::error!("Error in task '{CACHE_PROCESS}', retrying until Redis answers: {error}");
+        if error.is_unrecoverable_error()
+            && let Some(replaced) = self.connection.take()
+        {
+            self.replaced.push((replaced.run_id, replaced.client_id));
+        }
+        if !self.retrying {
+            self.retrying = true;
+            self.held.compact();
+        }
+        self.failed();
+        let delay = retry_delay(&self.database, self.failures);
+        self.failures = self.failures.saturating_add(1);
+        self.draining(tokio::time::sleep(delay)).await;
+    }
+
+    fn answered(&mut self) {
+        self.failures = 0;
+    }
+
+    /// Marks a delivery failing: a sent request failed, by an error or a timeout.
+    fn failed(&mut self) {
+        self.failing = true;
+        self.state.set_failing(true);
+    }
+
+    fn delivered(&mut self) {
+        self.retrying = false;
+        self.failing = false;
+        self.state.set_failing(false);
+    }
+
+    /// Awaits `future`, answering the closer's count requests meanwhile and, while a delivery
+    /// fails, taking newer commands in.
+    async fn draining<F: Future>(&mut self, future: F) -> F::Output {
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                output = &mut future => return output,
+                Some(reply) = self.count_requests.recv() => {
+                    let _ = reply.send((self.held_count(), self.closing));
+                }
+                maybe_cmd = self.rx.recv(), if self.retrying && !self.closing => {
+                    match maybe_cmd {
+                        Some(cmd) if !matches!(cmd.op_type, DatabaseOperation::Close) => {
+                            self.held.push_command(cmd, true);
+                        }
+                        _ => self.closing = true,
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn write_connection_config(database: &RedisCacheConfig) -> AsyncConnectionConfig {
+    AsyncConnectionConfig::new()
+        .set_connection_timeout(Some(Duration::from_secs(u64::from(
+            database.connection_timeout,
+        ))))
+        .set_response_timeout(Some(Duration::from_secs(u64::from(
+            database.response_timeout,
+        ))))
+}
+
+/// Opens a write connection, learning the server's run and the connection's client id, and kills
+/// each connection in `replaced` that the same server run still serves; a connection of an
+/// earlier run died with it.
+async fn open_write_connection(
+    client: redis::Client,
+    config: AsyncConnectionConfig,
+    replaced: Vec<(String, i64)>,
+) -> redis::RedisResult<WriteConnection> {
+    log::debug!("Creating {CACHE_WRITE} redis connection");
+    let mut con = client
+        .get_multiplexed_async_connection_with_config(&config)
+        .await?;
+
+    let mut handshake = redis::pipe();
+    handshake.cmd("INFO").cmd("CLIENT").arg("ID");
+    let (info, client_id): (String, i64) = handshake.query_async(&mut con).await?;
+    check_redis_version(&info).map_err(|e| {
+        redis::RedisError::from((redis::ErrorKind::Client, "Redis version", e.to_string()))
+    })?;
+    let Some(run_id) = info_field(&info, "run_id") else {
+        return Err((redis::ErrorKind::Client, "Redis run_id not available").into());
+    };
+
+    let fenced: Vec<i64> = replaced
+        .iter()
+        .filter(|(run, _)| run == run_id)
+        .map(|(_, replaced_id)| *replaced_id)
+        .collect();
+    if !fenced.is_empty() {
+        let mut fence = redis::pipe();
+        for replaced_id in &fenced {
+            fence.cmd("CLIENT").arg("KILL").arg("ID").arg(*replaced_id);
+        }
+        fence.query_async::<()>(&mut con).await?;
+    }
+
+    Ok(WriteConnection {
+        con,
+        run_id: run_id.to_string(),
+        client_id,
+    })
+}
+
+/// One Redis write a cache command makes, kept as data so that a writer retrying while Redis
+/// isn't answering can hold only the latest write to each target.
+#[derive(Debug)]
+enum Write {
+    Set {
+        key: String,
+        value: Bytes,
+    },
+    Delete {
+        key: String,
+    },
+    ReplaceList {
+        key: String,
+        value: Bytes,
+    },
+    /// `unique` when the entry is an event, which no other entry repeats.
+    Append {
+        key: String,
+        value: Bytes,
+        if_exists: bool,
+        unique: bool,
+    },
+    AddMember {
+        key: String,
+        member: Bytes,
+    },
+    RemoveMember {
+        key: String,
+        member: Bytes,
+    },
+    SetField {
+        key: String,
+        field: Bytes,
+        value: Bytes,
+    },
+    DeleteField {
+        key: String,
+        field: Bytes,
+    },
+}
+
+/// What a replacing write replaces: a whole key, or one member or field of it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Target {
+    Key(String),
+    Member(String, Bytes),
+}
+
+impl Write {
+    fn queue(&self, pipe: &mut Pipeline) {
+        match self {
+            Self::Set { key, value } => {
+                pipe.set(key.as_str(), value.as_ref());
+            }
+            Self::Delete { key } => {
+                pipe.del(key.as_str());
+            }
+            Self::ReplaceList { key, value } => {
+                pipe.del(key.as_str());
+                pipe.rpush(key.as_str(), value.as_ref());
+            }
+            Self::Append {
+                key,
+                value,
+                if_exists: true,
+                ..
+            } => {
+                pipe.rpush_exists(key.as_str(), value.as_ref());
+            }
+            Self::Append {
+                key,
+                value,
+                if_exists: false,
+                ..
+            } => {
+                pipe.rpush(key.as_str(), value.as_ref());
+            }
+            Self::AddMember { key, member } => {
+                pipe.sadd(key.as_str(), member.as_ref());
+            }
+            Self::RemoveMember { key, member } => {
+                pipe.srem(key.as_str(), member.as_ref());
+            }
+            Self::SetField { key, field, value } => {
+                pipe.hset(key.as_str(), field.as_ref(), value.as_ref());
+            }
+            Self::DeleteField { key, field } => {
+                pipe.hdel(key.as_str(), field.as_ref());
+            }
+        }
+    }
+
+    /// What this write replaces; `None` for an append, which replaces nothing.
+    fn target(&self) -> Option<Target> {
+        match self {
+            Self::Set { key, .. } | Self::Delete { key } | Self::ReplaceList { key, .. } => {
+                Some(Target::Key(key.clone()))
+            }
+            Self::Append { .. } => None,
+            Self::AddMember { key, member } | Self::RemoveMember { key, member } => {
+                Some(Target::Member(key.clone(), member.clone()))
+            }
+            Self::SetField { key, field, .. } | Self::DeleteField { key, field } => {
+                Some(Target::Member(key.clone(), field.clone()))
+            }
+        }
+    }
+}
+
+/// What the cache writer holds and has not yet delivered, by id in order. Consecutive writes are
+/// sent as one transaction; an order update or a flush is delivered on its own.
+struct Held {
+    trader_key: String,
+    ops: BTreeMap<i64, Op>,
+    next_id: i64,
+    next_front_id: i64,
+    /// The id of the latest write to each target.
+    latest: AHashMap<Target, i64>,
+    /// The id of the latest op reading each key.
+    read: AHashMap<String, i64>,
+}
+
+enum Op {
+    Write(Write),
+    UpdateOrder {
+        key: String,
+        payload: Vec<Bytes>,
+    },
+    /// Re-indexes the order stored as `stored`, once its event `appended` has been written.
+    IndexOrder {
+        key: String,
+        stored: Vec<Bytes>,
+        appended: Bytes,
+    },
+    Flush(SyncSender<()>),
+}
+
+/// A transaction sent: the id of its last write, and for each list it appended an event to and did
+/// not replace after, that list's last event.
+#[derive(Debug)]
+struct Attempt {
+    last_id: i64,
+    proofs: Vec<(String, Bytes)>,
+}
+
+/// Whether an order, rebuilt from its events, belongs in an index; `None` leaves its membership
+/// as it is.
+type Belongs = fn(&OrderAny) -> Option<bool>;
+
+/// Every order index an order update writes, each with whether the order belongs in it.
+const ORDER_INDEXES: [(&str, Belongs); 6] = [
+    (INDEX_ORDERS, |_| Some(true)),
+    (INDEX_ORDER_IDS, |order| {
+        order.venue_order_id().map(|_| true)
+    }),
+    (INDEX_ORDERS_INFLIGHT, |order| Some(order.is_inflight())),
+    (INDEX_ORDERS_CLOSED, |order| {
+        if order.is_open() {
+            Some(false)
+        } else if order.is_closed() {
+            Some(true)
+        } else {
+            None
+        }
+    }),
+    (INDEX_ORDERS_OPEN, |order| {
+        if order.is_open() {
+            Some(true)
+        } else if order.is_closed() {
+            Some(false)
+        } else {
+            None
+        }
+    }),
+    (INDEX_ORDERS_EMULATED, |order| {
+        let emulated = order
+            .emulation_trigger()
+            .is_some_and(|trigger| trigger != TriggerType::NoTrigger);
+        Some(emulated && !order.is_closed())
+    }),
+];
+
+impl Held {
+    fn new(trader_key: String) -> Self {
+        Self {
+            trader_key,
+            ops: BTreeMap::new(),
+            next_id: 0,
+            next_front_id: -1,
+            latest: AHashMap::new(),
+            read: AHashMap::new(),
+        }
+    }
+
+    /// The number of commands held; a re-index is the remainder of an order update already
+    /// counted by its append.
+    fn len(&self) -> usize {
+        self.ops
+            .values()
+            .filter(|op| !matches!(op, Op::IndexOrder { .. }))
+            .count()
+    }
+
+    /// Holds the writes `cmd` makes after everything already held. When `coalesce`, a replacing
+    /// write drops the earlier write to its target it supersedes.
+    fn push_command(&mut self, cmd: DatabaseCommand, coalesce: bool) {
+        let op_type = match cmd.op_type {
+            DatabaseOperation::Flush(reply_tx) => {
+                self.push(Op::Flush(reply_tx), coalesce);
+                return;
+            }
+            DatabaseOperation::Close => panic!("Close command should not be held"),
+            op_type => op_type,
+        };
+        let Some(key) = cmd.key else {
+            log::error!("Null key found for {op_type:?} command");
+            return;
         };
         let collection = match get_collection_key(&key) {
             Ok(collection) => collection,
             Err(e) => {
                 log::error!("{e}");
-                continue; // Continue to next message
+                return;
             }
         };
 
-        let key = format!("{trader_key}{REDIS_DELIMITER}{key}");
+        let key = full_redis_key(&self.trader_key, &key);
+        let mut writes = Vec::new();
 
-        match msg.op_type {
+        match op_type {
             DatabaseOperation::Insert => {
-                if let Some(payload) = msg.payload {
+                if let Some(payload) = cmd.payload {
                     log::debug!("Processing INSERT for collection: {collection}, key: {key}");
-                    if let Err(e) = insert(&mut pipe, collection, &key, &payload) {
+                    if let Err(e) = insert(&mut writes, collection, &key, &payload) {
                         log::error!("{e}");
-                    } else {
-                        has_pending_ops = true;
                     }
                 } else {
                     log::error!("Null `payload` for `insert`");
                 }
             }
             DatabaseOperation::Update => {
-                if let Some(payload) = msg.payload {
+                if let Some(payload) = cmd.payload {
                     log::debug!("Processing UPDATE for collection: {collection}, key: {key}");
-                    if let Err(e) = update(&mut pipe, collection, &key, &payload) {
+                    if let Err(e) = update(&mut writes, collection, &key, &payload) {
                         log::error!("{e}");
-                    } else {
-                        has_pending_ops = true;
                     }
                 } else {
                     log::error!("Null `payload` for `update`");
                 }
             }
             DatabaseOperation::UpdateOrder => {
-                flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops).await;
-
-                if let Some(payload) = msg.payload {
+                if let Some(payload) = cmd.payload {
                     log::debug!("Processing UPDATE_ORDER for key: {key}");
-                    if let Err(e) =
-                        update_order_event_log(conn, trader_key, encoding, &key, &payload).await
-                    {
-                        log::error!("{e}");
-                    }
+                    self.push(Op::UpdateOrder { key, payload }, coalesce);
                 } else {
                     log::error!("Null `payload` for `update_order`");
                 }
             }
             DatabaseOperation::ReplaceList => {
-                if let Some(payload) = msg.payload {
+                if let Some(payload) = cmd.payload {
                     log::debug!("Processing REPLACE_LIST for key: {key}");
-                    if let Err(e) = replace_list_operation(&mut pipe, collection, &key, &payload) {
+                    if let Err(e) = replace_list_operation(&mut writes, collection, &key, &payload)
+                    {
                         log::error!("{e}");
-                    } else {
-                        has_pending_ops = true;
                     }
                 } else {
                     log::error!("Null `payload` for `replace_list`");
@@ -844,62 +1446,169 @@ async fn drain_buffer(
                     "Processing DELETE for collection: {}, key: {}, payload: {:?}",
                     collection,
                     key,
-                    msg.payload.as_ref().map(std::vec::Vec::len)
+                    cmd.payload.as_ref().map(std::vec::Vec::len)
                 );
                 // `payload` can be `None` for a delete operation
-                if let Err(e) = delete(&mut pipe, collection, &key, msg.payload) {
+                if let Err(e) = delete(&mut writes, collection, &key, cmd.payload) {
                     log::error!("{e}");
-                } else {
-                    has_pending_ops = true;
                 }
             }
-            DatabaseOperation::Close => panic!("Close command should not be drained"),
-            DatabaseOperation::Flush(_) => panic!("Flush command should not be drained"),
+            DatabaseOperation::Flush(_) | DatabaseOperation::Close => {
+                unreachable!("handled before the key is read")
+            }
+        }
+
+        for write in writes {
+            self.push(Op::Write(write), coalesce);
         }
     }
 
-    flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops).await;
-}
-
-async fn flush_pending_pipeline(
-    conn: &mut ConnectionManager,
-    pipe: &mut Pipeline,
-    has_pending_ops: &mut bool,
-) {
-    if !*has_pending_ops {
-        return;
+    fn push(&mut self, op: Op, coalesce: bool) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.insert(id, op, coalesce);
     }
 
-    if let Err(e) = pipe.query_async::<()>(conn).await {
-        log::error!("{e}");
+    /// Holds `op` before everything already held, as the remainder of the order update being
+    /// delivered.
+    fn push_front(&mut self, op: Op) {
+        let id = self.next_front_id;
+        self.next_front_id -= 1;
+        self.ops.insert(id, op);
     }
 
-    *pipe = redis::pipe();
-    pipe.atomic();
-    *has_pending_ops = false;
+    /// Holds `op` as `id`, recording what it reads. When `coalesce`, a replacing write drops the
+    /// earlier write to its target unless an op between them reads that target.
+    fn insert(&mut self, id: i64, op: Op, coalesce: bool) {
+        if let Op::Write(write) = &op
+            && let Some(target) = write.target()
+        {
+            if coalesce
+                && let Some(&earlier) = self.latest.get(&target)
+                && self.supersedes(&target, earlier)
+            {
+                self.ops.remove(&earlier);
+            }
+            self.latest.insert(target, id);
+        }
+        for key in self.reads(&op) {
+            self.read.insert(key, id);
+        }
+        self.ops.insert(id, op);
+    }
+
+    /// The keys `op` reads: an order update reads its order and rewrites every order index from
+    /// it; nothing else reads.
+    fn reads(&self, op: &Op) -> Vec<String> {
+        match op {
+            Op::UpdateOrder { key, .. } | Op::IndexOrder { key, .. } => {
+                let indexes = ORDER_INDEXES
+                    .iter()
+                    .map(|(index, _)| full_redis_key(&self.trader_key, index));
+                std::iter::once(key.clone()).chain(indexes).collect()
+            }
+            Op::Write(_) | Op::Flush(_) => Vec::new(),
+        }
+    }
+
+    /// Drops the held op `id` once delivered, with what was recorded for it.
+    fn remove(&mut self, id: i64) -> Option<Op> {
+        let op = self.ops.remove(&id)?;
+        self.retire(id, &op);
+        Some(op)
+    }
+
+    /// Forgets what was recorded for the delivered op `id`, keeping what later ops recorded.
+    fn retire(&mut self, id: i64, op: &Op) {
+        if let Op::Write(write) = op
+            && let Some(target) = write.target()
+            && self.latest.get(&target) == Some(&id)
+        {
+            self.latest.remove(&target);
+        }
+        for key in self.reads(op) {
+            if self.read.get(&key) == Some(&id) {
+                self.read.remove(&key);
+            }
+        }
+    }
+
+    /// Whether a write to `target` held after the write `earlier` supersedes it: true unless an op
+    /// between them reads the target's key.
+    fn supersedes(&self, target: &Target, earlier: i64) -> bool {
+        let (Target::Key(key) | Target::Member(key, _)) = target;
+        self.read.get(key).is_none_or(|&read| read < earlier)
+    }
+
+    /// Drops every held write a later held write supersedes, as coalescing would have.
+    fn compact(&mut self) {
+        let ops = std::mem::take(&mut self.ops);
+        self.latest.clear();
+        self.read.clear();
+        for (id, op) in ops {
+            self.insert(id, op, true);
+        }
+    }
+
+    /// The writes held before any other op, by id. Writes held in front, the remainder of an
+    /// order update, are a transaction of their own, as the order update's are when healthy.
+    fn front_run(&self) -> impl Iterator<Item = (&i64, &Write)> {
+        let in_front = self.ops.keys().next().is_some_and(|&id| id < 0);
+        self.ops.iter().map_while(move |(id, op)| match op {
+            Op::Write(write) if (*id < 0) == in_front => Some((id, write)),
+            _ => None,
+        })
+    }
+
+    fn transaction(&self) -> (Pipeline, Attempt) {
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        let mut proofs: AHashMap<&str, &Bytes> = AHashMap::new();
+        let mut last_id = None;
+        for (id, write) in self.front_run() {
+            last_id = Some(*id);
+            write.queue(&mut pipe);
+            match write {
+                Write::Append {
+                    key,
+                    value,
+                    unique: true,
+                    ..
+                } => {
+                    proofs.insert(key, value);
+                }
+                Write::Set { key, .. } | Write::Delete { key } | Write::ReplaceList { key, .. } => {
+                    proofs.remove(key.as_str());
+                }
+                _ => {}
+            }
+        }
+
+        let last_id = last_id.expect("a transaction is built from held writes");
+        let proofs = proofs
+            .into_iter()
+            .map(|(key, event)| (key.to_string(), event.clone()))
+            .collect();
+        (pipe, Attempt { last_id, proofs })
+    }
+
+    /// Drops the held ops up to and including `last_id`, the front run a transaction delivered.
+    fn remove_through(&mut self, last_id: i64) {
+        let pending = self.ops.split_off(&(last_id + 1));
+        let delivered = std::mem::replace(&mut self.ops, pending);
+        for (id, op) in &delivered {
+            self.retire(*id, op);
+        }
+    }
 }
 
-async fn update_order_event_log(
-    conn: &mut ConnectionManager,
-    trader_key: &str,
+fn order_from_events(
     encoding: SerializationEncoding,
     key: &str,
-    value: &[Bytes],
-) -> anyhow::Result<()> {
-    check_slice_not_empty(value, stringify!(value))?;
-
-    let result: Vec<Bytes> = conn.lrange(key, 0, -1).await?;
-    if result.is_empty() {
-        log::warn!("Cannot update order in Redis, no existing state at {key}");
-        return Ok(());
-    }
-
-    let mut append_pipe = redis::pipe();
-    append_pipe.atomic();
-    update_list(&mut append_pipe, key, value[0].as_ref());
-    append_pipe.query_async::<()>(conn).await?;
-
-    let mut events: Vec<OrderEventAny> = result
+    stored: &[Bytes],
+    appended: &Bytes,
+) -> anyhow::Result<OrderAny> {
+    let mut events: Vec<OrderEventAny> = stored
         .iter()
         .map(|payload| DatabaseQueries::deserialize_payload(encoding, payload))
         .collect::<anyhow::Result<_>>()
@@ -908,43 +1617,59 @@ async fn update_order_event_log(
                 "Order event append succeeded for {key}, but index replay failed decoding history"
             )
         })?;
-    let event: OrderEventAny = DatabaseQueries::deserialize_payload(encoding, value[0].as_ref())
+    let event: OrderEventAny = DatabaseQueries::deserialize_payload(encoding, appended.as_ref())
         .with_context(|| {
             format!(
                 "Order event append succeeded for {key}, but index replay failed decoding appended event"
             )
         })?;
     events.push(event);
-    let order = OrderAny::from_events(events).with_context(|| {
+    OrderAny::from_events(events).with_context(|| {
         format!("Order event append succeeded for {key}, but index replay failed rebuilding order")
-    })?;
-
-    let mut pipe = redis::pipe();
-    pipe.atomic();
-    update_order_indexes(&mut pipe, trader_key, &order);
-    pipe.query_async::<()>(conn).await?;
-
-    Ok(())
+    })
 }
 
-fn insert(pipe: &mut Pipeline, collection: &str, key: &str, value: &[Bytes]) -> anyhow::Result<()> {
+fn insert(
+    writes: &mut Vec<Write>,
+    collection: &str,
+    key: &str,
+    value: &[Bytes],
+) -> anyhow::Result<()> {
     check_slice_not_empty(value, stringify!(value))?;
 
     match collection {
-        INDEX => insert_index(pipe, key, value),
+        INDEX => insert_index(writes, key, value),
         GENERAL | CURRENCIES | INSTRUMENTS | SYNTHETICS | ACTORS | STRATEGIES | HEALTH | CUSTOM => {
-            insert_string(pipe, key, value[0].as_ref());
+            writes.push(Write::Set {
+                key: key.to_string(),
+                value: value[0].clone(),
+            });
             Ok(())
         }
-        ACCOUNTS | ORDERS | POSITIONS | SNAPSHOTS => {
-            insert_list(pipe, key, value[0].as_ref());
+        ACCOUNTS | ORDERS | POSITIONS => {
+            writes.push(Write::Append {
+                key: key.to_string(),
+                value: value[0].clone(),
+                if_exists: false,
+                unique: true,
+            });
+            Ok(())
+        }
+        // A snapshot repeats the state it captures, so two can be identical
+        SNAPSHOTS => {
+            writes.push(Write::Append {
+                key: key.to_string(),
+                value: value[0].clone(),
+                if_exists: false,
+                unique: false,
+            });
             Ok(())
         }
         _ => anyhow::bail!("Unsupported operation: `insert` for collection '{collection}'"),
     }
 }
 
-fn insert_index(pipe: &mut Pipeline, key: &str, value: &[Bytes]) -> anyhow::Result<()> {
+fn insert_index(writes: &mut Vec<Write>, key: &str, value: &[Bytes]) -> anyhow::Result<()> {
     let index_key = get_index_key(key)?;
     match index_key {
         INDEX_ORDER_IDS
@@ -956,40 +1681,26 @@ fn insert_index(pipe: &mut Pipeline, key: &str, value: &[Bytes]) -> anyhow::Resu
         | INDEX_POSITIONS
         | INDEX_POSITIONS_OPEN
         | INDEX_POSITIONS_CLOSED => {
-            insert_set(pipe, key, value[0].as_ref());
+            writes.push(Write::AddMember {
+                key: key.to_string(),
+                member: value[0].clone(),
+            });
             Ok(())
         }
         INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT => {
-            insert_hset(pipe, key, value[0].as_ref(), value[1].as_ref());
+            writes.push(Write::SetField {
+                key: key.to_string(),
+                field: value[0].clone(),
+                value: value[1].clone(),
+            });
             Ok(())
         }
         _ => anyhow::bail!("Index unknown '{index_key}' on insert"),
     }
 }
 
-fn insert_string(pipe: &mut Pipeline, key: &str, value: &[u8]) {
-    pipe.set(key, value);
-}
-
-fn insert_set(pipe: &mut Pipeline, key: &str, value: &[u8]) {
-    pipe.sadd(key, value);
-}
-
-fn insert_hset(pipe: &mut Pipeline, key: &str, name: &[u8], value: &[u8]) {
-    pipe.hset(key, name, value);
-}
-
-fn insert_list(pipe: &mut Pipeline, key: &str, value: &[u8]) {
-    pipe.rpush(key, value);
-}
-
-fn replace_list(pipe: &mut Pipeline, key: &str, value: &[u8]) {
-    pipe.del(key);
-    pipe.rpush(key, value);
-}
-
 fn replace_list_operation(
-    pipe: &mut Pipeline,
+    writes: &mut Vec<Write>,
     collection: &str,
     key: &str,
     value: &[Bytes],
@@ -998,31 +1709,40 @@ fn replace_list_operation(
 
     match collection {
         ACCOUNTS | ORDERS | POSITIONS => {
-            replace_list(pipe, key, value[0].as_ref());
+            writes.push(Write::ReplaceList {
+                key: key.to_string(),
+                value: value[0].clone(),
+            });
             Ok(())
         }
         _ => anyhow::bail!("Unsupported operation: `replace_list` for collection '{collection}'"),
     }
 }
 
-fn update(pipe: &mut Pipeline, collection: &str, key: &str, value: &[Bytes]) -> anyhow::Result<()> {
+fn update(
+    writes: &mut Vec<Write>,
+    collection: &str,
+    key: &str,
+    value: &[Bytes],
+) -> anyhow::Result<()> {
     check_slice_not_empty(value, stringify!(value))?;
 
     match collection {
         ACCOUNTS | ORDERS | POSITIONS => {
-            update_list(pipe, key, value[0].as_ref());
+            writes.push(Write::Append {
+                key: key.to_string(),
+                value: value[0].clone(),
+                if_exists: true,
+                unique: true,
+            });
             Ok(())
         }
         _ => anyhow::bail!("Unsupported operation: `update` for collection '{collection}'"),
     }
 }
 
-fn update_list(pipe: &mut Pipeline, key: &str, value: &[u8]) {
-    pipe.rpush_exists(key, value);
-}
-
 fn delete(
-    pipe: &mut Pipeline,
+    writes: &mut Vec<Write>,
     collection: &str,
     key: &str,
     value: Option<Vec<Bytes>>,
@@ -1035,9 +1755,11 @@ fn delete(
     );
 
     match collection {
-        INDEX => delete_from_index(pipe, key, value),
+        INDEX => delete_from_index(writes, key, value),
         ORDERS | POSITIONS | ACCOUNTS | ACTORS | STRATEGIES => {
-            delete_string(pipe, key);
+            writes.push(Write::Delete {
+                key: key.to_string(),
+            });
             Ok(())
         }
         _ => anyhow::bail!("Unsupported operation: `delete` for collection '{collection}'"),
@@ -1045,7 +1767,7 @@ fn delete(
 }
 
 fn delete_from_index(
-    pipe: &mut Pipeline,
+    writes: &mut Vec<Write>,
     key: &str,
     value: Option<Vec<Bytes>>,
 ) -> anyhow::Result<()> {
@@ -1062,105 +1784,42 @@ fn delete_from_index(
         | INDEX_POSITIONS
         | INDEX_POSITIONS_OPEN
         | INDEX_POSITIONS_CLOSED => {
-            remove_from_set(pipe, key, value[0].as_ref());
+            writes.push(Write::RemoveMember {
+                key: key.to_string(),
+                member: value[0].clone(),
+            });
             Ok(())
         }
         INDEX_ORDER_POSITION | INDEX_ORDER_CLIENT => {
-            remove_from_hash(pipe, key, value[0].as_ref());
+            writes.push(Write::DeleteField {
+                key: key.to_string(),
+                field: value[0].clone(),
+            });
             Ok(())
         }
         _ => anyhow::bail!("Unsupported index operation: remove from '{index_key}'"),
     }
 }
 
-fn remove_from_set(pipe: &mut Pipeline, key: &str, member: &[u8]) {
-    pipe.srem(key, member);
-}
-
-fn remove_from_hash(pipe: &mut Pipeline, key: &str, field: &[u8]) {
-    pipe.hdel(key, field);
-}
-
-fn delete_string(pipe: &mut Pipeline, key: &str) {
-    pipe.del(key);
-}
-
 fn full_redis_key(trader_key: &str, key: &str) -> String {
     format!("{trader_key}{REDIS_DELIMITER}{key}")
 }
 
-fn update_order_indexes(pipe: &mut Pipeline, trader_key: &str, order: &OrderAny) {
-    let client_order_id = order.client_order_id();
-    let order_id_bytes = client_order_id.to_string();
-
-    insert_set(
-        pipe,
-        &full_redis_key(trader_key, INDEX_ORDERS),
-        order_id_bytes.as_bytes(),
-    );
-
-    if order.venue_order_id().is_some() {
-        insert_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDER_IDS),
-            order_id_bytes.as_bytes(),
-        );
-    }
-
-    if order.is_inflight() {
-        insert_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_INFLIGHT),
-            order_id_bytes.as_bytes(),
-        );
-    } else {
-        remove_from_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_INFLIGHT),
-            order_id_bytes.as_bytes(),
-        );
-    }
-
-    if order.is_open() {
-        remove_from_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_CLOSED),
-            order_id_bytes.as_bytes(),
-        );
-        insert_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_OPEN),
-            order_id_bytes.as_bytes(),
-        );
-    } else if order.is_closed() {
-        remove_from_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_OPEN),
-            order_id_bytes.as_bytes(),
-        );
-        insert_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_CLOSED),
-            order_id_bytes.as_bytes(),
-        );
-    }
-
-    if order
-        .emulation_trigger()
-        .is_some_and(|trigger| trigger != TriggerType::NoTrigger)
-        && !order.is_closed()
-    {
-        insert_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_EMULATED),
-            order_id_bytes.as_bytes(),
-        );
-    } else {
-        remove_from_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_EMULATED),
-            order_id_bytes.as_bytes(),
-        );
+fn update_order_indexes(writes: &mut Vec<Write>, trader_key: &str, order: &OrderAny) {
+    let member = Bytes::from(order.client_order_id().to_string());
+    for (index, belongs) in ORDER_INDEXES {
+        let key = full_redis_key(trader_key, index);
+        match belongs(order) {
+            Some(true) => writes.push(Write::AddMember {
+                key,
+                member: member.clone(),
+            }),
+            Some(false) => writes.push(Write::RemoveMember {
+                key,
+                member: member.clone(),
+            }),
+            None => {}
+        }
     }
 }
 
@@ -1994,5 +2653,647 @@ mod tests {
     fn test_get_collection_key_invalid() {
         let key = "no_delimiter";
         assert!(get_collection_key(key).is_err());
+    }
+}
+
+#[cfg(target_os = "linux")] // Run Redis tests on Linux platforms only
+#[cfg(test)]
+mod serial_tests {
+    use nautilus_common::testing::wait_until_async;
+    use nautilus_model::events::{OrderDenied, OrderInitialized};
+    use rstest::rstest;
+    use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
+
+    use super::*;
+    use crate::redis::{CLOSE_TIMEOUT, msgbus::test_proxy::RedisProxy};
+
+    async fn redis_connection() -> ConnectionManager {
+        let config = RedisCacheConfig {
+            connection_timeout: 1,
+            number_of_retries: 0,
+            ..Default::default()
+        };
+        create_redis_connection(CACHE_READ, &config)
+            .await
+            .expect("A running Redis service is required for this test")
+    }
+
+    fn database_through(proxy: &RedisProxy) -> RedisCacheConfig {
+        RedisCacheConfig {
+            port: Some(proxy.port),
+            connection_timeout: 1,
+            response_timeout: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Buffers commands until closed.
+    fn buffered() -> CacheConfig {
+        CacheConfig {
+            buffer_interval_ms: Some(3_600_000),
+            ..Default::default()
+        }
+    }
+
+    fn new_trader_key() -> String {
+        format!("trader-tester-{}", UUID4::new())
+    }
+
+    fn spawn_writer(
+        rx: tokio::sync::mpsc::UnboundedReceiver<DatabaseCommand>,
+        trader_key: &str,
+        config: CacheConfig,
+        database: RedisCacheConfig,
+    ) -> (JoinHandle<()>, Arc<WriterState>) {
+        let (state, count_requests) = WriterState::new();
+        let handle = tokio::spawn({
+            let trader_key = trader_key.to_string();
+            let state = state.clone();
+            async move {
+                process_commands(rx, trader_key, config, database, state, count_requests)
+                    .await
+                    .unwrap();
+            }
+        });
+        (handle, state)
+    }
+
+    /// Waits until a delivery of the writer behind `state` is failing while it holds `held`
+    /// writes.
+    async fn wait_until_holding(state: &Arc<WriterState>, held: usize) {
+        wait_until_async(
+            || {
+                let state = state.clone();
+                async move {
+                    state.is_failing() && state.held().await.is_some_and(|(count, _)| count == held)
+                }
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+
+    /// Starts a cache writer for a fresh trader key whose connection runs through the proxy.
+    fn writer_through(
+        config: CacheConfig,
+        database: RedisCacheConfig,
+    ) -> (
+        UnboundedSender<DatabaseCommand>,
+        JoinHandle<()>,
+        String,
+        Arc<WriterState>,
+    ) {
+        let trader_key = new_trader_key();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (handle, state) = spawn_writer(rx, &trader_key, config, database);
+        (tx, handle, trader_key, state)
+    }
+
+    fn command(op_type: DatabaseOperation, key: &str, value: impl Into<Bytes>) -> DatabaseCommand {
+        DatabaseCommand::new(op_type, key.to_string(), Some(vec![value.into()]))
+    }
+
+    async fn wait_for_list_len(con: &ConnectionManager, key: &str, len: usize) {
+        wait_until_async(
+            || {
+                let mut con = con.clone();
+                let key = key.to_string();
+                async move { con.llen::<_, usize>(&key).await.unwrap() == len }
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_lost_with_its_connection_is_retried() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let (tx, handle, trader_key, _) =
+            writer_through(CacheConfig::default(), database_through(&proxy));
+        let ready = format!("{trader_key}{REDIS_DELIMITER}orders:O-1");
+        let ledger = format!("{trader_key}{REDIS_DELIMITER}general:ledger");
+
+        tx.send(command(
+            DatabaseOperation::ReplaceList,
+            "orders:O-1",
+            &b"initialized"[..],
+        ))
+        .unwrap();
+        wait_for_list_len(&con, &ready, 1).await;
+        proxy.pause();
+        tx.send(command(
+            DatabaseOperation::Insert,
+            "general:ledger",
+            &b"ledger"[..],
+        ))
+        .unwrap();
+        wait_until_async(
+            || async { proxy.held_writes() >= 1 },
+            Duration::from_secs(3),
+        )
+        .await;
+        proxy.sever();
+        proxy.resume();
+        tx.send(DatabaseCommand::close()).unwrap();
+        handle.await.unwrap();
+
+        let stored: Option<Vec<u8>> = con.get(&ledger).await.unwrap();
+        let _: usize = con.del(&[&ready, &ledger]).await.unwrap();
+
+        assert_eq!(stored.as_deref(), Some(&b"ledger"[..]));
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_append_whose_reply_is_lost_lands_once() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let (tx, handle, trader_key, _) =
+            writer_through(CacheConfig::default(), database_through(&proxy));
+        let key = format!("{trader_key}{REDIS_DELIMITER}orders:O-1");
+
+        tx.send(command(
+            DatabaseOperation::ReplaceList,
+            "orders:O-1",
+            &b"initialized"[..],
+        ))
+        .unwrap();
+        wait_for_list_len(&con, &key, 1).await;
+        proxy.lose_next_reply();
+        tx.send(command(
+            DatabaseOperation::Update,
+            "orders:O-1",
+            &b"filled"[..],
+        ))
+        .unwrap();
+        tx.send(DatabaseCommand::close()).unwrap();
+        handle.await.unwrap();
+
+        let events: Vec<Vec<u8>> = con.lrange(&key, 0, -1).await.unwrap();
+        let _: usize = con.del(&key).await.unwrap();
+
+        assert_eq!(events, vec![b"initialized".to_vec(), b"filled".to_vec()]);
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_an_append_delayed_on_a_replaced_connection_never_lands() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let (tx, handle, trader_key, _) =
+            writer_through(CacheConfig::default(), database_through(&proxy));
+        let key = format!("{trader_key}{REDIS_DELIMITER}orders:O-1");
+
+        tx.send(command(
+            DatabaseOperation::ReplaceList,
+            "orders:O-1",
+            &b"initialized"[..],
+        ))
+        .unwrap();
+        wait_for_list_len(&con, &key, 1).await;
+        proxy.stall();
+        tx.send(command(
+            DatabaseOperation::Update,
+            "orders:O-1",
+            &b"filled"[..],
+        ))
+        .unwrap();
+        wait_until_async(
+            || async { proxy.stalled_bytes() > 0 },
+            Duration::from_secs(3),
+        )
+        .await;
+        // The writer loses the connection; Redis still serves it, the append not yet received
+        proxy.drop_stalled_clients();
+        wait_for_list_len(&con, &key, 2).await;
+        tx.send(command(
+            DatabaseOperation::Update,
+            "orders:O-1",
+            &b"settled"[..],
+        ))
+        .unwrap();
+        wait_for_list_len(&con, &key, 3).await;
+        proxy.release_stalled().await;
+        tx.send(DatabaseCommand::close()).unwrap();
+        handle.await.unwrap();
+
+        let events: Vec<Vec<u8>> = con.lrange(&key, 0, -1).await.unwrap();
+        let _: usize = con.del(&key).await.unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                b"initialized".to_vec(),
+                b"filled".to_vec(),
+                b"settled".to_vec()
+            ]
+        );
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_lost_transaction_holding_a_repeated_snapshot_is_sent_again() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let trader_key = new_trader_key();
+        let snapshots = format!("{trader_key}{REDIS_DELIMITER}snapshots:O-1");
+        let ledger = format!("{trader_key}{REDIS_DELIMITER}general:ledger");
+        let _: usize = con.rpush(&snapshots, &b"snapshot"[..]).await.unwrap();
+        let _: () = con.set(&ledger, &b"ledger-1"[..]).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Queued before the writer starts, so its one buffered transaction holds both
+        tx.send(command(
+            DatabaseOperation::Insert,
+            "general:ledger",
+            &b"ledger-2"[..],
+        ))
+        .unwrap();
+        tx.send(command(
+            DatabaseOperation::Insert,
+            "snapshots:O-1",
+            &b"snapshot"[..],
+        ))
+        .unwrap();
+        tx.send(DatabaseCommand::close()).unwrap();
+        proxy.sever_on_next_exec();
+        let (handle, _) = spawn_writer(rx, &trader_key, buffered(), database_through(&proxy));
+        handle.await.unwrap();
+
+        let stored: Option<Vec<u8>> = con.get(&ledger).await.unwrap();
+        let stored_snapshots: Vec<Vec<u8>> = con.lrange(&snapshots, 0, -1).await.unwrap();
+        let _: usize = con.del(&[&snapshots, &ledger]).await.unwrap();
+
+        assert_eq!(stored.as_deref(), Some(&b"ledger-2"[..]));
+        assert_eq!(
+            stored_snapshots,
+            vec![b"snapshot".to_vec(), b"snapshot".to_vec()]
+        );
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_writer_whose_setup_goes_unanswered_delivers() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let database = RedisCacheConfig {
+            number_of_retries: 0,
+            ..database_through(&proxy)
+        };
+
+        proxy.lose_next_request();
+        let (tx, handle, trader_key, _) = writer_through(CacheConfig::default(), database);
+        let ledger = format!("{trader_key}{REDIS_DELIMITER}general:ledger");
+        tx.send(command(
+            DatabaseOperation::Insert,
+            "general:ledger",
+            &b"ledger"[..],
+        ))
+        .unwrap();
+        tx.send(DatabaseCommand::close()).unwrap();
+        handle.await.unwrap();
+
+        let stored: Option<Vec<u8>> = con.get(&ledger).await.unwrap();
+        let _: usize = con.del(&ledger).await.unwrap();
+
+        assert_eq!(stored.as_deref(), Some(&b"ledger"[..]));
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_buffered_transaction_becomes_visible_at_once() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let trader_key = new_trader_key();
+        let order = format!("{trader_key}{REDIS_DELIMITER}orders:O-1");
+        let open = format!("{trader_key}{REDIS_DELIMITER}{INDEX_ORDERS_OPEN}");
+        let closed = format!("{trader_key}{REDIS_DELIMITER}{INDEX_ORDERS_CLOSED}");
+        let _: usize = con.rpush(&order, &b"accepted"[..]).await.unwrap();
+        let _: usize = con.sadd(&open, &b"O-1"[..]).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // An order's fill and its index moves, queued before the writer starts so that its one
+        // buffered transaction holds them all
+        tx.send(command(
+            DatabaseOperation::Update,
+            "orders:O-1",
+            &b"filled"[..],
+        ))
+        .unwrap();
+        tx.send(command(
+            DatabaseOperation::Delete,
+            INDEX_ORDERS_OPEN,
+            &b"O-1"[..],
+        ))
+        .unwrap();
+        tx.send(command(
+            DatabaseOperation::Insert,
+            INDEX_ORDERS_CLOSED,
+            &b"O-1"[..],
+        ))
+        .unwrap();
+        tx.send(DatabaseCommand::close()).unwrap();
+        proxy.pause_after_next_exec();
+        let (handle, _) = spawn_writer(rx, &trader_key, buffered(), database_through(&proxy));
+        wait_for_list_len(&con, &order, 2).await;
+        let open_once_filled: bool = con.sismember(&open, &b"O-1"[..]).await.unwrap();
+        let closed_once_filled: bool = con.sismember(&closed, &b"O-1"[..]).await.unwrap();
+        proxy.resume();
+        handle.await.unwrap();
+        let _: usize = con.del(&[&order, &open, &closed]).await.unwrap();
+
+        assert_eq!((open_once_filled, closed_once_filled), (false, true));
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_paused_writer_holds_the_latest_value_and_every_event() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let (tx, handle, trader_key, state) =
+            writer_through(CacheConfig::default(), database_through(&proxy));
+        let order = format!("{trader_key}{REDIS_DELIMITER}orders:O-1");
+        let ledger = format!("{trader_key}{REDIS_DELIMITER}general:ledger");
+
+        tx.send(command(
+            DatabaseOperation::ReplaceList,
+            "orders:O-1",
+            &b"initialized"[..],
+        ))
+        .unwrap();
+        wait_for_list_len(&con, &order, 1).await;
+        proxy.pause();
+        for seq in 1..=1_000 {
+            tx.send(command(
+                DatabaseOperation::Insert,
+                "general:ledger",
+                format!("ledger-{seq}"),
+            ))
+            .unwrap();
+        }
+        for seq in 1..=10 {
+            tx.send(command(
+                DatabaseOperation::Update,
+                "orders:O-1",
+                format!("event-{seq}"),
+            ))
+            .unwrap();
+        }
+        wait_until_holding(&state, 1 + 10).await;
+        proxy.resume();
+        tx.send(DatabaseCommand::close()).unwrap();
+        handle.await.unwrap();
+
+        let stored: Option<String> = con.get(&ledger).await.unwrap();
+        let events: Vec<String> = con.lrange(&order, 0, -1).await.unwrap();
+        let _: usize = con.del(&[&order, &ledger]).await.unwrap();
+
+        let mut expected = vec!["initialized".to_string()];
+        expected.extend((1..=10).map(|seq| format!("event-{seq}")));
+        assert_eq!(stored.as_deref(), Some("ledger-1000"));
+        assert_eq!(events, expected);
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_failed_buffered_batch_holds_only_the_latest_value() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let trader_key = new_trader_key();
+        let ledger = format!("{trader_key}{REDIS_DELIMITER}general:ledger");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Queued before the writer starts, so its one buffered transaction holds them all
+        for seq in 1..=1_000 {
+            tx.send(command(
+                DatabaseOperation::Insert,
+                "general:ledger",
+                format!("ledger-{seq}"),
+            ))
+            .unwrap();
+        }
+        tx.send(DatabaseCommand::close()).unwrap();
+        proxy.pause_at_next_exec();
+        let (handle, state) = spawn_writer(rx, &trader_key, buffered(), database_through(&proxy));
+        wait_until_holding(&state, 1).await;
+        proxy.resume();
+        handle.await.unwrap();
+
+        let stored: Option<String> = con.get(&ledger).await.unwrap();
+        let _: usize = con.del(&ledger).await.unwrap();
+
+        assert_eq!(stored.as_deref(), Some("ledger-1000"));
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_order_updates_between_writes_of_another_key_keep_only_its_latest_value() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let (tx, handle, trader_key, state) =
+            writer_through(CacheConfig::default(), database_through(&proxy));
+        let order = format!("{trader_key}{REDIS_DELIMITER}orders:O-1");
+        let ledger = format!("{trader_key}{REDIS_DELIMITER}general:ledger");
+        let fills = 100;
+
+        tx.send(command(
+            DatabaseOperation::ReplaceList,
+            "orders:O-1",
+            &b"initialized"[..],
+        ))
+        .unwrap();
+        wait_for_list_len(&con, &order, 1).await;
+        proxy.pause();
+        for seq in 1..=fills {
+            tx.send(command(
+                DatabaseOperation::Insert,
+                "general:ledger",
+                format!("ledger-{seq}"),
+            ))
+            .unwrap();
+            tx.send(command(
+                DatabaseOperation::UpdateOrder,
+                "orders:O-1",
+                format!("fill-{seq}"),
+            ))
+            .unwrap();
+        }
+        wait_until_holding(&state, 1 + fills).await;
+        proxy.resume();
+        tx.send(DatabaseCommand::close()).unwrap();
+        handle.await.unwrap();
+
+        let stored: Option<String> = con.get(&ledger).await.unwrap();
+        let events: Vec<String> = con.lrange(&order, 0, -1).await.unwrap();
+        let _: usize = con.del(&[&order, &ledger]).await.unwrap();
+
+        let mut expected = vec!["initialized".to_string()];
+        expected.extend((1..=fills).map(|seq| format!("fill-{seq}")));
+        assert_eq!(stored.as_deref(), Some(format!("ledger-{fills}").as_str()));
+        assert_eq!(events, expected);
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_an_order_update_between_replacements_of_its_order_keeps_the_earlier_one() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let config = CacheConfig::default();
+        let encoding = config.encoding;
+        let (tx, handle, trader_key, _) = writer_through(config, database_through(&proxy));
+        let initialized = OrderInitialized::default();
+        let reinitialized = OrderInitialized {
+            event_id: UUID4::new(),
+            ..initialized.clone()
+        };
+        let denied = OrderDenied::new(
+            initialized.trader_id,
+            initialized.strategy_id,
+            initialized.instrument_id,
+            initialized.client_order_id,
+            Ustr::from("denied"),
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        let client_order_id = initialized.client_order_id.to_string();
+        let order_key = format!("orders:{client_order_id}");
+        let order = format!("{trader_key}{REDIS_DELIMITER}{order_key}");
+        let closed = format!("{trader_key}{REDIS_DELIMITER}{INDEX_ORDERS_CLOSED}");
+        let ledger = format!("{trader_key}{REDIS_DELIMITER}general:ledger");
+        let payload = |event: OrderEventAny| {
+            Bytes::from(DatabaseQueries::serialize_payload(encoding, &event).unwrap())
+        };
+        let second = payload(OrderEventAny::Initialized(reinitialized));
+
+        proxy.pause();
+        tx.send(command(
+            DatabaseOperation::Insert,
+            "general:ledger",
+            &b"ledger"[..],
+        ))
+        .unwrap();
+        tx.send(command(
+            DatabaseOperation::ReplaceList,
+            &order_key,
+            payload(OrderEventAny::Initialized(initialized)),
+        ))
+        .unwrap();
+        tx.send(command(
+            DatabaseOperation::UpdateOrder,
+            &order_key,
+            payload(OrderEventAny::Denied(denied)),
+        ))
+        .unwrap();
+        tx.send(command(
+            DatabaseOperation::ReplaceList,
+            &order_key,
+            second.clone(),
+        ))
+        .unwrap();
+        // A second held write is the ledger's retry, sent once the writer took the rest in
+        wait_until_async(
+            || async { proxy.held_writes() >= 2 },
+            Duration::from_secs(10),
+        )
+        .await;
+        proxy.resume();
+        tx.send(DatabaseCommand::close()).unwrap();
+        handle.await.unwrap();
+
+        let events: Vec<Vec<u8>> = con.lrange(&order, 0, -1).await.unwrap();
+        let is_closed: bool = con.sismember(&closed, &client_order_id).await.unwrap();
+        let _: usize = con.del(&[&order, &closed, &ledger]).await.unwrap();
+        let _: usize = con
+            .del(
+                ORDER_INDEXES
+                    .iter()
+                    .map(|(index, _)| format!("{trader_key}{REDIS_DELIMITER}{index}"))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events, vec![second.to_vec()]);
+        assert!(is_closed);
+    }
+
+    async fn cache_through(
+        proxy: &RedisProxy,
+        config: CacheConfig,
+        database: RedisCacheConfig,
+    ) -> RedisCacheDatabase {
+        let config = CacheConfig {
+            use_instance_id: true,
+            ..config
+        };
+        let cache = RedisCacheDatabase::new(
+            TraderId::from("tester-001"),
+            UUID4::new(),
+            config,
+            RedisCacheConfig {
+                port: Some(proxy.port),
+                ..database
+            },
+        )
+        .await
+        .unwrap();
+        let state = cache.writer.clone();
+        wait_until_async(|| async { !state.is_failing() }, Duration::from_secs(3)).await;
+        cache
+    }
+
+    /// Closes `cache` on a thread of its own, sending how long the close took.
+    fn close_on_thread(mut cache: RedisCacheDatabase) -> std::sync::mpsc::Receiver<Duration> {
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            cache.close();
+            let _ = closed_tx.send(started.elapsed());
+        });
+        closed_rx
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_healthy_close_waits_for_a_large_buffered_drain() {
+        let mut con = redis_connection().await;
+        let proxy = RedisProxy::start().await;
+        let database = RedisCacheConfig {
+            response_timeout: 30,
+            ..database_through(&proxy)
+        };
+        let cache = cache_through(&proxy, buffered(), database).await;
+        let keys: Vec<String> = (0..10_000)
+            .map(|seq| format!("{}{REDIS_DELIMITER}general:key-{seq}", cache.trader_key))
+            .collect();
+        for seq in 0..10_000 {
+            cache
+                .tx
+                .send(command(
+                    DatabaseOperation::Insert,
+                    &format!("general:key-{seq}"),
+                    seq.to_string(),
+                ))
+                .unwrap();
+        }
+
+        // Redis answers late but within the response timeout: the writer is delivering, not
+        // retrying, so its close outlasts the bound a retrying writer's close keeps
+        proxy.pause();
+        let closed = close_on_thread(cache);
+        tokio::time::sleep(CLOSE_TIMEOUT + Duration::from_millis(500)).await;
+        let closed_while_paused = closed.try_recv().is_ok();
+        proxy.resume();
+        closed
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the close returns once its drain is answered");
+        let stored: usize = con.exists(&keys).await.unwrap();
+        let _: usize = con.del(&keys).await.unwrap();
+
+        assert!(!closed_while_paused);
+        assert_eq!(stored, 10_000);
     }
 }

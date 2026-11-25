@@ -55,12 +55,15 @@ use nautilus_core::{
 };
 use nautilus_cryptography::providers::install_cryptographic_provider;
 use nautilus_model::identifiers::TraderId;
-use redis::{AsyncCommands, RetryMethod, aio::ConnectionManager, streams};
+use redis::{AsyncCommands, aio::ConnectionManager, streams};
 use serde::{Deserialize, Serialize};
 use streams::StreamReadOptions;
 use ustr::Ustr;
 
-use super::{REDIS_MINID, REDIS_XTRIM, await_handle};
+use super::{
+    CountRequest, REDIS_MINID, REDIS_XTRIM, WriterState, await_handle, await_publisher,
+    check_redis_version, connect_redis, is_retryable_error, retry_delay,
+};
 use crate::redis::{RedisConnectionConfig, create_redis_connection, get_stream_key};
 
 const MSGBUS_PUBLISH: &str = "msgbus-publish";
@@ -232,6 +235,7 @@ pub struct RedisMessageBusBacking {
     pub instance_id: UUID4,
     pub_tx: tokio::sync::mpsc::UnboundedSender<BusMessage>,
     pub_handle: Option<tokio::task::JoinHandle<()>>,
+    pub_state: Arc<WriterState>,
     stream_rx: Option<tokio::sync::mpsc::Receiver<BusMessage>>,
     stream_handle: Option<tokio::task::JoinHandle<()>>,
     stream_signal: Arc<AtomicBool>,
@@ -271,10 +275,21 @@ impl RedisMessageBusBacking {
         let publish = backing.clone();
 
         let (pub_tx, pub_rx) = tokio::sync::mpsc::unbounded_channel::<BusMessage>();
+        let (pub_state, count_requests) = WriterState::new();
+        let publish_state = pub_state.clone();
 
         // Create publish task (start the runtime here for now)
         let pub_handle = Some(get_runtime().spawn(async move {
-            if let Err(e) = publish_messages(pub_rx, trader_id, instance_id, config, publish).await
+            if let Err(e) = publish_reporting(
+                pub_rx,
+                trader_id,
+                instance_id,
+                config,
+                publish,
+                publish_state,
+                count_requests,
+            )
+            .await
             {
                 log_task_error(MSGBUS_PUBLISH, &e);
             }
@@ -322,6 +337,7 @@ impl RedisMessageBusBacking {
             instance_id,
             pub_tx,
             pub_handle,
+            pub_state,
             stream_rx,
             stream_handle,
             stream_signal,
@@ -400,7 +416,7 @@ impl RedisMessageBusBacking {
     }
 
     pub async fn close_async(&mut self) {
-        await_handle(self.pub_handle.take(), MSGBUS_PUBLISH).await;
+        await_publisher(self.pub_handle.take(), MSGBUS_PUBLISH, &self.pub_state).await;
         await_handle(self.stream_handle.take(), MSGBUS_STREAM).await;
         await_handle(self.heartbeat_handle.take(), MSGBUS_HEARTBEAT).await;
     }
@@ -408,22 +424,53 @@ impl RedisMessageBusBacking {
 
 /// Publishes messages received on `rx` to Redis streams for the given `trader_id` and `instance_id`, using `config`.
 ///
+/// A write Redis does not answer is retried until it does, before any newer message is written,
+/// so every message reaches its stream at least once and in order.
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The backing configuration is missing in `config`.
-/// - Establishing the Redis connection fails.
-/// - Any Redis command fails during publishing.
+/// - The server's version cannot be read.
+/// - Redis answers a write with an error that retrying cannot clear.
 pub async fn publish_messages(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
     trader_id: TraderId,
     instance_id: UUID4,
     config: MessageBusConfig,
     backing: RedisMessageBusConfig,
 ) -> anyhow::Result<()> {
+    let (state, count_requests) = WriterState::new();
+    publish_reporting(
+        rx,
+        trader_id,
+        instance_id,
+        config,
+        backing,
+        state,
+        count_requests,
+    )
+    .await
+}
+
+/// Publishes as [`publish_messages`] does, telling its closer through `state` whether a delivery
+/// is failing and answering `count_requests` with what it holds.
+pub(crate) async fn publish_reporting(
+    rx: tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
+    trader_id: TraderId,
+    instance_id: UUID4,
+    config: MessageBusConfig,
+    backing: RedisMessageBusConfig,
+    state: Arc<WriterState>,
+    count_requests: tokio::sync::mpsc::UnboundedReceiver<CountRequest>,
+) -> anyhow::Result<()> {
     log_task_started(MSGBUS_PUBLISH);
 
-    let mut con = create_redis_connection(MSGBUS_PUBLISH, &backing).await?;
+    let mut outbox = Outbox::new(rx, state, count_requests);
+    let (mut con, info) = outbox
+        .until_answered(&backing, || connect_redis(MSGBUS_PUBLISH, &backing))
+        .await?;
+    check_redis_version(&info)?;
     let stream_key = get_stream_key(trader_id, instance_id, &config);
 
     // Auto-trimming
@@ -439,7 +486,6 @@ pub async fn publish_messages(
     let mut last_trim_index: HashMap<String, usize> = HashMap::new();
 
     // Buffering
-    let mut buffer: VecDeque<BusMessage> = VecDeque::new();
     let buffer_interval = Duration::from_millis(u64::from(config.buffer_interval_ms.unwrap_or(0)));
 
     // A sleep used to trigger periodic flushing of the buffer.
@@ -448,59 +494,67 @@ pub async fn publish_messages(
     let flush_timer = tokio::time::sleep(buffer_interval);
     tokio::pin!(flush_timer);
 
-    loop {
+    // What was taken in while the setup was retried; holding nothing, nothing is failing
+    if outbox.buffer.is_empty() {
+        outbox.delivered();
+    } else {
+        let pipe = drain_buffer(
+            &mut outbox,
+            &mut con,
+            &stream_key,
+            config.stream_per_topic,
+            autotrim_duration,
+            autotrim_maxlen,
+            &mut last_trim_index,
+        )
+        .await;
+        outbox.write(&con, &pipe, &backing).await?;
+    }
+
+    while !outbox.closing {
         tokio::select! {
-            maybe_msg = rx.recv() => {
+            maybe_msg = outbox.rx.recv() => {
                 if let Some(msg) = maybe_msg {
                     if msg.topic == CLOSE_TOPIC {
                         log::debug!("Received close message");
-                        // Ensure we exit the loop after flushing any remaining messages.
-                        if !buffer.is_empty() {
-                            drain_buffer(
+                        outbox.closing = true;
+                    } else {
+                        outbox.buffer.push_back(msg);
+
+                        // Immediate flush mode, which also flushes what was taken in while a
+                        // write was retried
+                        while buffer_interval.is_zero() && !outbox.buffer.is_empty() {
+                            let pipe = drain_buffer(
+                                &mut outbox,
                                 &mut con,
                                 &stream_key,
                                 config.stream_per_topic,
                                 autotrim_duration,
                                 autotrim_maxlen,
                                 &mut last_trim_index,
-                                &mut buffer,
-                            ).await?;
+                            ).await;
+                            outbox.write(&con, &pipe, &backing).await?;
                         }
-                        break;
-                    }
-
-                    buffer.push_back(msg);
-
-                    if buffer_interval.is_zero() {
-                        // Immediate flush mode
-                        drain_buffer(
-                            &mut con,
-                            &stream_key,
-                            config.stream_per_topic,
-                            autotrim_duration,
-                            autotrim_maxlen,
-                            &mut last_trim_index,
-                            &mut buffer,
-                        ).await?;
                     }
                 } else {
                     log::debug!("Channel hung up");
-                    break;
+                    outbox.closing = true;
                 }
             }
             // Only poll the timer when the interval is non-zero. This avoids
             // unnecessarily waking the task when immediate flushing is enabled.
             () = &mut flush_timer, if !buffer_interval.is_zero() => {
-                if !buffer.is_empty() {
-                    drain_buffer(
+                if !outbox.buffer.is_empty() {
+                    let pipe = drain_buffer(
+                        &mut outbox,
                         &mut con,
                         &stream_key,
                         config.stream_per_topic,
                         autotrim_duration,
                         autotrim_maxlen,
                         &mut last_trim_index,
-                        &mut buffer,
-                    ).await?;
+                    ).await;
+                    outbox.write(&con, &pipe, &backing).await?;
                 }
 
                 // Schedule the next tick
@@ -510,36 +564,162 @@ pub async fn publish_messages(
     }
 
     // Drain any remaining messages
-    if !buffer.is_empty() {
-        drain_buffer(
+    if !outbox.buffer.is_empty() {
+        let pipe = drain_buffer(
+            &mut outbox,
             &mut con,
             &stream_key,
             config.stream_per_topic,
             autotrim_duration,
             autotrim_maxlen,
             &mut last_trim_index,
-            &mut buffer,
         )
-        .await?;
+        .await;
+        outbox.write(&con, &pipe, &backing).await?;
     }
 
     log_task_stopped(MSGBUS_PUBLISH);
     Ok(())
 }
 
+/// What the publisher has taken from its channel and not yet written. Once a write has failed,
+/// newer messages keep being taken in behind it while it is retried.
+struct Outbox {
+    rx: tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
+    count_requests: tokio::sync::mpsc::UnboundedReceiver<CountRequest>,
+    buffer: VecDeque<BusMessage>,
+    in_flight: usize,
+    /// Consecutive unanswered requests, for the backoff.
+    failures: usize,
+    /// Whether newer messages are taken in while the publisher waits: from an unanswered request
+    /// until a delivery.
+    retrying: bool,
+    closing: bool,
+    state: Arc<WriterState>,
+}
+
+impl Outbox {
+    fn new(
+        rx: tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
+        state: Arc<WriterState>,
+        count_requests: tokio::sync::mpsc::UnboundedReceiver<CountRequest>,
+    ) -> Self {
+        Self {
+            rx,
+            count_requests,
+            buffer: VecDeque::new(),
+            in_flight: 0,
+            failures: 0,
+            retrying: false,
+            closing: false,
+            state,
+        }
+    }
+
+    fn held(&self) -> usize {
+        self.in_flight + self.buffer.len() + self.rx.len()
+    }
+
+    /// Marks a delivery failing: a sent request failed, by an error or a timeout.
+    fn failed(&mut self) {
+        self.retrying = true;
+        self.state.set_failing(true);
+    }
+
+    fn delivered(&mut self) {
+        self.retrying = false;
+        self.state.set_failing(false);
+    }
+
+    /// Writes `pipe`, carrying the messages in flight, until Redis answers it. A write retried
+    /// after only its reply was lost lands twice, which every stream reader absorbs by its key.
+    async fn write(
+        &mut self,
+        con: &ConnectionManager,
+        pipe: &redis::Pipeline,
+        backing: &RedisMessageBusConfig,
+    ) -> anyhow::Result<()> {
+        let written = self
+            .until_answered(backing, || {
+                let mut con = con.clone();
+                async move { pipe.query_async::<()>(&mut con).await }
+            })
+            .await;
+        self.in_flight = 0;
+        written?;
+        self.delivered();
+        Ok(())
+    }
+
+    /// Runs `op` until it succeeds or fails with an error retrying cannot clear, waiting the
+    /// config's backoff after each retryable failure.
+    async fn until_answered<T, F, Fut>(
+        &mut self,
+        backing: &RedisMessageBusConfig,
+        mut op: F,
+    ) -> redis::RedisResult<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = redis::RedisResult<T>>,
+    {
+        loop {
+            match self.draining(op()).await {
+                Err(e) if is_retryable_error(&e) => {
+                    log::error!(
+                        "Error in task '{MSGBUS_PUBLISH}', retrying until Redis answers: {e}"
+                    );
+                    self.failed();
+                    let delay = retry_delay(backing, self.failures);
+                    self.failures = self.failures.saturating_add(1);
+                    self.draining(tokio::time::sleep(delay)).await;
+                }
+                result => {
+                    self.failures = 0;
+                    return result;
+                }
+            }
+        }
+    }
+
+    /// Awaits `future`, answering the closer's count requests meanwhile and, once a write has
+    /// failed, taking newer messages in.
+    async fn draining<F: Future>(&mut self, future: F) -> F::Output {
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                output = &mut future => return output,
+                Some(reply) = self.count_requests.recv() => {
+                    let _ = reply.send((self.held(), self.closing));
+                }
+                maybe_msg = self.rx.recv(), if self.retrying && !self.closing => {
+                    match maybe_msg {
+                        Some(msg) if msg.topic != CLOSE_TOPIC => self.buffer.push_back(msg),
+                        _ => self.closing = true,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Drains the outbox's buffer into one atomic pipeline of stream writes, its messages in flight
+/// from then, trimming streams as configured.
 async fn drain_buffer(
+    outbox: &mut Outbox,
     conn: &mut redis::aio::ConnectionManager,
     stream_key: &str,
     stream_per_topic: bool,
     autotrim_duration: Option<Duration>,
     autotrim_maxlen: Option<usize>,
     last_trim_index: &mut HashMap<String, usize>,
-    buffer: &mut VecDeque<BusMessage>,
-) -> anyhow::Result<()> {
+) -> redis::Pipeline {
     let mut pipe = redis::pipe();
     pipe.atomic();
 
-    for msg in buffer.drain(..) {
+    let messages = std::mem::take(&mut outbox.buffer);
+    outbox.in_flight = messages.len();
+    for msg in messages {
         let encoding = msg.encoding.to_string();
         let items: Vec<(&str, &[u8])> = vec![
             ("topic", msg.topic.as_ref()),
@@ -578,22 +758,23 @@ async fn drain_buffer(
             let min_timestamp_ms = unix_duration_now
                 .saturating_sub(autotrim_duration.unwrap())
                 .as_millis() as usize;
-            let result: Result<(), redis::RedisError> = redis::cmd(REDIS_XTRIM)
-                .arg(stream_key.clone())
+            let mut trim = redis::cmd(REDIS_XTRIM);
+            trim.arg(stream_key.clone())
                 .arg(REDIS_MINID)
-                .arg(min_timestamp_ms)
-                .query_async(conn)
-                .await;
+                .arg(min_timestamp_ms);
+            let result: Result<(), redis::RedisError> =
+                outbox.draining(trim.query_async(conn)).await;
 
             if let Err(e) = result {
                 log::error!("Error trimming stream '{stream_key}': {e}");
+                outbox.failed();
             } else {
                 last_trim_index.insert(stream_key.clone(), unix_duration_now.as_millis() as usize);
             }
         }
     }
 
-    pipe.query_async(conn).await.map_err(anyhow::Error::from)
+    pipe
 }
 
 /// Streams messages from Redis streams and sends them over the provided `tx` channel.
@@ -684,7 +865,7 @@ pub async fn stream_messages(
                 }
             }
             Err(e) => {
-                if !is_retryable_stream_error(&e) {
+                if !is_retryable_error(&e) {
                     anyhow::bail!("Error reading from stream: {e:?}");
                 }
 
@@ -727,10 +908,10 @@ async fn reconnect_stream_connection(
     read_error_count: &mut usize,
 ) -> anyhow::Result<Option<ConnectionManager>> {
     loop {
-        let retry_delay = stream_retry_delay(config, *read_error_count);
+        let delay = retry_delay(config, *read_error_count);
         *read_error_count = (*read_error_count).saturating_add(1);
 
-        if !wait_for_retry_delay(retry_delay, stream_signal).await {
+        if !wait_for_retry_delay(delay, stream_signal).await {
             return Ok(None);
         }
 
@@ -742,28 +923,6 @@ async fn reconnect_stream_connection(
             }
         }
     }
-}
-
-fn stream_retry_delay(config: &RedisMessageBusConfig, attempt: usize) -> Duration {
-    let exponent = u32::try_from(attempt.min(32)).unwrap_or(32);
-    let delay_ms = config
-        .factor
-        .saturating_mul(config.exponent_base.saturating_pow(exponent));
-    let max_delay = Duration::from_secs(config.max_delay);
-
-    Duration::from_millis(delay_ms)
-        .min(max_delay)
-        .max(Duration::from_millis(1))
-}
-
-fn is_retryable_stream_error(error: &redis::RedisError) -> bool {
-    matches!(
-        error.retry_method(),
-        RetryMethod::Reconnect
-            | RetryMethod::ReconnectFromInitialConnections
-            | RetryMethod::RetryImmediately
-            | RetryMethod::WaitAndRetry
-    )
 }
 
 async fn wait_for_retry_delay(retry_delay: Duration, stream_signal: &Arc<AtomicBool>) -> bool {
@@ -1210,9 +1369,9 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(stream_retry_delay(&config, 0), Duration::from_millis(10));
-        assert_eq!(stream_retry_delay(&config, 1), Duration::from_millis(20));
-        assert_eq!(stream_retry_delay(&config, 10), Duration::from_secs(1));
+        assert_eq!(retry_delay(&config, 0), Duration::from_millis(10));
+        assert_eq!(retry_delay(&config, 1), Duration::from_millis(20));
+        assert_eq!(retry_delay(&config, 10), Duration::from_secs(1));
     }
 
     #[rstest]
@@ -1221,8 +1380,8 @@ mod tests {
             redis::RedisError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         let client: redis::RedisError = (redis::ErrorKind::Client, "client error").into();
 
-        assert!(is_retryable_stream_error(&dropped));
-        assert!(!is_retryable_stream_error(&client));
+        assert!(is_retryable_error(&dropped));
+        assert!(!is_retryable_error(&client));
     }
 
     #[tokio::test]
@@ -1268,6 +1427,7 @@ mod tests {
             instance_id: UUID4::new(),
             pub_tx,
             pub_handle: None,
+            pub_state: WriterState::new().0,
             stream_rx: Some(stream_rx),
             stream_handle: None,
             stream_signal: Arc::new(AtomicBool::new(false)),
@@ -1295,7 +1455,7 @@ mod serial_tests {
     use redis::aio::ConnectionManager;
     use rstest::*;
 
-    use super::*;
+    use super::{test_proxy::RedisProxy, *};
 
     #[fixture]
     async fn redis_connection() -> ConnectionManager {
@@ -1745,6 +1905,147 @@ mod serial_tests {
 
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_publish_messages_retries_until_redis_answers(
+        #[future] redis_connection: ConnectionManager,
+    ) {
+        let mut con = redis_connection.await;
+        let proxy = RedisProxy::start().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BusMessage>();
+        let trader_id = TraderId::from("tester-001");
+        let instance_id = UUID4::new();
+        let config = MessageBusConfig {
+            use_instance_id: true,
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        let backing = RedisMessageBusConfig {
+            port: Some(proxy.port),
+            connection_timeout: 1,
+            response_timeout: 1,
+            ..Default::default()
+        };
+        let stream_key = get_stream_key(trader_id, instance_id, &config);
+        let handle = tokio::spawn(async move {
+            publish_messages(rx, trader_id, instance_id, config, backing)
+                .await
+                .unwrap();
+        });
+        let numbered = |seq: u32| {
+            BusMessage::with_str_topic(
+                "test_topic",
+                BusPayloadType::Custom(Ustr::default()),
+                Bytes::from(seq.to_string()),
+                SerializationEncoding::Json,
+            )
+        };
+
+        tx.send(numbered(1)).unwrap();
+        wait_until_async(
+            || {
+                let mut con = con.clone();
+                let stream_key = stream_key.clone();
+                async move { con.xlen::<_, usize>(&stream_key).await.unwrap() == 1 }
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        proxy.pause();
+        for seq in 2..=4 {
+            tx.send(numbered(seq)).unwrap();
+        }
+        // A second held write is the retry of the first, sent after it timed out
+        wait_until_async(
+            || async { proxy.held_writes() >= 2 },
+            Duration::from_secs(10),
+        )
+        .await;
+        proxy.resume();
+        tx.send(numbered(5)).unwrap();
+        tx.send(BusMessage::new_close()).unwrap();
+        handle.await.unwrap();
+
+        let messages: RedisStreamBulk = con.xread(&[&stream_key], &["0"]).await.unwrap();
+        let _: usize = con.del(&stream_key).await.unwrap();
+        let mut published: Vec<u32> = messages[0][&stream_key]
+            .iter()
+            .flat_map(|entry| entry.values())
+            .map(|fields| {
+                let payload = decode_bus_message(fields).unwrap().payload;
+                std::str::from_utf8(&payload).unwrap().parse().unwrap()
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        published.retain(|seq| seen.insert(*seq));
+
+        assert_eq!(published, vec![1, 2, 3, 4, 5]);
+    }
+
+    fn numbered(seq: u32) -> BusMessage {
+        BusMessage::with_str_topic(
+            "test_topic",
+            BusPayloadType::Custom(Ustr::default()),
+            Bytes::from(seq.to_string()),
+            SerializationEncoding::Json,
+        )
+    }
+
+    async fn published_numbers(con: &mut ConnectionManager, stream_key: &str) -> Vec<u32> {
+        let messages: RedisStreamBulk = con.xread(&[stream_key], &["0"]).await.unwrap();
+        let Some(streams) = messages.first() else {
+            return Vec::new();
+        };
+        streams[stream_key]
+            .iter()
+            .flat_map(|entry| entry.values())
+            .map(|fields| {
+                let payload = decode_bus_message(fields).unwrap().payload;
+                std::str::from_utf8(&payload).unwrap().parse().unwrap()
+            })
+            .collect()
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_publisher_whose_setup_goes_unanswered_delivers(
+        #[future] redis_connection: ConnectionManager,
+    ) {
+        let mut con = redis_connection.await;
+        let proxy = RedisProxy::start().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BusMessage>();
+        let trader_id = TraderId::from("tester-001");
+        let instance_id = UUID4::new();
+        let config = MessageBusConfig {
+            use_instance_id: true,
+            stream_per_topic: false,
+            ..Default::default()
+        };
+        let backing = RedisMessageBusConfig {
+            port: Some(proxy.port),
+            connection_timeout: 1,
+            response_timeout: 1,
+            number_of_retries: 0,
+            ..Default::default()
+        };
+        let stream_key = get_stream_key(trader_id, instance_id, &config);
+
+        proxy.lose_next_request();
+        let handle = tokio::spawn(async move {
+            publish_messages(rx, trader_id, instance_id, config, backing)
+                .await
+                .unwrap();
+        });
+        tx.send(numbered(1)).unwrap();
+        tx.send(BusMessage::new_close()).unwrap();
+        handle.await.unwrap();
+
+        let published = published_numbers(&mut con, &stream_key).await;
+        let _: usize = con.del(&stream_key).await.unwrap();
+
+        assert_eq!(published, vec![1]);
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_two_live_nodes_publish_and_ingest_external_redis_stream(
         #[future] redis_connection: ConnectionManager,
     ) {
@@ -2129,5 +2430,327 @@ mod serial_tests {
         .await;
 
         received.unwrap()
+    }
+}
+
+/// A TCP proxy in front of the test Redis that holds traffic as a paused server does, severs its
+/// connections as a restarting server does, loses one reply after Redis has acted on it, or holds
+/// one connection's requests apart while the client connects again.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_proxy {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{
+            TcpListener, TcpStream,
+            tcp::{OwnedReadHalf, OwnedWriteHalf},
+        },
+        sync::{oneshot, watch},
+    };
+
+    const REDIS_ADDR: &str = "127.0.0.1:6379";
+    const EXEC: &[u8] = b"EXEC\r\n";
+    const PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
+    const PONG: &[u8] = b"+PONG\r\n";
+
+    #[derive(Clone)]
+    struct Controls {
+        pause: Arc<watch::Sender<bool>>,
+        paused: watch::Receiver<bool>,
+        severed: watch::Receiver<usize>,
+        lose_next_reply: Arc<AtomicBool>,
+        lose_next_request: Arc<AtomicBool>,
+        pause_at_exec: Arc<AtomicBool>,
+        pause_after_exec: Arc<AtomicBool>,
+        sever_on_exec: Arc<AtomicBool>,
+        held_writes: Arc<AtomicUsize>,
+    }
+
+    /// One relayed connection's own controls.
+    struct Connection {
+        stalled: AtomicBool,
+        stalled_requests: Mutex<Vec<u8>>,
+        drop_client: watch::Sender<bool>,
+        release: Mutex<Option<oneshot::Sender<oneshot::Sender<()>>>>,
+    }
+
+    pub(crate) struct RedisProxy {
+        pub(crate) port: u16,
+        controls: Controls,
+        severed: watch::Sender<usize>,
+        connections: Arc<Mutex<Vec<Arc<Connection>>>>,
+    }
+
+    impl RedisProxy {
+        pub(crate) async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (pause, paused) = watch::channel(false);
+            let (severed, severed_rx) = watch::channel(0);
+            let controls = Controls {
+                pause: Arc::new(pause),
+                paused,
+                severed: severed_rx,
+                lose_next_reply: Arc::new(AtomicBool::new(false)),
+                lose_next_request: Arc::new(AtomicBool::new(false)),
+                pause_at_exec: Arc::new(AtomicBool::new(false)),
+                pause_after_exec: Arc::new(AtomicBool::new(false)),
+                sever_on_exec: Arc::new(AtomicBool::new(false)),
+                held_writes: Arc::new(AtomicUsize::new(0)),
+            };
+            let connections: Arc<Mutex<Vec<Arc<Connection>>>> = Arc::default();
+            let proxy = Self {
+                port,
+                controls: controls.clone(),
+                severed,
+                connections: connections.clone(),
+            };
+
+            tokio::spawn(async move {
+                while let Ok((client, _)) = listener.accept().await {
+                    let server = TcpStream::connect(REDIS_ADDR).await.unwrap();
+                    let (release, released) = oneshot::channel();
+                    let connection = Arc::new(Connection {
+                        stalled: AtomicBool::new(false),
+                        stalled_requests: Mutex::new(Vec::new()),
+                        drop_client: watch::Sender::new(false),
+                        release: Mutex::new(Some(release)),
+                    });
+                    connections.lock().unwrap().push(connection.clone());
+                    tokio::spawn(relay(
+                        client,
+                        server,
+                        controls.clone(),
+                        connection,
+                        released,
+                    ));
+                }
+            });
+
+            proxy
+        }
+
+        /// Holds every byte in both directions until `resume`, as a paused server does.
+        pub(crate) fn pause(&self) {
+            self.controls.pause.send_replace(true);
+        }
+
+        pub(crate) fn resume(&self) {
+            self.controls.pause.send_replace(false);
+        }
+
+        /// Pauses as `pause` does on the next request holding an `EXEC`, holding that request too.
+        pub(crate) fn pause_at_next_exec(&self) {
+            self.controls.pause_at_exec.store(true, Ordering::SeqCst);
+        }
+
+        /// Pauses as `pause` does right after forwarding the next request holding an `EXEC`.
+        pub(crate) fn pause_after_next_exec(&self) {
+            self.controls.pause_after_exec.store(true, Ordering::SeqCst);
+        }
+
+        /// Closes every open connection, discarding what it holds, as a restarting server does.
+        pub(crate) fn sever(&self) {
+            self.severed.send_modify(|generation| *generation += 1);
+        }
+
+        /// Discards the next request holding an `EXEC` and closes its connection, so Redis never
+        /// runs that transaction.
+        pub(crate) fn sever_on_next_exec(&self) {
+            self.controls.sever_on_exec.store(true, Ordering::SeqCst);
+        }
+
+        /// Discards the next request a client sends, leaving its connection open, so the client
+        /// waits for an answer that never comes.
+        pub(crate) fn lose_next_request(&self) {
+            self.controls
+                .lose_next_request
+                .store(true, Ordering::SeqCst);
+        }
+
+        /// Discards the next reply Redis sends and closes the client's connection, after Redis
+        /// has acted on the request.
+        pub(crate) fn lose_next_reply(&self) {
+            self.controls.lose_next_reply.store(true, Ordering::SeqCst);
+        }
+
+        /// The number of client writes that arrived while traffic was held.
+        pub(crate) fn held_writes(&self) -> usize {
+            self.controls.held_writes.load(Ordering::SeqCst)
+        }
+
+        /// Holds the requests of every connection now open, apart from any connection opened
+        /// later, until `release_stalled`.
+        pub(crate) fn stall(&self) {
+            for connection in self.connections.lock().unwrap().iter() {
+                connection.stalled.store(true, Ordering::SeqCst);
+            }
+        }
+
+        /// The number of request bytes the stalled connections hold.
+        pub(crate) fn stalled_bytes(&self) -> usize {
+            self.connections
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|connection| connection.stalled_requests.lock().unwrap().len())
+                .sum()
+        }
+
+        /// Closes the stalled connections towards the client only: Redis keeps serving each, and
+        /// is yet to receive what it holds.
+        pub(crate) fn drop_stalled_clients(&self) {
+            for connection in self.connections.lock().unwrap().iter() {
+                if connection.stalled.load(Ordering::SeqCst) {
+                    connection.drop_client.send_replace(true);
+                }
+            }
+        }
+
+        /// Forwards to Redis what each stalled connection holds, followed by a `PING`, and
+        /// returns once Redis has answered it or closed the connection.
+        pub(crate) async fn release_stalled(&self) {
+            let releases: Vec<oneshot::Sender<oneshot::Sender<()>>> = self
+                .connections
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|connection| connection.stalled.load(Ordering::SeqCst))
+                .filter_map(|connection| connection.release.lock().unwrap().take())
+                .collect();
+            for release in releases {
+                let (done, released) = oneshot::channel();
+                if release.send(done).is_ok() {
+                    let _ = released.await;
+                }
+            }
+        }
+    }
+
+    async fn relay(
+        client: TcpStream,
+        server: TcpStream,
+        controls: Controls,
+        connection: Arc<Connection>,
+        released: oneshot::Receiver<oneshot::Sender<()>>,
+    ) {
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut server_read, mut server_write) = server.into_split();
+        let mut severed = controls.severed.clone();
+        severed.mark_unchanged();
+        let mut drop_client = connection.drop_client.subscribe();
+
+        tokio::select! {
+            () = forward_requests(&mut client_read, &mut server_write, controls.clone(), &connection) => return,
+            () = forward_replies(&mut server_read, &mut client_write, controls) => return,
+            _ = severed.changed() => return,
+            _ = drop_client.wait_for(|dropped| *dropped) => {}
+        }
+
+        drop(client_read);
+        drop(client_write);
+        if let Ok(done) = released.await {
+            let mut requests = std::mem::take(&mut *connection.stalled_requests.lock().unwrap());
+            requests.extend_from_slice(PING);
+            if server_write.write_all(&requests).await.is_ok() {
+                await_pong(&mut server_read).await;
+            }
+            let _ = done.send(());
+        }
+    }
+
+    async fn await_pong(from: &mut OwnedReadHalf) {
+        let mut replies = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match from.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    replies.extend_from_slice(&buf[..n]);
+                    if replies.ends_with(PONG) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn forward_requests(
+        from: &mut OwnedReadHalf,
+        to: &mut OwnedWriteHalf,
+        mut controls: Controls,
+        connection: &Connection,
+    ) {
+        let paused = controls.paused.clone();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut held: Vec<u8> = Vec::new();
+        loop {
+            tokio::select! {
+                read = from.read(&mut buf) => {
+                    let n = match read {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    let request = &buf[..n];
+                    if connection.stalled.load(Ordering::SeqCst) {
+                        connection.stalled_requests.lock().unwrap().extend_from_slice(request);
+                        continue;
+                    }
+                    if controls.lose_next_request.swap(false, Ordering::SeqCst) {
+                        continue;
+                    }
+                    let holds_exec = request.windows(EXEC.len()).any(|window| window == EXEC);
+                    if holds_exec && controls.sever_on_exec.swap(false, Ordering::SeqCst) {
+                        return;
+                    }
+                    if holds_exec && controls.pause_at_exec.swap(false, Ordering::SeqCst) {
+                        controls.pause.send_replace(true);
+                    }
+                    if *paused.borrow() || !held.is_empty() {
+                        controls.held_writes.fetch_add(1, Ordering::SeqCst);
+                        held.extend_from_slice(request);
+                    } else if to.write_all(request).await.is_err() {
+                        return;
+                    }
+                    if holds_exec && controls.pause_after_exec.swap(false, Ordering::SeqCst) {
+                        controls.pause.send_replace(true);
+                    }
+                }
+                Ok(()) = controls.paused.changed(), if !held.is_empty() => {
+                    let resumed = !*paused.borrow();
+                    if resumed {
+                        if to.write_all(&held).await.is_err() {
+                            return;
+                        }
+                        held.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    async fn forward_replies(
+        from: &mut OwnedReadHalf,
+        to: &mut OwnedWriteHalf,
+        mut controls: Controls,
+    ) {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match from.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            let _ = controls.paused.wait_for(|paused| !paused).await;
+            if controls.lose_next_reply.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            if to.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+        }
     }
 }

@@ -19,12 +19,16 @@ pub mod cache;
 pub mod msgbus;
 pub mod queries;
 
-use std::{fmt::Write as _, time::Duration};
+use std::{fmt::Write as _, sync::Arc, time::Duration};
 
 use nautilus_common::{logging::log_task_awaiting, msgbus::MessageBusConfig};
 use nautilus_core::{UUID4, string::semver::SemVer};
 use nautilus_model::identifiers::TraderId;
-use redis::RedisError;
+use redis::{RedisError, RetryMethod};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
+};
 
 const REDIS_MIN_VERSION: &str = "6.2.0";
 const REDIS_DELIMITER: char = ':';
@@ -32,6 +36,9 @@ const REDIS_INDEX_PATTERN: &str = ":index:";
 const REDIS_XTRIM: &str = "XTRIM";
 const REDIS_MINID: &str = "MINID";
 const REDIS_FLUSHDB: &str = "FLUSHDB";
+
+/// How long a close waits for a task, and for a writer retrying because Redis isn't answering.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Extracts the index key from a full Redis key.
 ///
@@ -53,18 +60,169 @@ async fn await_handle(handle: Option<tokio::task::JoinHandle<()>>, task_name: &s
     if let Some(handle) = handle {
         log_task_awaiting(task_name);
 
-        let timeout = Duration::from_secs(2);
-        match tokio::time::timeout(timeout, handle).await {
+        match tokio::time::timeout(CLOSE_TIMEOUT, handle).await {
             Ok(result) => {
                 if let Err(e) = result {
                     log::error!("Error awaiting task '{task_name}': {e:?}");
                 }
             }
             Err(_) => {
-                log::warn!("Timeout {timeout:?} awaiting task '{task_name}'");
+                log::warn!("Timeout {CLOSE_TIMEOUT:?} awaiting task '{task_name}'");
             }
         }
     }
+}
+
+/// A request for the number of writes a writer holds, counting its queued commands, answered with
+/// that number and whether it has taken its close command.
+pub(crate) type CountRequest = oneshot::Sender<(usize, bool)>;
+
+/// What a Redis writer tells its closer: whether a delivery it holds is failing because Redis
+/// isn't answering, and, on request, how many writes it holds.
+#[derive(Debug)]
+pub(crate) struct WriterState {
+    failing: watch::Sender<bool>,
+    count_requests: mpsc::UnboundedSender<CountRequest>,
+}
+
+impl WriterState {
+    /// A writer starts out failing: nothing it holds is delivered until its connection is
+    /// answered. The receiver is the writer's, which answers each request from where it waits.
+    pub(crate) fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<CountRequest>) {
+        let (count_requests, count_requests_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Self {
+            failing: watch::Sender::new(true),
+            count_requests,
+        });
+        (state, count_requests_rx)
+    }
+
+    pub(crate) fn set_failing(&self, failing: bool) {
+        self.failing
+            .send_if_modified(|was| std::mem::replace(was, failing) != failing);
+    }
+
+    pub(crate) fn is_failing(&self) -> bool {
+        *self.failing.borrow()
+    }
+
+    /// The number of writes the writer holds, counting its queued commands, and whether it has
+    /// taken its close command, counted by the writer now; `None` once it is gone.
+    pub(crate) async fn held(&self) -> Option<(usize, bool)> {
+        let (reply, count) = oneshot::channel();
+        self.count_requests.send(reply).ok()?;
+        count.await.ok()
+    }
+}
+
+/// Logs at ERROR the writes the writer `handle` holds, unless it finishes first or a delivery
+/// succeeds, which returns `false` to keep waiting.
+async fn report_undelivered(
+    handle: &mut JoinHandle<()>,
+    task_name: &str,
+    state: &WriterState,
+) -> bool {
+    let mut failing = state.failing.subscribe();
+    tokio::select! {
+        held = state.held() => {
+            // The close command the closer queued is no write
+            if let Some((queued, closing)) = held {
+                let held = queued - usize::from(!closing);
+                log::error!(
+                    "Closed '{task_name}' while Redis is not answering: {held} queued writes not delivered"
+                );
+            }
+            true
+        }
+        _ = &mut *handle => true,
+        _ = failing.wait_for(|failing| !failing) => false,
+    }
+}
+
+/// Waits for the writer `handle` for as long as it delivers. While a delivery it holds is
+/// failing, the wait ends [`CLOSE_TIMEOUT`] after the later of the close and the failure, and
+/// only that delivery succeeding lifts the bound.
+pub(crate) async fn await_writer(mut handle: JoinHandle<()>, task_name: &str, state: &WriterState) {
+    let mut failing = state.failing.subscribe();
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        if *failing.borrow_and_update() {
+            let deadline =
+                *deadline.get_or_insert_with(|| tokio::time::Instant::now() + CLOSE_TIMEOUT);
+            tokio::select! {
+                result = &mut handle => {
+                    if let Err(e) = result {
+                        log::error!("Error awaiting task '{task_name}': {e:?}");
+                    }
+                    return;
+                }
+                _ = failing.changed() => {}
+                () = tokio::time::sleep_until(deadline) => {
+                    if report_undelivered(&mut handle, task_name, state).await {
+                        return;
+                    }
+                }
+            }
+        } else {
+            deadline = None;
+            tokio::select! {
+                result = &mut handle => {
+                    if let Err(e) = result {
+                        log::error!("Error awaiting task '{task_name}': {e:?}");
+                    }
+                    return;
+                }
+                _ = failing.changed() => {}
+            }
+        }
+    }
+}
+
+/// Waits [`CLOSE_TIMEOUT`] for the publisher `handle`, as for any task, then logs at ERROR the
+/// messages it holds when a delivery is still failing.
+pub(crate) async fn await_publisher(
+    handle: Option<JoinHandle<()>>,
+    task_name: &str,
+    state: &WriterState,
+) {
+    if let Some(mut handle) = handle {
+        log_task_awaiting(task_name);
+
+        match tokio::time::timeout(CLOSE_TIMEOUT, &mut handle).await {
+            Ok(Err(e)) => log::error!("Error awaiting task '{task_name}': {e:?}"),
+            Ok(Ok(())) => {}
+            Err(_) if state.is_failing() => {
+                report_undelivered(&mut handle, task_name, state).await;
+            }
+            Err(_) => log::warn!("Timeout {CLOSE_TIMEOUT:?} awaiting task '{task_name}'"),
+        }
+    }
+}
+
+/// The wait before retry number `attempt`, growing from the config's `factor` by its
+/// `exponent_base` up to its `max_delay`.
+pub(crate) fn retry_delay(config: &impl RedisConnectionConfig, attempt: usize) -> Duration {
+    let exponent = u32::try_from(attempt.min(32)).unwrap_or(32);
+    let delay_ms = config
+        .factor()
+        .saturating_mul(config.exponent_base().saturating_pow(exponent));
+    let max_delay = Duration::from_secs(config.max_delay());
+
+    Duration::from_millis(delay_ms)
+        .min(max_delay)
+        .max(Duration::from_millis(1))
+}
+
+/// Whether `error` can clear on a retry: no answer, a dropped connection, or a server not yet
+/// ready.
+pub(crate) fn is_retryable_error(error: &RedisError) -> bool {
+    matches!(
+        error.retry_method(),
+        RetryMethod::Reconnect
+            | RetryMethod::ReconnectFromInitialConnections
+            | RetryMethod::RetryImmediately
+            | RetryMethod::WaitAndRetry
+    )
 }
 
 /// Redis connection settings shared by Redis-owned config structs.
@@ -161,6 +319,17 @@ pub async fn create_redis_connection(
     con_name: &str,
     config: &impl RedisConnectionConfig,
 ) -> anyhow::Result<redis::aio::ConnectionManager> {
+    let (con, info) = connect_redis(con_name, config).await?;
+    check_redis_version(&info)?;
+    Ok(con)
+}
+
+/// Creates a connection manager as [`create_redis_connection`] does, returning it with the
+/// server's `INFO`.
+pub(crate) async fn connect_redis(
+    con_name: &str,
+    config: &impl RedisConnectionConfig,
+) -> redis::RedisResult<(redis::aio::ConnectionManager, String)> {
     log::debug!("Creating {con_name} redis connection");
     let (redis_url, redacted_url) = get_redis_url(config);
     log::debug!("Connecting to {redacted_url}");
@@ -191,8 +360,21 @@ pub async fn create_redis_connection(
     let mut con = client
         .get_connection_manager_with_config(connection_manager_config)
         .await?;
+    let info: String = redis::cmd("INFO").query_async(&mut con).await?;
 
-    let version = get_redis_version(&mut con).await?;
+    Ok((con, info))
+}
+
+/// Logs the server version `info` reports, at ERROR when it is below the minimum supported.
+///
+/// # Errors
+///
+/// Returns an error if `info` carries no parseable version.
+pub(crate) fn check_redis_version(info: &str) -> anyhow::Result<()> {
+    let Some(version_str) = info_field(info, "redis_version") else {
+        anyhow::bail!("Redis version not available");
+    };
+    let version = SemVer::parse(version_str)?;
     let min_version = SemVer::parse(REDIS_MIN_VERSION)?;
     let con_msg = format!("Connected to redis v{version}");
 
@@ -202,7 +384,16 @@ pub async fn create_redis_connection(
         log::error!("{con_msg}, but minimum supported version is {REDIS_MIN_VERSION}");
     }
 
-    Ok(con)
+    Ok(())
+}
+
+/// The value of the `name` field in an `INFO` reply.
+pub(crate) fn info_field<'a>(info: &'a str, name: &str) -> Option<&'a str> {
+    info.lines().find_map(|line| {
+        line.strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .map(str::trim)
+    })
 }
 
 /// Flushes the entire Redis database for the specified connection.
@@ -241,21 +432,6 @@ pub fn get_stream_key(
 
     stream_key.push_str(&config.streams_prefix);
     stream_key
-}
-
-async fn get_redis_version(conn: &mut redis::aio::ConnectionManager) -> anyhow::Result<SemVer> {
-    let info: String = redis::cmd("INFO").query_async(conn).await?;
-    let Some(version_str) = info.lines().find_map(|line| {
-        if line.starts_with("redis_version:") {
-            line.split(':').nth(1).map(|s| s.trim().to_string())
-        } else {
-            None
-        }
-    }) else {
-        anyhow::bail!("Redis version not available");
-    };
-
-    SemVer::parse(&version_str)
 }
 
 #[cfg(test)]
